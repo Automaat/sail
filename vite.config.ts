@@ -1,8 +1,8 @@
 import { defineConfig } from "vite";
-import solid from "vite-plugin-solid";
+import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 export default defineConfig({
-  plugins: [solid()],
+  plugins: [svelte()],
   clearScreen: false,
   server: { strictPort: true, port: 1420 },
   envPrefix: ["VITE_", "TAURI_ENV_*"],

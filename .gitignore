@@ -2,5 +2,6 @@ node_modules
 dist
 target
 .tauri
+src-tauri/gen
 *.log
 .DS_Store

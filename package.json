@@ -5,19 +5,22 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "build": "npm run check && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
     "@opencode-ai/sdk": "latest",
+    "@smykla-skalski/sui": "^0.2.1",
     "@tauri-apps/api": "^2.8.0",
-    "solid-js": "^1.9.9"
+    "svelte": "^5.57.1"
   },
   "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@tauri-apps/cli": "^2.8.0",
+    "svelte-check": "^4.7.6",
     "typescript": "~5.8.3",
-    "vite": "^6.3.5",
-    "vite-plugin-solid": "^2.11.6"
+    "vite": "^8.3.1"
   }
 }

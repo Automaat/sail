@@ -1,0 +1,29 @@
+[tools]
+node = "latest"
+rust = "latest"
+
+[tasks.install]
+description = "Install JavaScript dependencies from the lockfile"
+run = "npm ci"
+sources = ["package.json", "package-lock.json"]
+outputs = ["node_modules/.package-lock.json"]
+
+[tasks.dev]
+description = "Run the Tauri desktop app"
+depends = ["install"]
+run = "npm run tauri dev"
+
+[tasks.web]
+description = "Run the frontend in a browser"
+depends = ["install"]
+run = "npm run dev"
+
+[tasks.check]
+description = "Check the frontend and Rust application"
+depends = ["install"]
+run = ["npm run build", "cargo check --manifest-path src-tauri/Cargo.toml"]
+
+[tasks.build]
+description = "Bundle the desktop app"
+depends = ["install"]
+run = "npm run tauri build"
