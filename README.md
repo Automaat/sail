@@ -4,8 +4,8 @@ A desktop workspace for planning and reviewing coding-agent work. OpenCode runs 
 
 ## Current scaffold
 
-- Tauri 2 desktop shell with a SolidJS interface.
-- Initial plan-review workspace screen.
+- Tauri 2 desktop shell with a Svelte 5 interface and [SUI](https://github.com/smykla-skalski/sui) components.
+- Initial workspace screen using the Smyklot palette and a light/dark theme toggle.
 - OpenCode server integration is the next implementation step; the UI currently uses illustrative sample data.
 
 ## Development
