@@ -23,7 +23,7 @@ Mise installs the latest stable Node.js and Rust toolchains. The development tas
 mise run dev
 ```
 
-Select the repository in the app, then describe the work in chat. The first message creates an Architect session. Set `SAI_OPENCODE_BIN` to an absolute path if `opencode` is not on the app's `PATH`.
+Select the repository in the app, then describe the work in chat. The first message creates an Architect session. The app detects OpenCode in common installation locations. Open **OpenCode settings** to see the detected binary or set an absolute path; the app remembers an override. You can also set `SAI_OPENCODE_BIN` before starting the app.
 
 Other tasks:
 
