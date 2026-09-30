@@ -10,17 +10,18 @@ A desktop workspace for planning and reviewing coding-agent work. OpenCode runs 
 
 ## Development
 
-Prerequisites: Rust, Node.js, and the platform dependencies required by [Tauri](https://tauri.app/start/prerequisites/).
+Prerequisites: [mise](https://mise.jdx.dev/) and the platform dependencies required by [Tauri](https://tauri.app/start/prerequisites/). Mise installs the latest stable Node.js and Rust toolchains. The development task installs JavaScript dependencies when needed.
 
 ```sh
-npm install
-npm run tauri dev
+mise run dev
 ```
 
-To run the frontend by itself:
+Other tasks:
 
 ```sh
-npm run dev
+mise run web    # frontend in a browser
+mise run check  # frontend build and Rust check
+mise run build  # desktop bundle
 ```
 
 ## Architecture direction
