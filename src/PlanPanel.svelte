@@ -4,8 +4,10 @@
   import {
     answerQuestions,
     reviewPlan,
+    snapshotAnswers,
     type PlanDecision,
     type PlanQuestion,
+    type PlanQuestions,
     type PlanSnapshot,
   } from './lib/plan';
   import type { OpenCodeClient } from './lib/opencode';
@@ -14,18 +16,27 @@
     snapshot: PlanSnapshot;
     client: OpenCodeClient | null;
     directory: string;
+    sessionID: string | null;
     dark: boolean;
     onchanged: () => Promise<void>;
   }
 
-  let { snapshot, client, directory, dark, onchanged }: Props = $props();
+  let { snapshot, client, directory, sessionID, dark, onchanged }: Props = $props();
   let decisions = $state<Record<string, PlanDecision>>({});
   let answers = $state<Record<string, string[]>>({});
+  let questionErrors = $state<Record<string, string>>({});
+  let answerStatus = $state<'editing' | 'sending' | 'answered' | 'superseded'>('editing');
+  let lastOutcome = $state<{ status: 'answered' | 'superseded'; id: string } | null>(null);
+  let staleDraft = $state<{ questions: PlanQuestion[]; answers: Record<string, string[]> } | null>(
+    null,
+  );
   let note = $state('');
   let pending = $state(false);
   let error = $state('');
   let currentPlan = '';
   let currentQuestions = '';
+  let currentScope = '';
+  let currentBatch: PlanQuestions | null = null;
 
   let plan = $derived(snapshot.plan);
   let questions = $derived(snapshot.questions);
@@ -55,13 +66,76 @@
     }
   });
 
-  $effect(() => {
-    const key = questions?.id ?? '';
-    if (key !== currentQuestions) {
-      currentQuestions = key;
-      answers = Object.fromEntries(
-        questions?.questions.map((question) => [question.id, question.recommended ?? []]) ?? [],
+  function scopeKey(path: string, id: string) {
+    return `${encodeURIComponent(path)}:${encodeURIComponent(id)}`;
+  }
+
+  function draftKey(scope: string, id: string) {
+    return `sai-questions-draft:${scope}:${encodeURIComponent(id)}`;
+  }
+
+  function loadAnswers(scope: string, id: string): Record<string, string[]> {
+    try {
+      const stored: unknown = JSON.parse(localStorage.getItem(draftKey(scope, id)) ?? '{}');
+      if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return {};
+      return Object.fromEntries(
+        Object.entries(stored).filter(
+          (entry): entry is [string, string[]] =>
+            Array.isArray(entry[1]) && entry[1].every((value) => typeof value === 'string'),
+        ),
       );
+    } catch {
+      return {};
+    }
+  }
+
+  function saveDraft(scope: string, id: string, draft: Record<string, string[]>) {
+    localStorage.setItem(draftKey(scope, id), JSON.stringify(draft));
+  }
+
+  function saveOutcome(
+    scope: string,
+    batch: PlanQuestions,
+    draft: Record<string, string[]>,
+    status: 'answered' | 'superseded',
+  ) {
+    const outcome = { status, id: batch.id };
+    localStorage.setItem(`sai-questions-outcome:${scope}`, JSON.stringify(outcome));
+    if (status === 'superseded') {
+      const preserved = { questions: batch.questions, answers: draft };
+      localStorage.setItem(`sai-questions-stale:${scope}`, JSON.stringify(preserved));
+      if (scope === currentScope) staleDraft = preserved;
+    }
+    if (scope === currentScope) lastOutcome = outcome;
+  }
+
+  $effect(() => {
+    const scope = sessionID ? scopeKey(directory, sessionID) : '';
+    if (scope !== currentScope) {
+      currentScope = scope;
+      currentQuestions = '';
+      currentBatch = null;
+      questionErrors = {};
+      error = '';
+      try {
+        lastOutcome = JSON.parse(localStorage.getItem(`sai-questions-outcome:${scope}`) ?? 'null');
+        staleDraft = JSON.parse(localStorage.getItem(`sai-questions-stale:${scope}`) ?? 'null');
+      } catch {
+        lastOutcome = null;
+        staleDraft = null;
+      }
+    }
+    const batch = questions?.sessionID === sessionID ? questions : null;
+    const key = batch ? `${scope}:${batch.id}` : '';
+    if (key !== currentQuestions) {
+      if (currentBatch && answerStatus === 'editing')
+        saveOutcome(scope, currentBatch, answers, 'superseded');
+      currentQuestions = key;
+      currentBatch = batch;
+      answers = batch ? loadAnswers(scope, batch.id) : {};
+      questionErrors = {};
+      error = '';
+      answerStatus = 'editing';
     }
   });
 
@@ -80,6 +154,14 @@
         ? current.filter((item) => item !== value)
         : [...current, value]
       : [value];
+    questionErrors[id] = '';
+    if (questions) saveDraft(currentScope, questions.id, answers);
+  }
+
+  function setText(id: string, value: string) {
+    answers[id] = value ? [value] : [];
+    questionErrors[id] = '';
+    if (questions) saveDraft(currentScope, questions.id, answers);
   }
 
   function questionOptions(question: PlanQuestion) {
@@ -91,16 +173,72 @@
       : (question.options ?? []);
   }
 
+  function recommendation(question: PlanQuestion): string {
+    const options = questionOptions(question);
+    return (question.recommended ?? [])
+      .map((value) => options.find((option) => option.value === value)?.label ?? value)
+      .join(', ');
+  }
+
   async function sendAnswers() {
-    if (!client || !questions) return;
+    if (
+      !client ||
+      !questions ||
+      questions.sessionID !== sessionID ||
+      pending ||
+      answerStatus !== 'editing'
+    )
+      return;
+    const batch = questions;
+    const scope = currentScope;
+    const draft = snapshotAnswers(answers);
+    const validated: Record<string, string[]> = {};
+    const errors: Record<string, string> = {};
+    for (const question of batch.questions) {
+      const selected = draft[question.id] ?? [];
+      if (question.kind === 'text') {
+        const text = selected[0]?.trim() ?? '';
+        if (!text) errors[question.id] = 'Enter an answer.';
+        else validated[question.id] = [text];
+      } else {
+        const options = new Set(questionOptions(question).map((option) => option.value));
+        if (
+          !selected.length ||
+          (question.kind !== 'multi' && selected.length !== 1) ||
+          selected.some((value) => !options.has(value))
+        )
+          errors[question.id] = 'Choose a valid answer.';
+        else validated[question.id] = [...new Set(selected)];
+      }
+    }
+    questionErrors = errors;
+    if (Object.keys(errors).length) return;
     pending = true;
+    answerStatus = 'sending';
     error = '';
+    let accepted = false;
     try {
-      await answerQuestions(client, directory, questions.sessionID, questions.id, answers);
-      await onchanged();
+      await answerQuestions(client, directory, batch.sessionID, batch.id, validated);
+      accepted = true;
+      saveOutcome(scope, batch, draft, 'answered');
+      if (scope === currentScope && questions?.id === batch.id) answerStatus = 'answered';
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : String(cause);
+      const message = cause instanceof Error ? cause.message : String(cause);
+      if (scope === currentScope && questions?.id === batch.id) error = message;
+      if (message.includes('no longer pending')) {
+        saveOutcome(scope, batch, draft, 'superseded');
+        if (scope === currentScope && questions?.id === batch.id) answerStatus = 'superseded';
+        await onchanged().catch(() => {});
+      } else if (scope === currentScope && questions?.id === batch.id) answerStatus = 'editing';
     } finally {
+      if (accepted) {
+        try {
+          await onchanged();
+        } catch (cause) {
+          if (scope === currentScope)
+            error = `Answers sent, but refresh failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+        }
+      }
       pending = false;
     }
   }
@@ -139,23 +277,46 @@
   </div>
 
   {#if error}<p class="panel-error" role="alert">{error}</p>{/if}
+  {#if answerStatus === 'sending' && questions}<p class="question-state" role="status">
+      Sending answers…
+    </p>{/if}
+  {#if lastOutcome && (!questions || lastOutcome.id === questions.id || lastOutcome.status === 'superseded')}<p
+      class="question-state"
+      role="status"
+    >
+      {lastOutcome.status === 'answered'
+        ? 'Answers sent.'
+        : 'A question batch was superseded. Your draft was kept.'}
+    </p>{/if}
+  {#if lastOutcome?.status === 'superseded' && staleDraft}<details class="stale-answers">
+      <summary>View saved answers from the superseded batch</summary>
+      {#each staleDraft.questions as oldQuestion (oldQuestion.id)}<p>
+          <strong>{oldQuestion.question}</strong>: {(staleDraft.answers[oldQuestion.id] ?? []).join(
+            ', ',
+          ) || 'No answer'}
+        </p>{/each}
+    </details>{/if}
 
   {#if questions}
     <div class="panel-scroll">
       <h3>Questions before planning</h3>
-      <p class="muted">Answer these together so the architect can complete the plan.</p>
+      <p class="muted">
+        Answer every question before sending. Recommendations are suggestions until you select them.
+      </p>
       {#each questions.questions as question, index (question.id)}
         <section class="question-block">
           <h4><span>{index + 1}.</span> {question.question}</h4>
+          {#if question.recommended?.length}<p class="question-recommendation">
+              Recommended: {recommendation(question)}
+            </p>{/if}
           {#if question.kind === 'text'}
             <textarea
               rows="3"
               placeholder="Your answer"
               value={answers[question.id]?.[0] ?? ''}
-              oninput={(event) =>
-                (answers[question.id] = event.currentTarget.value.trim()
-                  ? [event.currentTarget.value]
-                  : [])}></textarea>
+              aria-invalid={!!questionErrors[question.id]}
+              disabled={pending || answerStatus !== 'editing'}
+              oninput={(event) => setText(question.id, event.currentTarget.value)}></textarea>
           {:else}
             {#each questionOptions(question) as option (option.value)}
               <label class="answer-option">
@@ -163,6 +324,7 @@
                   type={question.kind === 'multi' ? 'checkbox' : 'radio'}
                   name={question.id}
                   checked={(answers[question.id] ?? []).includes(option.value)}
+                  disabled={pending || answerStatus !== 'editing'}
                   onchange={() => setAnswer(question.id, option.value, question.kind === 'multi')}
                 />
                 <span
@@ -174,11 +336,18 @@
               </label>
             {/each}
           {/if}
+          {#if questionErrors[question.id]}<p class="question-error" role="alert">
+              {questionErrors[question.id]}
+            </p>{/if}
         </section>
       {/each}
     </div>
     <div class="panel-actions">
-      <Button onclick={sendAnswers} loading={pending}>Send answers</Button>
+      <Button
+        onclick={sendAnswers}
+        disabled={pending || answerStatus !== 'editing'}
+        loading={pending}>Send answers</Button
+      >
     </div>
   {:else if plan}
     <div class="panel-scroll">
@@ -400,6 +569,23 @@
   }
   .question-block h4 span {
     color: var(--sui-primary);
+  }
+  .question-recommendation,
+  .question-state,
+  .stale-answers {
+    margin: 8px 20px;
+    color: var(--sui-muted);
+    font-size: 12px;
+  }
+  .question-recommendation {
+    margin: 0 0 12px;
+  }
+  .question-error {
+    color: var(--sui-danger);
+    font-size: 12px;
+  }
+  .stale-answers p {
+    overflow-wrap: anywhere;
   }
   .answer-option {
     display: flex;
