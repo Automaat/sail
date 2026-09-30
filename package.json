@@ -11,9 +11,11 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "latest",
+    "@opencode/client": "^2.0.20",
     "@smykla-skalski/sui": "^0.2.1",
     "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.8.0",
+    "mermaid": "^12.0.0",
     "svelte": "^5.57.1"
   },
   "devDependencies": {

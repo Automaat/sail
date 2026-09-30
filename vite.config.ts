@@ -4,7 +4,7 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 export default defineConfig({
   plugins: [svelte()],
   clearScreen: false,
-  server: { strictPort: true, port: 1420 },
+  server: { host: '127.0.0.1', strictPort: true, port: 1420 },
   envPrefix: ["VITE_", "TAURI_ENV_*"],
   build: { target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari13" },
 });
