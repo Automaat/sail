@@ -1,65 +1,95 @@
-import type { OpenCodeClient } from './opencode';
+import { z } from 'zod';
+import type { JsonValue, OpenCodeClient } from '@opencode/client';
 
-export interface PlanStep {
-  id: string;
-  title: string;
-  detail: string;
-  rationale?: string;
-  files: string[];
-  risk: 'low' | 'medium' | 'high';
-  diagram?: string;
-  needsYou?: string;
-  status: string;
+const PlanStepSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  detail: z.string(),
+  rationale: z.string().optional(),
+  files: z.array(z.string()),
+  risk: z.enum(['low', 'medium', 'high']),
+  diagram: z.string().optional(),
+  needsYou: z.string().optional(),
+  status: z.string(),
+  comment: z.string().optional(),
+});
+
+const PlanSchema = z.object({
+  title: z.string(),
+  summary: z.string(),
+  diagram: z.string().optional(),
+  alternatives: z
+    .array(
+      z.object({
+        name: z.string(),
+        pros: z.array(z.string()),
+        cons: z.array(z.string()),
+        chosen: z.boolean(),
+      }),
+    )
+    .optional(),
+  steps: z.array(PlanStepSchema),
+  sessionID: z.string(),
+  version: z.number(),
+  state: z.enum(['review', 'executing', 'done']),
+});
+
+const PlanQuestionSchema = z.object({
+  id: z.string(),
+  question: z.string(),
+  kind: z.enum(['text', 'single', 'multi', 'confirm']),
+  options: z
+    .array(z.object({ value: z.string(), label: z.string(), description: z.string().optional() }))
+    .optional(),
+  recommended: z.array(z.string()).optional(),
+});
+
+const PlanQuestionsSchema = z.object({
+  id: z.string(),
+  sessionID: z.string(),
+  questions: z.array(PlanQuestionSchema),
+});
+
+const PlanSnapshotSchema = z.object({
+  plan: PlanSchema.nullable(),
+  questions: PlanQuestionsSchema.nullable(),
+});
+
+const OutcomeSchema = z.object({ ok: z.boolean(), error: z.string().optional() });
+
+export type Plan = z.infer<typeof PlanSchema>;
+export type PlanStep = z.infer<typeof PlanStepSchema>;
+export type PlanQuestion = z.infer<typeof PlanQuestionSchema>;
+export type PlanQuestions = z.infer<typeof PlanQuestionsSchema>;
+export type PlanSnapshot = z.infer<typeof PlanSnapshotSchema>;
+
+export interface PlanDecision {
+  stepID: string;
+  verdict?: 'approve' | 'reject' | 'revise';
   comment?: string;
-}
-
-export interface Plan {
-  title: string;
-  summary: string;
-  diagram?: string;
-  alternatives?: Array<{ name: string; pros: string[]; cons: string[]; chosen: boolean }>;
-  steps: PlanStep[];
-  sessionID: string;
-  version: number;
-  state: 'review' | 'executing' | 'done';
-}
-
-export interface PlanQuestion {
-  id: string;
-  question: string;
-  kind: 'text' | 'single' | 'multi' | 'confirm';
-  options?: Array<{ value: string; label: string; description?: string }>;
-  recommended?: string[];
-}
-
-export interface PlanQuestions {
-  id: string;
-  sessionID: string;
-  questions: PlanQuestion[];
-}
-
-export interface PlanSnapshot {
-  plan: Plan | null;
-  questions: PlanQuestions | null;
 }
 
 async function call(
   client: OpenCodeClient,
   directory: string,
   method: string,
-  input: Record<string, unknown>,
+  input: JsonValue,
 ): Promise<unknown> {
   const response = await client.rpc.call({
     rpcID: 'planreview',
     method,
     location: { directory },
-    input: input as Parameters<typeof client.rpc.call>[0]['input'],
+    input,
   });
   return response.output;
 }
 
-export async function getPlan(client: OpenCodeClient, directory: string, sessionID: string): Promise<PlanSnapshot> {
-  return (await call(client, directory, 'get', { sessionID })) as PlanSnapshot;
+export async function getPlan(
+  client: OpenCodeClient,
+  directory: string,
+  sessionID: string,
+): Promise<PlanSnapshot> {
+  return PlanSnapshotSchema.parse(await call(client, directory, 'get', { sessionID }));
 }
 
 export async function answerQuestions(
@@ -69,14 +99,10 @@ export async function answerQuestions(
   id: string,
   answers: Record<string, string[]>,
 ): Promise<void> {
-  const result = (await call(client, directory, 'answer', { sessionID, id, answers })) as { ok: boolean; error?: string };
+  const result = OutcomeSchema.parse(
+    await call(client, directory, 'answer', { sessionID, id, answers }),
+  );
   if (!result.ok) throw new Error(result.error ?? 'The answers were not accepted.');
-}
-
-export interface PlanDecision {
-  stepID: string;
-  verdict?: 'approve' | 'reject' | 'revise';
-  comment?: string;
 }
 
 export async function reviewPlan(
@@ -87,12 +113,17 @@ export async function reviewPlan(
   decisions: PlanDecision[],
   note?: string,
 ): Promise<void> {
-  const result = (await call(client, directory, 'review', {
+  const input: JsonValue = {
     sessionID: plan.sessionID,
     version: plan.version,
     action,
-    decisions,
-    note,
-  })) as { ok: boolean; error?: string };
+    decisions: decisions.map((decision) => ({
+      stepID: decision.stepID,
+      ...(decision.verdict ? { verdict: decision.verdict } : {}),
+      ...(decision.comment === undefined ? {} : { comment: decision.comment }),
+    })),
+    ...(note === undefined ? {} : { note }),
+  };
+  const result = OutcomeSchema.parse(await call(client, directory, 'review', input));
   if (!result.ok) throw new Error(result.error ?? 'The review was not accepted.');
 }

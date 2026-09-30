@@ -29,9 +29,13 @@ Other tasks:
 
 ```sh
 mise run web    # frontend preview; desktop runtime unavailable in a browser
-mise run check  # frontend build and Rust check
+mise run lint   # strict Oxlint, ESLint, Prettier, rustfmt, Clippy
+mise run check  # lint, Svelte typecheck, frontend build
+mise run format # format frontend and Rust sources
 mise run build  # desktop bundle
 ```
+
+Pull requests run the same frontend and Rust checks on Linux, macOS, and Windows through GitHub Actions. The frontend lint configuration follows the [Harness panel](https://github.com/smykla-skalski/harness/tree/main/crates/harness-panel/frontend); Rust uses its Clippy settings.
 
 ## Architecture
 

@@ -1,7 +1,13 @@
 <script lang="ts">
   import { Badge, Button } from '@smykla-skalski/sui';
   import Diagram from './Diagram.svelte';
-  import { answerQuestions, reviewPlan, type PlanDecision, type PlanSnapshot } from './lib/plan';
+  import {
+    answerQuestions,
+    reviewPlan,
+    type PlanDecision,
+    type PlanQuestion,
+    type PlanSnapshot,
+  } from './lib/plan';
   import type { OpenCodeClient } from './lib/opencode';
 
   interface Props {
@@ -23,12 +29,22 @@
 
   let plan = $derived(snapshot.plan);
   let questions = $derived(snapshot.questions);
-  let canExecute = $derived(!!plan &&
-    plan.steps.every((step) => decisions[step.id]?.verdict
-      ? ['approve', 'reject'].includes(decisions[step.id].verdict ?? '')
-      : ['approved', 'in_progress', 'done', 'blocked', 'skipped', 'rejected'].includes(step.status)) &&
-    plan.steps.some((step) => decisions[step.id]?.verdict === 'approve' ||
-      (decisions[step.id]?.verdict !== 'reject' && ['approved', 'in_progress', 'blocked'].includes(step.status))));
+  let canExecute = $derived(
+    !!plan &&
+      plan.steps.every((step) =>
+        decisions[step.id]?.verdict
+          ? ['approve', 'reject'].includes(decisions[step.id].verdict ?? '')
+          : ['approved', 'in_progress', 'done', 'blocked', 'skipped', 'rejected'].includes(
+              step.status,
+            ),
+      ) &&
+      plan.steps.some(
+        (step) =>
+          decisions[step.id]?.verdict === 'approve' ||
+          (decisions[step.id]?.verdict !== 'reject' &&
+            ['approved', 'in_progress', 'blocked'].includes(step.status)),
+      ),
+  );
 
   $effect(() => {
     const key = plan ? `${plan.sessionID}:${plan.version}` : '';
@@ -43,7 +59,9 @@
     const key = questions?.id ?? '';
     if (key !== currentQuestions) {
       currentQuestions = key;
-      answers = Object.fromEntries(questions?.questions.map((question) => [question.id, question.recommended ?? []]) ?? []);
+      answers = Object.fromEntries(
+        questions?.questions.map((question) => [question.id, question.recommended ?? []]) ?? [],
+      );
     }
   });
 
@@ -57,7 +75,20 @@
 
   function setAnswer(id: string, value: string, multi: boolean) {
     const current = answers[id] ?? [];
-    answers[id] = multi ? (current.includes(value) ? current.filter((item) => item !== value) : [...current, value]) : [value];
+    answers[id] = multi
+      ? current.includes(value)
+        ? current.filter((item) => item !== value)
+        : [...current, value]
+      : [value];
+  }
+
+  function questionOptions(question: PlanQuestion) {
+    return question.kind === 'confirm'
+      ? [
+          { value: 'yes', label: 'Yes' },
+          { value: 'no', label: 'No' },
+        ]
+      : (question.options ?? []);
   }
 
   async function sendAnswers() {
@@ -79,7 +110,14 @@
     pending = true;
     error = '';
     try {
-      await reviewPlan(client, directory, plan, action, Object.values(decisions), note.trim() || undefined);
+      await reviewPlan(
+        client,
+        directory,
+        plan,
+        action,
+        Object.values(decisions),
+        note.trim() || undefined,
+      );
       await onchanged();
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
@@ -91,8 +129,13 @@
 
 <aside class="plan-panel" aria-label="Plan review">
   <div class="panel-heading">
-    <div><p class="eyebrow">PLAN WORKSPACE</p><h2>Review</h2></div>
-    {#if plan}<Badge tone={plan.state === 'review' ? 'warning' : 'success'}>v{plan.version} · {plan.state}</Badge>{/if}
+    <div>
+      <p class="eyebrow">PLAN WORKSPACE</p>
+      <h2>Review</h2>
+    </div>
+    {#if plan}<Badge tone={plan.state === 'review' ? 'warning' : 'success'}
+        >v{plan.version} · {plan.state}</Badge
+      >{/if}
   </div>
 
   {#if error}<p class="panel-error" role="alert">{error}</p>{/if}
@@ -105,19 +148,38 @@
         <section class="question-block">
           <h4><span>{index + 1}.</span> {question.question}</h4>
           {#if question.kind === 'text'}
-            <textarea rows="3" placeholder="Your answer" value={answers[question.id]?.[0] ?? ''} oninput={(event) => answers[question.id] = event.currentTarget.value.trim() ? [event.currentTarget.value] : []}></textarea>
+            <textarea
+              rows="3"
+              placeholder="Your answer"
+              value={answers[question.id]?.[0] ?? ''}
+              oninput={(event) =>
+                (answers[question.id] = event.currentTarget.value.trim()
+                  ? [event.currentTarget.value]
+                  : [])}></textarea>
           {:else}
-            {#each (question.kind === 'confirm' ? [{ value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }] : (question.options ?? [])) as option (option.value)}
+            {#each questionOptions(question) as option (option.value)}
               <label class="answer-option">
-                <input type={question.kind === 'multi' ? 'checkbox' : 'radio'} name={question.id} checked={(answers[question.id] ?? []).includes(option.value)} onchange={() => setAnswer(question.id, option.value, question.kind === 'multi')} />
-                <span><strong>{option.label}</strong>{#if 'description' in option && option.description}<small>{option.description}</small>{/if}</span>
+                <input
+                  type={question.kind === 'multi' ? 'checkbox' : 'radio'}
+                  name={question.id}
+                  checked={(answers[question.id] ?? []).includes(option.value)}
+                  onchange={() => setAnswer(question.id, option.value, question.kind === 'multi')}
+                />
+                <span
+                  ><strong>{option.label}</strong
+                  >{#if 'description' in option && option.description}<small
+                      >{option.description}</small
+                    >{/if}</span
+                >
               </label>
             {/each}
           {/if}
         </section>
       {/each}
     </div>
-    <div class="panel-actions"><Button onclick={sendAnswers} loading={pending}>Send answers</Button></div>
+    <div class="panel-actions">
+      <Button onclick={sendAnswers} loading={pending}>Send answers</Button>
+    </div>
   {:else if plan}
     <div class="panel-scroll">
       <h3>{plan.title}</h3>
@@ -126,15 +188,41 @@
 
       {#if plan.alternatives?.length}
         <div class="subheading">Approaches</div>
-        {#each plan.alternatives as alternative}
-          <div class="alternative"><strong>{alternative.name}</strong>{#if alternative.chosen}<Badge tone="success">Chosen</Badge>{/if}{#if alternative.pros.length}<p><b>Pros</b> {alternative.pros.join(' · ')}</p>{/if}{#if alternative.cons.length}<p><b>Cons</b> {alternative.cons.join(' · ')}</p>{/if}</div>
+        {#each plan.alternatives as alternative, index (index)}
+          <div class="alternative">
+            <strong>{alternative.name}</strong>{#if alternative.chosen}<Badge tone="success"
+                >Chosen</Badge
+              >{/if}{#if alternative.pros.length}<p>
+                <b>Pros</b>
+                {alternative.pros.join(' · ')}
+              </p>{/if}{#if alternative.cons.length}<p>
+                <b>Cons</b>
+                {alternative.cons.join(' · ')}
+              </p>{/if}
+          </div>
         {/each}
       {/if}
 
       <div class="subheading">Steps <span>{plan.steps.length}</span></div>
       {#each plan.steps as step, index (step.id)}
         <section class="step-card">
-          <div class="step-head"><span class="step-number">{String(index + 1).padStart(2, '0')}</span><h4>{step.title}</h4><Badge tone={step.risk === 'high' ? 'danger' : step.risk === 'medium' ? 'warning' : 'neutral'}>{step.risk}</Badge><Badge tone={step.status === 'done' || step.status === 'approved' ? 'success' : step.status === 'blocked' || step.status === 'rejected' ? 'danger' : 'neutral'}>{step.status}</Badge></div>
+          <div class="step-head">
+            <span class="step-number">{String(index + 1).padStart(2, '0')}</span>
+            <h4>{step.title}</h4>
+            <Badge
+              tone={step.risk === 'high'
+                ? 'danger'
+                : step.risk === 'medium'
+                  ? 'warning'
+                  : 'neutral'}>{step.risk}</Badge
+            ><Badge
+              tone={step.status === 'done' || step.status === 'approved'
+                ? 'success'
+                : step.status === 'blocked' || step.status === 'rejected'
+                  ? 'danger'
+                  : 'neutral'}>{step.status}</Badge
+            >
+          </div>
           <p>{step.detail}</p>
           {#if step.rationale}<p class="rationale">Why: {step.rationale}</p>{/if}
           {#if step.needsYou}<p class="decision-prompt">Decision: {step.needsYou}</p>{/if}
@@ -142,50 +230,249 @@
           {#if step.files.length}<p class="files">{step.files.join(' · ')}</p>{/if}
           {#if plan.state === 'review'}
             <div class="decision-buttons">
-              <Button size="sm" variant={decisions[step.id]?.verdict === 'approve' ? 'primary' : 'secondary'} onclick={() => setDecision(step.id, 'approve')}>Approve</Button>
-              <Button size="sm" variant={decisions[step.id]?.verdict === 'revise' ? 'primary' : 'secondary'} onclick={() => setDecision(step.id, 'revise')}>Revise</Button>
-              <Button size="sm" variant={decisions[step.id]?.verdict === 'reject' ? 'danger' : 'secondary'} onclick={() => setDecision(step.id, 'reject')}>Reject</Button>
+              <Button
+                size="sm"
+                variant={decisions[step.id]?.verdict === 'approve' ? 'primary' : 'secondary'}
+                onclick={() => setDecision(step.id, 'approve')}>Approve</Button
+              >
+              <Button
+                size="sm"
+                variant={decisions[step.id]?.verdict === 'revise' ? 'primary' : 'secondary'}
+                onclick={() => setDecision(step.id, 'revise')}>Revise</Button
+              >
+              <Button
+                size="sm"
+                variant={decisions[step.id]?.verdict === 'reject' ? 'danger' : 'secondary'}
+                onclick={() => setDecision(step.id, 'reject')}>Reject</Button
+              >
             </div>
             {#if decisions[step.id]?.verdict === 'revise' || decisions[step.id]?.verdict === 'reject'}
-              <textarea rows="2" placeholder="What should change?" value={decisions[step.id]?.comment ?? ''} oninput={(event) => setComment(step.id, event.currentTarget.value)}></textarea>
+              <textarea
+                rows="2"
+                placeholder="What should change?"
+                value={decisions[step.id]?.comment ?? ''}
+                oninput={(event) => setComment(step.id, event.currentTarget.value)}></textarea>
             {/if}
           {/if}
         </section>
       {/each}
-      {#if plan.state === 'review'}<textarea class="review-note" rows="2" placeholder="General feedback for the architect (optional)" bind:value={note}></textarea>{/if}
+      {#if plan.state === 'review'}<textarea
+          class="review-note"
+          rows="2"
+          placeholder="General feedback for the architect (optional)"
+          bind:value={note}></textarea>{/if}
     </div>
     {#if plan.state === 'review'}
       <div class="panel-actions split">
-        <Button variant="secondary" onclick={() => sendReview('revise')} loading={pending}>Request changes</Button>
-        <Button onclick={() => sendReview('execute')} disabled={!canExecute} loading={pending}>Execute plan</Button>
+        <Button variant="secondary" onclick={() => sendReview('revise')} loading={pending}
+          >Request changes</Button
+        >
+        <Button onclick={() => sendReview('execute')} disabled={!canExecute} loading={pending}
+          >Execute plan</Button
+        >
       </div>
     {/if}
   {:else}
-    <div class="panel-empty"><div class="panel-empty-mark">◇</div><h3>Your plan appears here</h3><p>Start a conversation with the architect. Diagrams, questions, and step decisions will appear alongside the chat.</p></div>
+    <div class="panel-empty">
+      <div class="panel-empty-mark">◇</div>
+      <h3>Your plan appears here</h3>
+      <p>
+        Start a conversation with the architect. Diagrams, questions, and step decisions will appear
+        alongside the chat.
+      </p>
+    </div>
   {/if}
 </aside>
 
 <style>
-  .plan-panel { display: flex; flex-direction: column; min-width: 0; height: 100%; background: var(--sui-surface); border-left: 1px solid var(--shell-divider); }
-  .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 20px; border-bottom: 1px solid var(--shell-divider); }
-  .eyebrow { margin: 0 0 3px; color: var(--sui-primary); font-size: 10px; font-weight: 700; letter-spacing: .08em; }
-  h2 { margin: 0; font-size: 18px; } h3 { margin: 0 0 8px; font-size: 16px; } h4 { margin: 0; font-size: 14px; }
-  .panel-scroll { flex: 1; overflow: auto; padding: 20px; }
-  .summary,.muted { margin: 0 0 18px; color: var(--sui-muted); font-size: 13px; line-height: 1.55; white-space: pre-wrap; }
-  .subheading { display: flex; justify-content: space-between; margin: 24px 0 10px; color: var(--sui-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
-  .alternative { padding: 12px 0; border-bottom: 1px solid var(--shell-divider); font-size: 13px; }
-  .alternative :global(.sui-badge) { margin-left: 8px; }.alternative p { margin: 5px 0 0; color: var(--sui-muted); }
-  .step-card,.question-block { padding: 16px 0; border-top: 1px solid var(--shell-divider); }
-  .step-head { display: flex; align-items: center; gap: 9px; }.step-head h4 { flex: 1; }.step-number { color: var(--sui-primary); font-size: 11px; font-weight: 700; }
-  .step-card > p { margin: 10px 0; color: var(--sui-muted); font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
-  .step-card .decision-prompt { color: var(--sui-foreground); font-weight: 600; }.step-card .files { font-family: ui-monospace,monospace; font-size: 11px; }
-  .decision-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
-  .question-block h4 { margin-bottom: 12px; line-height: 1.45; }.question-block h4 span { color: var(--sui-primary); }
-  .answer-option { display: flex; align-items: flex-start; gap: 10px; padding: 9px; border: 1px solid var(--shell-divider); border-radius: 8px; margin-bottom: 7px; cursor: pointer; }
-  .answer-option input { accent-color: var(--sui-primary); margin-top: 3px; }.answer-option strong { display: block; font-size: 13px; }.answer-option small { display: block; color: var(--sui-muted); margin-top: 2px; }
-  textarea { width: 100%; margin-top: 12px; padding: 10px 12px; resize: vertical; border: 1px solid var(--sui-border); border-radius: 8px; color: var(--sui-foreground); background: var(--sui-surface); font: 13px/1.5 var(--sui-font); }
-  textarea:focus { outline: 2px solid var(--sui-focus); outline-offset: 1px; }.review-note { margin-top: 20px; }
-  .panel-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 20px; border-top: 1px solid var(--shell-divider); }.panel-actions.split { justify-content: space-between; }
-  .panel-empty { margin: auto; max-width: 290px; padding: 30px; text-align: center; }.panel-empty-mark { color: var(--sui-primary); font-size: 42px; }.panel-empty p { color: var(--sui-muted); font-size: 13px; line-height: 1.5; }
-  .panel-error { margin: 12px 20px 0; padding: 10px; color: var(--sui-danger-ink); background: var(--sui-danger-subtle); border-radius: 8px; font-size: 12px; }
+  .plan-panel {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    height: 100%;
+    background: var(--sui-surface);
+    border-left: 1px solid var(--shell-divider);
+  }
+  .panel-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 20px;
+    border-bottom: 1px solid var(--shell-divider);
+  }
+  .eyebrow {
+    margin: 0 0 3px;
+    color: var(--sui-primary);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+  h2 {
+    margin: 0;
+    font-size: 18px;
+  }
+  h3 {
+    margin: 0 0 8px;
+    font-size: 16px;
+  }
+  h4 {
+    margin: 0;
+    font-size: 14px;
+  }
+  .panel-scroll {
+    flex: 1;
+    overflow: auto;
+    padding: 20px;
+  }
+  .summary,
+  .muted {
+    margin: 0 0 18px;
+    color: var(--sui-muted);
+    font-size: 13px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+  }
+  .subheading {
+    display: flex;
+    justify-content: space-between;
+    margin: 24px 0 10px;
+    color: var(--sui-muted);
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .alternative {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--shell-divider);
+    font-size: 13px;
+  }
+  .alternative :global(.sui-badge) {
+    margin-left: 8px;
+  }
+  .alternative p {
+    margin: 5px 0 0;
+    color: var(--sui-muted);
+  }
+  .step-card,
+  .question-block {
+    padding: 16px 0;
+    border-top: 1px solid var(--shell-divider);
+  }
+  .step-head {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .step-head h4 {
+    flex: 1;
+  }
+  .step-number {
+    color: var(--sui-primary);
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .step-card > p {
+    margin: 10px 0;
+    color: var(--sui-muted);
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+  }
+  .step-card .decision-prompt {
+    color: var(--sui-foreground);
+    font-weight: 600;
+  }
+  .step-card .files {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+  }
+  .decision-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 14px;
+  }
+  .question-block h4 {
+    margin-bottom: 12px;
+    line-height: 1.45;
+  }
+  .question-block h4 span {
+    color: var(--sui-primary);
+  }
+  .answer-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 9px;
+    border: 1px solid var(--shell-divider);
+    border-radius: 8px;
+    margin-bottom: 7px;
+    cursor: pointer;
+  }
+  .answer-option input {
+    accent-color: var(--sui-primary);
+    margin-top: 3px;
+  }
+  .answer-option strong {
+    display: block;
+    font-size: 13px;
+  }
+  .answer-option small {
+    display: block;
+    color: var(--sui-muted);
+    margin-top: 2px;
+  }
+  textarea {
+    width: 100%;
+    margin-top: 12px;
+    padding: 10px 12px;
+    resize: vertical;
+    border: 1px solid var(--sui-border);
+    border-radius: 8px;
+    color: var(--sui-foreground);
+    background: var(--sui-surface);
+    font: 13px/1.5 var(--sui-font);
+  }
+  textarea:focus {
+    outline: 2px solid var(--sui-focus);
+    outline-offset: 1px;
+  }
+  .review-note {
+    margin-top: 20px;
+  }
+  .panel-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 16px 20px;
+    border-top: 1px solid var(--shell-divider);
+  }
+  .panel-actions.split {
+    justify-content: space-between;
+  }
+  .panel-empty {
+    margin: auto;
+    max-width: 290px;
+    padding: 30px;
+    text-align: center;
+  }
+  .panel-empty-mark {
+    color: var(--sui-primary);
+    font-size: 42px;
+  }
+  .panel-empty p {
+    color: var(--sui-muted);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .panel-error {
+    margin: 12px 20px 0;
+    padding: 10px;
+    color: var(--sui-danger-ink);
+    background: var(--sui-danger-subtle);
+    border-radius: 8px;
+    font-size: 12px;
+  }
 </style>

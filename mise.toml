@@ -19,9 +19,28 @@ depends = ["install"]
 run = "npm run dev"
 
 [tasks.check]
-description = "Check the frontend and Rust application"
+description = "Lint, typecheck, build, and check the Rust application"
 depends = ["install"]
-run = ["npm run build", "cargo check --manifest-path src-tauri/Cargo.toml"]
+run = [
+  "npm run lint",
+  "npm run build",
+  "cargo fmt --manifest-path src-tauri/Cargo.toml --all --check",
+  "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings",
+]
+
+[tasks.lint]
+description = "Lint the Svelte frontend and Rust application"
+depends = ["install"]
+run = [
+  "npm run lint",
+  "cargo fmt --manifest-path src-tauri/Cargo.toml --all --check",
+  "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings",
+]
+
+[tasks.format]
+description = "Format frontend and Rust sources"
+depends = ["install"]
+run = ["npm run format", "cargo fmt --manifest-path src-tauri/Cargo.toml --all"]
 
 [tasks.build]
 description = "Bundle the desktop app"
