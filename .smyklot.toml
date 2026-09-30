@@ -1,0 +1,7 @@
+#:schema https://smyklot.com/schema/repository-panel-v1.json
+
+[panel]
+version = 1
+scope = 'repository'
+
+[panel.settings]
