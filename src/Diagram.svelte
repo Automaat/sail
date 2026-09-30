@@ -5,13 +5,13 @@
   }
 
   let { source, dark }: Props = $props();
-  let svg = $state('');
+  let imageUrl = $state('');
   let error = $state('');
   let generation = 0;
 
   $effect(() => {
     const current = ++generation;
-    svg = '';
+    imageUrl = '';
     error = '';
     void (async () => {
       try {
@@ -21,8 +21,12 @@
           securityLevel: 'strict',
           theme: dark ? 'dark' : 'neutral',
         });
-        const rendered = await mermaid.render(`sai-plan-${current}-${Math.random().toString(36).slice(2)}`, source);
-        if (current === generation) svg = rendered.svg;
+        const rendered = await mermaid.render(
+          `sai-plan-${current}-${Math.random().toString(36).slice(2)}`,
+          source,
+        );
+        if (current === generation)
+          imageUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(rendered.svg)}`;
       } catch {
         if (current === generation) error = 'Diagram preview is unavailable.';
       }
@@ -31,8 +35,8 @@
 </script>
 
 <div class="diagram" aria-label="Plan diagram">
-  {#if svg}
-    {@html svg}
+  {#if imageUrl}
+    <img src={imageUrl} alt="Plan diagram" />
   {:else if error}
     <p>{error}</p>
     <pre>{source}</pre>
@@ -42,8 +46,27 @@
 </div>
 
 <style>
-  .diagram { overflow: auto; padding: 16px; border: 1px solid var(--shell-divider); border-radius: 10px; background: var(--sui-surface); }
-  .diagram :global(svg) { display: block; max-width: 100%; height: auto; margin: 0 auto; }
-  p { margin: 0; color: var(--sui-muted); font-size: 13px; }
-  pre { overflow: auto; font-size: 12px; white-space: pre-wrap; }
+  .diagram {
+    overflow: auto;
+    padding: 16px;
+    border: 1px solid var(--shell-divider);
+    border-radius: 10px;
+    background: var(--sui-surface);
+  }
+  img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 0 auto;
+  }
+  p {
+    margin: 0;
+    color: var(--sui-muted);
+    font-size: 13px;
+  }
+  pre {
+    overflow: auto;
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
 </style>

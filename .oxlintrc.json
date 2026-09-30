@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+  },
+  "plugins": ["eslint", "typescript", "oxc", "promise", "unicorn"],
+  "options": {
+    "typeAware": true
+  },
+  "env": {
+    "browser": true,
+    "svelte": true
+  },
+  "ignorePatterns": ["dist/**", "node_modules/**", "src-tauri/target/**", "src-tauri/gen/**"],
+  "overrides": [
+    {
+      "files": ["*.config.ts", "*.config.js"],
+      "env": { "node": true }
+    }
+  ]
+}
