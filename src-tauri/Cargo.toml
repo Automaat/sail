@@ -1,0 +1,19 @@
+[package]
+name = "sai-harness"
+version = "0.1.0"
+description = "Desktop workflow harness for OpenCode"
+authors = ["Marcin Skalski"]
+edition = "2021"
+
+[lib]
+name = "sai_harness_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+

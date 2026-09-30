@@ -1,0 +1,6 @@
+node_modules
+dist
+target
+.tauri
+*.log
+.DS_Store
