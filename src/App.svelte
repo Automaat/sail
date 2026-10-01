@@ -22,6 +22,14 @@
     type PaletteEntry,
   } from './lib/command-palette';
   import {
+    loadRecentThreadKeys,
+    migrateRecentThreadKeys,
+    nextRecentIndex,
+    retainRecentThreads,
+    threadKey,
+    touchRecentThread,
+  } from './lib/recent-threads';
+  import {
     adjacentPaneId,
     closePane,
     leaves,
@@ -76,6 +84,12 @@
   let runtimeSettingsOpen = $state(false);
   let agentAvailability = $state<AgentAvailability[]>([]);
   let agentThreads = $state<AgentThread[]>(savedAgentThreads);
+  let recentThreadKeys = $state<string[]>(
+    loadRecentThreadKeys(getSetting('sai-recent-agent-threads'), savedAgentThreads),
+  );
+  let recentCycleKeys: string[] | null = null;
+  let recentCycleIndex = -1;
+  let recentJumpGeneration = 0;
   let paletteQuery = $state('');
   let paletteIndex = $state(0);
   let promptFocusPane = $state<string | null>(null);
@@ -796,6 +810,7 @@
       const removedThreads = agentThreads.filter((thread) => thread.directory === path);
       agentThreads = agentThreads.filter((thread) => thread.directory !== path);
       saveAgentThreads(agentThreads);
+      forgetMissingRecentThreads();
       for (const thread of removedThreads) updateAgentThreadStatus(thread, false);
       delete paneLayouts[path];
       persistPaneLayouts();
@@ -824,7 +839,7 @@
     }
   }
 
-  async function loadProject(path: string) {
+  async function loadProject(path: string, recordRestoredThread = true) {
     ++projectLoadGeneration;
     saveViewState();
     error = '';
@@ -837,6 +852,15 @@
     const savedMain = leaves(paneLayouts[path] ?? mainPane()).find((leaf) => leaf.id === 'main');
     acpAgent = savedMain?.agent ?? null;
     acpThread = savedMain?.thread ?? null;
+    const restoredThread = leaves(paneLayouts[path] ?? mainPane()).find(
+      (leaf) => leaf.id === focusedPane,
+    )?.thread;
+    if (
+      recordRestoredThread &&
+      restoredThread &&
+      agentThreads.some((thread) => threadKey(thread) === threadKey(restoredThread))
+    )
+      rememberRecentThread(restoredThread);
     ++sessionRefresh;
     workReady = false;
     planReady = false;
@@ -905,6 +929,26 @@
           persistPaneLayouts();
         }
         saveProjectCatalog(replaceRepositoryPath(projectCatalog, path, report.repository));
+        if (recentCycleKeys) {
+          const selectedKey = recentCycleKeys[recentCycleIndex];
+          const migratedSelected = selectedKey
+            ? migrateRecentThreadKeys([selectedKey], agentThreads, path, report.repository)[0]
+            : null;
+          recentCycleKeys = migrateRecentThreadKeys(
+            recentCycleKeys,
+            agentThreads,
+            path,
+            report.repository,
+          );
+          recentCycleIndex = migratedSelected ? recentCycleKeys.indexOf(migratedSelected) : -1;
+        }
+        recentThreadKeys = migrateRecentThreadKeys(
+          recentThreadKeys,
+          agentThreads,
+          path,
+          report.repository,
+        );
+        setSetting('sai-recent-agent-threads', JSON.stringify(recentThreadKeys));
         agentThreads = agentThreads.map((thread) =>
           thread.directory === path
             ? Object.assign({}, thread, { directory: report.repository })
@@ -1090,8 +1134,13 @@
     removeSetting(`sai-session:${directory}`);
   }
 
-  function openAgent(agent: AgentId, thread: AgentThread | null = null) {
+  function openAgent(agent: AgentId, thread: AgentThread | null = null, preserveCycle = false) {
     if (!directory) return;
+    if (!preserveCycle) {
+      recentCycleKeys = null;
+      ++recentJumpGeneration;
+    }
+    if (thread) rememberRecentThread(thread);
     if (focusedPane !== 'main' && leaves(paneLayout).some((leaf) => leaf.id === focusedPane)) {
       savePaneLayout(updatePane(paneLayout, focusedPane, { agent, thread }));
       return;
@@ -1106,6 +1155,7 @@
 
   function openCommandPalette() {
     if (paletteDialog.open || document.querySelector('dialog[open]')) return;
+    ++recentJumpGeneration;
     palettePreviousFocus = document.activeElement as HTMLElement | null;
     restorePaletteFocus = true;
     paletteQuery = '';
@@ -1145,7 +1195,7 @@
     closeCommandPalette(false);
     let expectedProjectLoad = projectLoadGeneration;
     if (target !== directory) {
-      const pending = loadProject(target);
+      const pending = loadProject(target, false);
       expectedProjectLoad = projectLoadGeneration;
       await pending;
     }
@@ -1221,8 +1271,74 @@
       acpThread = thread;
   }
 
+  function rememberRecentThread(thread: AgentThread) {
+    recentThreadKeys = touchRecentThread(recentThreadKeys, thread);
+    setSetting('sai-recent-agent-threads', JSON.stringify(recentThreadKeys));
+  }
+
+  function forgetMissingRecentThreads() {
+    recentThreadKeys = retainRecentThreads(recentThreadKeys, agentThreads);
+    setSetting('sai-recent-agent-threads', JSON.stringify(recentThreadKeys));
+  }
+
+  function availableRecentKeys(): string[] {
+    const availableAgents = new Set(
+      agentAvailability.filter((agent) => agent.available).map((agent) => agent.id),
+    );
+    const projectPaths = new Set([
+      ...projectCatalog.repositories,
+      ...Object.values(projectCatalog.worktrees).flatMap((worktrees) =>
+        worktrees.map((worktree) => worktree.path),
+      ),
+    ]);
+    const availableThreads = new Set(
+      agentThreads
+        .filter((thread) => availableAgents.has(thread.agent) && projectPaths.has(thread.directory))
+        .map(threadKey),
+    );
+    return recentThreadKeys.filter((key) => availableThreads.has(key));
+  }
+
+  function focusedThreadKey(): string | null {
+    const thread =
+      focusedPane === 'main'
+        ? acpThread
+        : leaves(paneLayout).find((pane) => pane.id === focusedPane)?.thread;
+    return thread ? threadKey(thread) : null;
+  }
+
+  async function jumpToRecentThread(key: string) {
+    const thread = agentThreads.find((item) => threadKey(item) === key);
+    if (!thread || !agentAvailability.some((agent) => agent.id === thread.agent && agent.available))
+      return;
+    const jump = ++recentJumpGeneration;
+    let expectedProjectLoad = projectLoadGeneration;
+    const target = await invoke<string>('validate_repository', { path: thread.directory }).catch(
+      () => null,
+    );
+    if (!target || jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
+      return;
+    if (thread.directory !== directory || target !== directory) {
+      const pending = loadProject(thread.directory, false);
+      expectedProjectLoad = projectLoadGeneration;
+      await pending;
+    }
+    if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration) return;
+    const selected = agentThreads.find(
+      (item) =>
+        item.directory === directory &&
+        item.agent === thread.agent &&
+        item.sessionId === thread.sessionId,
+    );
+    if (!selected) return;
+    focusMainPane();
+    openAgent(selected.agent, selected, true);
+    focusPaneForTyping('main');
+  }
+
   function createAgentThread(thread: AgentThread) {
     saveAgentThread(thread);
+    rememberRecentThread(thread);
     if (acpAgent === thread.agent && directory === thread.directory && !acpThread) {
       acpThread = thread;
       savePaneLayout(updatePane(paneLayout, 'main', { agent: thread.agent, thread }));
@@ -1240,6 +1356,7 @@
 
   function splitFocusedPane(direction: 'row' | 'column') {
     if (!directory) return;
+    ++recentJumpGeneration;
     const agent =
       (focusedPane === 'main'
         ? acpAgent
@@ -1259,8 +1376,20 @@
 
   function focusPaneForTyping(id: string) {
     focusedPane = id;
+    const thread =
+      id === 'main' ? acpThread : leaves(paneLayout).find((pane) => pane.id === id)?.thread;
+    if (thread) rememberRecentThread(thread);
     promptFocusPane = id;
     void focusPanePromptAfterTick(id);
+  }
+
+  function focusPane(id: string) {
+    if (focusedPane === id) return;
+    ++recentJumpGeneration;
+    focusedPane = id;
+    const thread =
+      id === 'main' ? acpThread : leaves(paneLayout).find((pane) => pane.id === id)?.thread;
+    if (thread) rememberRecentThread(thread);
   }
 
   async function focusPanePromptAfterTick(id: string) {
@@ -1284,6 +1413,7 @@
   }
 
   function closeFocusedPane(id: string) {
+    ++recentJumpGeneration;
     let layout = closePane(paneLayout, id);
     if (!('direction' in layout) && layout.id === 'main')
       layout = { ...layout, agent: acpAgent, thread: acpThread };
@@ -1293,6 +1423,7 @@
   }
 
   function closeCurrentPane() {
+    ++recentJumpGeneration;
     if (leaves(paneLayout).length > 1) {
       closeFocusedPane(focusedPane);
       return;
@@ -1315,6 +1446,7 @@
   function createPaneThread(id: string, thread: AgentThread) {
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     saveAgentThread(thread);
+    rememberRecentThread(thread);
   }
 
   function focusMainPane() {
@@ -1338,6 +1470,7 @@
         item.sessionId !== thread.sessionId,
     );
     saveAgentThreads(agentThreads);
+    forgetMissingRecentThreads();
     updateAgentThreadStatus(thread, false);
     for (const [path, layout] of Object.entries(paneLayouts)) {
       let next = layout;
@@ -2145,6 +2278,46 @@
 
   function keydownWorkspace(event: KeyboardEvent) {
     if (
+      event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      event.key === 'Tab' &&
+      !document.querySelector('dialog[open]')
+    ) {
+      event.preventDefault();
+      if (!recentCycleKeys) {
+        recentCycleKeys = availableRecentKeys();
+        recentCycleIndex = nextRecentIndex(
+          recentCycleKeys,
+          focusedThreadKey(),
+          event.shiftKey ? -1 : 1,
+        );
+      } else {
+        recentCycleIndex = nextRecentIndex(
+          recentCycleKeys,
+          recentCycleKeys[recentCycleIndex] ?? null,
+          event.shiftKey ? -1 : 1,
+        );
+      }
+      const key = recentCycleKeys[recentCycleIndex];
+      if (key) void jumpToRecentThread(key);
+      return;
+    }
+    if (
+      event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      /^[1-9]$/.test(event.key) &&
+      !document.querySelector('dialog[open]')
+    ) {
+      event.preventDefault();
+      recentCycleKeys = null;
+      const key = availableRecentKeys()[Number(event.key) - 1];
+      if (key) void jumpToRecentThread(key);
+      return;
+    }
+    if (
       (event.metaKey || event.ctrlKey) &&
       !event.altKey &&
       !event.shiftKey &&
@@ -2204,7 +2377,10 @@
               focusedPane,
               event.key.slice(5).toLowerCase() as 'left' | 'right' | 'up' | 'down',
             );
-      if (next) focusPaneForTyping(next);
+      if (next) {
+        ++recentJumpGeneration;
+        focusPaneForTyping(next);
+      }
       return;
     }
     if (
@@ -2239,6 +2415,10 @@
     void toggleChanges();
   }
 
+  function keyupWorkspace(event: KeyboardEvent) {
+    if (event.key === 'Control') recentCycleKeys = null;
+  }
+
   function focusWorkspace() {
     if (acpAgent && agentChangesOpen) void refreshAgentDiff();
     else if (!acpAgent && detailsOpen && activeSideTab === 'changes') void refreshDiff();
@@ -2264,6 +2444,8 @@
 <svelte:head><title>Sail · Plan workspace</title></svelte:head>
 <svelte:window
   onkeydown={keydownWorkspace}
+  onkeyup={keyupWorkspace}
+  onblur={() => (recentCycleKeys = null)}
   onfocus={focusWorkspace}
   onfocusin={cancelPendingPromptFocus}
 />
@@ -2852,7 +3034,7 @@
       {changesPanes}
       main={mainPaneContent}
       canClose={leaves(paneLayout).length > 1}
-      onfocus={(id) => (focusedPane = id)}
+      onfocus={focusPane}
       onclose={closeFocusedPane}
       onratio={updatePaneRatio}
       oncreated={createPaneThread}
