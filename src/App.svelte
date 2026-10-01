@@ -17,6 +17,11 @@
   import AgentWorkspace from './AgentWorkspace.svelte';
   import PaneTree from './PaneTree.svelte';
   import {
+    newestAvailableThread,
+    searchCommandPalette,
+    type PaletteEntry,
+  } from './lib/command-palette';
+  import {
     adjacentPaneId,
     closePane,
     leaves,
@@ -71,6 +76,16 @@
   let runtimeSettingsOpen = $state(false);
   let agentAvailability = $state<AgentAvailability[]>([]);
   let agentThreads = $state<AgentThread[]>(savedAgentThreads);
+  let paletteQuery = $state('');
+  let paletteIndex = $state(0);
+  let promptFocusPane = $state<string | null>(null);
+  let paletteDialog: HTMLDialogElement;
+  let paletteInput: HTMLInputElement;
+  let palettePreviousFocus: HTMLElement | null = null;
+  let restorePaletteFocus = true;
+  const paletteEntries = $derived(
+    searchCommandPalette(projectCatalog, agentThreads, agentAvailability, directory, paletteQuery),
+  );
   let runningAgentThreads = $state<Record<string, boolean>>({});
   const savedPaneLayouts = loadPaneLayouts(getSetting('sai-pane-layouts'));
   let paneLayouts = $state<Record<string, Pane>>(savedPaneLayouts);
@@ -359,6 +374,7 @@
   let pendingPermissions = $state<PermissionRequest[]>([]);
   let pendingForms = $state<FormInfo[]>([]);
   let selection = 0;
+  let projectLoadGeneration = 0;
   let sessionRefresh = 0;
   let promptRefresh = 0;
 
@@ -781,6 +797,7 @@
   }
 
   async function loadProject(path: string) {
+    ++projectLoadGeneration;
     saveViewState();
     error = '';
     const current = ++selection;
@@ -1058,6 +1075,90 @@
     setupOpen = false;
   }
 
+  function openCommandPalette() {
+    if (paletteDialog.open || document.querySelector('dialog[open]')) return;
+    palettePreviousFocus = document.activeElement as HTMLElement | null;
+    restorePaletteFocus = true;
+    paletteQuery = '';
+    paletteIndex = 0;
+    paletteDialog.showModal();
+    void tick().then(() => paletteInput.focus());
+  }
+
+  function closeCommandPalette(restore = true) {
+    restorePaletteFocus = restore;
+    paletteDialog.close();
+  }
+
+  function commandPaletteClosed() {
+    if (restorePaletteFocus) palettePreviousFocus?.focus();
+    palettePreviousFocus = null;
+  }
+
+  async function choosePaletteEntry(entry: PaletteEntry | null) {
+    const target = entry?.directory ?? directory;
+    const thread =
+      entry?.kind === 'thread'
+        ? entry.thread
+        : entry?.kind === 'location'
+          ? newestAvailableThread(agentThreads, agentAvailability, target, entry.agent)
+          : null;
+    const agent =
+      entry?.agent ?? thread?.agent ?? agentAvailability.find((item) => item.available)?.id;
+    if (!target || !agent) {
+      error = 'Choose a project and install an agent to start a thread.';
+      return;
+    }
+    if (!agentAvailability.some((item) => item.id === agent && item.available)) {
+      error = `${agent} is unavailable. Choose another agent.`;
+      return;
+    }
+    closeCommandPalette(false);
+    let expectedProjectLoad = projectLoadGeneration;
+    if (target !== directory) {
+      const pending = loadProject(target);
+      expectedProjectLoad = projectLoadGeneration;
+      await pending;
+    }
+    if (expectedProjectLoad !== projectLoadGeneration || !directory) return;
+    const selectedThread = thread
+      ? (agentThreads.find(
+          (item) =>
+            item.directory === directory &&
+            item.agent === thread.agent &&
+            item.sessionId === thread.sessionId,
+        ) ?? null)
+      : null;
+    focusMainPane();
+    openAgent(agent, selectedThread);
+    focusPaneForTyping('main');
+  }
+
+  function keydownCommandPalette(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeCommandPalette();
+    } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!paletteEntries.length) return;
+      paletteIndex =
+        (paletteIndex + (event.key === 'ArrowDown' ? 1 : -1) + paletteEntries.length) %
+        paletteEntries.length;
+      scrollToActivePaletteEntry();
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      void choosePaletteEntry(paletteEntries[paletteIndex] ?? null);
+    }
+  }
+
+  function scrollToActivePaletteEntry() {
+    void tick().then(() =>
+      paletteDialog
+        .querySelector<HTMLElement>('.palette-entry.active')
+        ?.scrollIntoView({ block: 'nearest' }),
+    );
+  }
+
   function saveAgentThread(thread: AgentThread) {
     agentThreads = [
       thread,
@@ -1124,10 +1225,33 @@
     const created = leaves(layout).find((leaf) => !old.has(leaf.id));
     if (!created) return;
     savePaneLayout(layout);
-    focusedPane = created.id;
-    void tick().then(() =>
-      document.querySelector<HTMLElement>(`[data-pane-id="${created.id}"]`)?.focus(),
-    );
+    focusPaneForTyping(created.id);
+  }
+
+  function focusPaneForTyping(id: string) {
+    focusedPane = id;
+    promptFocusPane = id;
+    void focusPanePromptAfterTick(id);
+  }
+
+  async function focusPanePromptAfterTick(id: string) {
+    await tick();
+    if (focusedPane !== id || promptFocusPane !== id) return;
+    const pane = document.querySelector<HTMLElement>(`[data-pane-id="${id}"]`);
+    const prompt = pane?.querySelector<HTMLTextAreaElement>('[data-pane-prompt]:not(:disabled)');
+    if (prompt) {
+      prompt.focus();
+      promptFocusPane = null;
+    } else {
+      pane?.focus();
+      if (id === 'main' && !acpAgent) promptFocusPane = null;
+    }
+  }
+
+  function cancelPendingPromptFocus(event: FocusEvent) {
+    if (!promptFocusPane) return;
+    const pane = document.querySelector<HTMLElement>(`[data-pane-id="${promptFocusPane}"]`);
+    if (!(event.target instanceof Node) || !pane?.contains(event.target)) promptFocusPane = null;
   }
 
   function closeFocusedPane(id: string) {
@@ -1136,10 +1260,23 @@
       layout = { ...layout, agent: acpAgent, thread: acpThread };
     savePaneLayout(layout);
     changesPanes = changesPanes.filter((item) => item !== id);
-    focusedPane = leaves(layout)[0]?.id ?? 'main';
-    void tick().then(() =>
-      document.querySelector<HTMLElement>(`[data-pane-id="${focusedPane}"]`)?.focus(),
-    );
+    focusPaneForTyping(leaves(layout)[0]?.id ?? 'main');
+  }
+
+  function closeCurrentPane() {
+    if (leaves(paneLayout).length > 1) {
+      closeFocusedPane(focusedPane);
+      return;
+    }
+    if (acpAgent || !leaves(paneLayout).some((pane) => pane.id === 'main')) {
+      acpAgent = null;
+      acpThread = null;
+      savePaneLayout(mainPane());
+      changesPanes = [];
+    } else if (sessionID) {
+      clearSelectedSession();
+    }
+    focusPaneForTyping('main');
   }
 
   function updatePaneRatio(id: string, ratio: number) {
@@ -1981,6 +2118,27 @@
     if (
       (event.metaKey || event.ctrlKey) &&
       !event.altKey &&
+      !event.shiftKey &&
+      event.key.toLowerCase() === 'k' &&
+      !event.repeat
+    ) {
+      event.preventDefault();
+      openCommandPalette();
+      return;
+    }
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key.toLowerCase() === 'w'
+    ) {
+      event.preventDefault();
+      if (!event.repeat && !document.querySelector('dialog[open]')) closeCurrentPane();
+      return;
+    }
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      !event.altKey &&
       event.key.toLowerCase() === 'd' &&
       !event.repeat &&
       !document.querySelector('dialog[open]')
@@ -2017,7 +2175,7 @@
               focusedPane,
               event.key.slice(5).toLowerCase() as 'left' | 'right' | 'up' | 'down',
             );
-      if (next) document.querySelector<HTMLElement>(`[data-pane-id="${next}"]`)?.focus();
+      if (next) focusPaneForTyping(next);
       return;
     }
     if (
@@ -2075,7 +2233,11 @@
 </script>
 
 <svelte:head><title>Sail · Plan workspace</title></svelte:head>
-<svelte:window onkeydown={keydownWorkspace} onfocus={focusWorkspace} />
+<svelte:window
+  onkeydown={keydownWorkspace}
+  onfocus={focusWorkspace}
+  onfocusin={cancelPendingPromptFocus}
+/>
 <div class="app-shell" data-mobile-view={mobileView}>
   <aside
     class="sidebar"
@@ -2387,6 +2549,8 @@
                   acpAgent}
                 {directory}
                 thread={acpThread}
+                focusPrompt={promptFocusPane === 'main'}
+                onpromptfocused={() => (promptFocusPane = null)}
                 running={!!(acpThread && runningAgentThreads[agentThreadKey(acpThread)])}
                 focused={focusedPane === 'main'}
                 oncreated={createAgentThread}
@@ -2537,6 +2701,7 @@
                       >{/each}
                   </div>{/if}
                 <textarea
+                  data-pane-prompt
                   aria-label="Message"
                   bind:value={draft}
                   onkeydown={keydown}
@@ -2650,6 +2815,8 @@
       onratio={updatePaneRatio}
       oncreated={createPaneThread}
       onactivity={saveAgentThread}
+      focusPromptPane={promptFocusPane}
+      onpromptfocused={() => (promptFocusPane = null)}
       running={(thread) => !!(thread && runningAgentThreads[agentThreadKey(thread)])}
       onstatus={updateAgentThreadStatus}
       onchanges={(id) => {
@@ -2658,3 +2825,48 @@
     />
   </div>
 </div>
+<dialog
+  class="command-palette"
+  bind:this={paletteDialog}
+  aria-label="Jump to project or thread"
+  onclose={commandPaletteClosed}
+>
+  <div class="palette-search">
+    <input
+      bind:this={paletteInput}
+      value={paletteQuery}
+      aria-label="Search projects, worktrees, and threads"
+      placeholder="Jump to project, worktree, or thread…"
+      oninput={(event) => {
+        paletteQuery = event.currentTarget.value;
+        paletteIndex = 0;
+        scrollToActivePaletteEntry();
+      }}
+      onkeydown={keydownCommandPalette}
+    />
+    <kbd>Esc</kbd>
+  </div>
+  <div class="palette-results">
+    {#each paletteEntries as entry, index (entry.id)}
+      <button
+        class="palette-entry"
+        class:active={index === paletteIndex}
+        aria-current={index === paletteIndex ? 'true' : undefined}
+        onclick={() => void choosePaletteEntry(entry)}
+      >
+        <span><strong>{entry.label}</strong><small>{entry.detail}</small></span>
+        <span class="palette-kind">{entry.kind === 'thread' ? 'Thread' : 'Project'}</span>
+      </button>
+    {:else}
+      <div class="palette-empty">
+        <p>No matches for “{paletteQuery}”.</p>
+        <button
+          disabled={!directory || !agentAvailability.some((agent) => agent.available)}
+          onclick={() => void choosePaletteEntry(null)}
+        >
+          Start a thread in the current project
+        </button>
+      </div>
+    {/each}
+  </div>
+</dialog>
