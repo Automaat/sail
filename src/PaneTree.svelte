@@ -6,6 +6,7 @@
   import AgentWorkspace from './AgentWorkspace.svelte';
   import DiffPanel from './DiffPanel.svelte';
   import EmptyPanePicker from './EmptyPanePicker.svelte';
+  import TerminalPane from './TerminalPane.svelte';
   import type { AgentThread, AgentAvailability } from './lib/acp';
   import type { ThreadStatus } from './lib/attention';
   import { clampPaneRatio, paneRatioBounds, type Pane } from './lib/panes';
@@ -23,6 +24,8 @@
     onratio: (id: string, ratio: number) => void;
     oncreated: (id: string, thread: AgentThread) => void;
     onchooseagent: (id: string, agent: string) => void;
+    onchooseterminal: (id: string) => void;
+    onshortcut: (event: KeyboardEvent) => void;
     onactivity: (thread: AgentThread) => void;
     focusPromptPane: string | null;
     onpromptfocused: () => void;
@@ -44,6 +47,8 @@
     onratio,
     oncreated,
     onchooseagent,
+    onchooseterminal,
+    onshortcut,
     onactivity,
     focusPromptPane,
     onpromptfocused,
@@ -146,6 +151,8 @@
       {onratio}
       {oncreated}
       {onchooseagent}
+      {onchooseterminal}
+      {onshortcut}
       {onactivity}
       {focusPromptPane}
       {onpromptfocused}
@@ -194,6 +201,8 @@
       {onratio}
       {oncreated}
       {onchooseagent}
+      {onchooseterminal}
+      {onshortcut}
       {onactivity}
       {focusPromptPane}
       {onpromptfocused}
@@ -208,12 +217,24 @@
     class:focused={focused === pane.id}
     data-pane-id={pane.id}
     aria-keyshortcuts="Meta+Alt+ArrowLeft Meta+Alt+ArrowRight Meta+Alt+ArrowUp Meta+Alt+ArrowDown F6 Shift+F6"
-    aria-label={pane.id === 'main' ? 'Main pane' : pane.agent ? `${pane.agent} pane` : 'Empty pane'}
+    aria-label={pane.id === 'main'
+      ? 'Main pane'
+      : pane.kind === 'terminal'
+        ? 'Terminal pane'
+        : pane.agent
+          ? `${pane.agent} pane`
+          : 'Empty pane'}
     tabindex="-1"
     onfocusin={() => onfocus(pane.id)}
     onpointerdown={(event) => {
       onfocus(pane.id);
-      if (pane.id === 'main' || pane.agent || !(event.target instanceof Element)) return;
+      if (
+        pane.id === 'main' ||
+        pane.agent ||
+        pane.kind === 'terminal' ||
+        !(event.target instanceof Element)
+      )
+        return;
       if (event.target.closest('button, input, textarea, select')) return;
       (
         event.currentTarget.querySelector<HTMLButtonElement>(
@@ -224,7 +245,11 @@
   >
     {#if pane.id !== 'main'}
       <div class="pane-heading">
-        <span>{pane.thread?.title ?? (pane.agent ? `New ${pane.agent} thread` : 'Empty pane')}</span
+        <span
+          >{pane.kind === 'terminal'
+            ? 'Terminal'
+            : (pane.thread?.title ??
+              (pane.agent ? `New ${pane.agent} thread` : 'Empty pane'))}</span
         ><small>⌘⌥ + arrow to switch</small><button
           aria-label="Close pane"
           onclick={() => onclose(pane.id)}>×</button
@@ -240,6 +265,10 @@
     {/if}
     {#if pane.id === 'main'}
       {@render main()}
+    {:else if pane.kind === 'terminal'}
+      {#key `${directory}:${pane.id}`}
+        <TerminalPane id={pane.id} {directory} focused={focused === pane.id} {onshortcut} />
+      {/key}
     {:else if pane.agent}
       {#key `${pane.id}:${pane.agent}`}
         <div class="pane-agent-content" class:changes-open={changesPanes.includes(pane.id)}>
@@ -275,6 +304,7 @@
         {agents}
         focused={focused === pane.id}
         onselect={(agent) => onchooseagent(pane.id, agent)}
+        onterminal={() => onchooseterminal(pane.id)}
       />
     {/if}
   </section>
