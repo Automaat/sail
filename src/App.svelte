@@ -14,6 +14,15 @@
   import HistoryPanel from './HistoryPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
+  import AgentWorkspace from './AgentWorkspace.svelte';
+  import {
+    acp,
+    loadAgentThreads,
+    saveAgentThreads,
+    type AgentAvailability,
+    type AgentId,
+    type AgentThread,
+  } from './lib/acp';
   import {
     connect,
     type OpenCodeClient,
@@ -36,7 +45,9 @@
   } from './lib/projects';
 
   let dark = $state(localStorage.getItem('sai-theme') === 'dark');
-  const savedDirectory = localStorage.getItem('sai-directory') ?? '';
+  const savedAgentThreads = loadAgentThreads();
+  const savedDirectory =
+    localStorage.getItem('sai-directory') ?? savedAgentThreads[0]?.directory ?? '';
   let directory = $state(savedDirectory);
   let projectCatalog = $state<ProjectCatalog>(
     loadProjectCatalog(localStorage.getItem('sai-project-catalog'), savedDirectory),
@@ -45,6 +56,11 @@
   let appliedBinaryPath = localStorage.getItem('sai-opencode-bin') ?? '';
   let activeBinary = $state('');
   let runtimeSettingsOpen = $state(false);
+  let agentAvailability = $state<AgentAvailability[]>([]);
+  let agentThreads = $state<AgentThread[]>(savedAgentThreads);
+  let agentChangesOpen = $state(false);
+  let acpAgent = $state<AgentId | null>(null);
+  let acpThread = $state<AgentThread | null>(null);
   let runtimeState = $state<'starting' | 'connected' | 'error'>('starting');
   let runtimeError = $state('');
   let workReady = $state(false);
@@ -123,13 +139,17 @@
   let workspaceElement: HTMLDivElement;
   let resizeStart: { x: number; width: number } | null = null;
   let error = $state('');
-  let chatScroll: HTMLDivElement;
+  let chatScroll = $state<HTMLDivElement>();
   let sidebarElement: HTMLElement;
   let chatArea: HTMLElement;
   let detailsArea = $state<HTMLElement>();
 
   async function showMobileView(view: 'sessions' | 'chat' | 'details') {
     saveViewState();
+    if (acpAgent) {
+      agentChangesOpen = view === 'details';
+      if (agentChangesOpen) void refreshAgentDiff();
+    }
     if (view === 'details') detailsOpen = true;
     mobileView = view;
     await tick();
@@ -146,6 +166,13 @@
   }
 
   async function toggleChanges() {
+    if (acpAgent) {
+      agentChangesOpen = !agentChangesOpen;
+      if (window.matchMedia('(max-width: 850px)').matches)
+        mobileView = agentChangesOpen ? 'details' : 'chat';
+      if (agentChangesOpen) void refreshAgentDiff();
+      return;
+    }
     if (!sessionID) return;
     const narrow = window.matchMedia('(max-width: 850px)').matches;
     const visible =
@@ -167,6 +194,24 @@
     void refreshDiff();
   }
 
+  async function refreshAgentDiff() {
+    if (!directory) return;
+    const path = directory;
+    const generation = ++diffRefresh;
+    diffLoading = true;
+    try {
+      const next = await invoke<FileDiffInfo[]>('working_tree_diff', { path });
+      if (generation !== diffRefresh || path !== directory) return;
+      diffs = next;
+      diffError = '';
+      selectedFilePath = selectedDiffFile(next, selectedFilePath, path);
+    } catch (cause) {
+      if (generation === diffRefresh) diffError = describe(cause);
+    } finally {
+      if (generation === diffRefresh) diffLoading = false;
+    }
+  }
+
   function restoreSideScroll(positions?: number[]) {
     const scrollable = detailsArea?.querySelectorAll<HTMLElement>(
       '.side-view:not(.inactive) :is(.panel-scroll, .diff-files, .patch-scroll, .history-list)',
@@ -179,15 +224,17 @@
   }
 
   function saveViewState() {
-    if (!directory) return;
+    if (!directory || acpAgent) return;
     const previous = viewStates.get(viewKey());
     const narrow = window.matchMedia('(max-width: 850px)').matches;
     const chatVisible = !narrow || mobileView === 'chat';
     const detailsVisible = !narrow || mobileView === 'details';
+    const currentChatScroll = chatScroll;
     const anchor = chatVisible
-      ? [...(chatScroll?.querySelectorAll<HTMLElement>('[data-message-id]') ?? [])].find(
+      ? [...(currentChatScroll?.querySelectorAll<HTMLElement>('[data-message-id]') ?? [])].find(
           (element) =>
-            element.getBoundingClientRect().bottom > chatScroll.getBoundingClientRect().top,
+            currentChatScroll &&
+            element.getBoundingClientRect().bottom > currentChatScroll.getBoundingClientRect().top,
         )
       : null;
     const scrollable = detailsArea?.querySelectorAll<HTMLElement>(
@@ -409,16 +456,27 @@
 
   onMount(() => {
     setTheme(dark);
+    if (isTauri())
+      void acp
+        .agents()
+        .then((agents) => (agentAvailability = agents))
+        .catch((cause) => (runtimeError = `Could not detect agents: ${describe(cause)}`));
     const observer = new ResizeObserver(() => (workspaceWidth = workspaceElement.clientWidth));
     observer.observe(workspaceElement);
     void initialize();
     healthTimer = setInterval(() => void checkRuntime(), 5000);
     diffPollTimer = setInterval(() => {
+      const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
+      if (acpAgent && agentChangesOpen && visible && !diffLoading) {
+        void refreshAgentDiff();
+        return;
+      }
       if (
+        !acpAgent &&
         detailsOpen &&
         activeSideTab === 'changes' &&
         sessionID &&
-        (!window.matchMedia('(max-width: 850px)').matches || mobileView === 'details') &&
+        visible &&
         !diffLoading
       )
         void refreshDiff(sessionID, selection, true);
@@ -650,11 +708,13 @@
   }
 
   async function loadProject(path: string) {
-    if (!client) return;
     saveViewState();
     error = '';
     const current = ++selection;
     directory = path;
+    localStorage.setItem('sai-directory', path);
+    acpAgent = null;
+    acpThread = null;
     ++sessionRefresh;
     workReady = false;
     planReady = false;
@@ -688,7 +748,7 @@
     historyError = '';
     ++historyRefresh;
     historyLoading = false;
-    if (!(await refreshSetup(path)) || current !== selection) return;
+    if (!client || !(await refreshSetup(path)) || current !== selection) return;
     draft = viewStates.get(viewKey())?.draft ?? '';
     if (!workReady && !planReady) return;
     try {
@@ -712,8 +772,17 @@
     try {
       const report = await inspectRepository(client, path);
       if (current !== selection) return false;
-      if (path !== report.repository)
+      if (path !== report.repository) {
         saveProjectCatalog(replaceRepositoryPath(projectCatalog, path, report.repository));
+        agentThreads = agentThreads.map((thread) =>
+          thread.directory === path
+            ? Object.assign({}, thread, { directory: report.repository })
+            : thread,
+        );
+        saveAgentThreads(agentThreads);
+        if (acpThread?.directory === path)
+          acpThread = Object.assign({}, acpThread, { directory: report.repository });
+      }
       directory = report.repository;
       localStorage.setItem('sai-directory', report.repository);
       setup = report;
@@ -891,8 +960,45 @@
     localStorage.removeItem(`sai-session:${directory}`);
   }
 
+  function openAgent(agent: AgentId, thread: AgentThread | null = null) {
+    if (!directory) return;
+    saveViewState();
+    acpAgent = agent;
+    acpThread = thread;
+    mobileView = 'chat';
+    setupOpen = false;
+  }
+
+  function saveAgentThread(thread: AgentThread) {
+    agentThreads = [
+      thread,
+      ...agentThreads.filter(
+        (item) => item.agent !== thread.agent || item.sessionId !== thread.sessionId,
+      ),
+    ].toSorted((a, b) => b.updated - a.updated);
+    saveAgentThreads(agentThreads);
+    if (acpAgent === thread.agent && acpThread?.sessionId === thread.sessionId) acpThread = thread;
+  }
+
+  function createAgentThread(thread: AgentThread) {
+    saveAgentThread(thread);
+    if (acpAgent === thread.agent && directory === thread.directory && !acpThread)
+      acpThread = thread;
+  }
+
+  function removeAgentThread(thread: AgentThread) {
+    agentThreads = agentThreads.filter(
+      (item) => item.agent !== thread.agent || item.sessionId !== thread.sessionId,
+    );
+    saveAgentThreads(agentThreads);
+    if (acpThread?.sessionId === thread.sessionId && acpAgent === thread.agent)
+      openAgent(thread.agent);
+  }
+
   async function selectSession(id: string) {
     if (!client || !directory) return;
+    acpAgent = null;
+    acpThread = null;
     if (sessionID || newSessionMode || draft !== (viewStates.get(viewKey())?.draft ?? ''))
       saveViewState();
     const current = ++selection;
@@ -949,6 +1055,8 @@
 
   function newWork() {
     if (!workReady || switching || sending) return;
+    acpAgent = null;
+    acpThread = null;
     saveViewState();
     ++selection;
     sessionID = null;
@@ -979,6 +1087,8 @@
 
   async function newPlan() {
     if (!client || !directory || !planReady || switching || sending) return;
+    acpAgent = null;
+    acpThread = null;
     const path = directory;
     const current = selection;
     try {
@@ -1297,7 +1407,7 @@
   }
 
   async function refreshDiff(id = sessionID, current = selection, quiet = false) {
-    if (!client || !id || !directory) return;
+    if (acpAgent || !client || !id || !directory) return;
     const source = client;
     const path = directory;
     const generation = ++diffRefresh;
@@ -1305,6 +1415,7 @@
     try {
       const next = (await source.vcs.diff({ location: { directory: path }, mode: 'working' })).data;
       if (
+        acpAgent ||
         generation !== diffRefresh ||
         current !== selection ||
         id !== sessionID ||
@@ -1315,7 +1426,7 @@
       diffError = '';
       selectedFilePath = selectedDiffFile(next, selectedFilePath, path);
     } catch (cause) {
-      if (generation === diffRefresh && current === selection && id === sessionID)
+      if (!acpAgent && generation === diffRefresh && current === selection && id === sessionID)
         diffError = describe(cause);
     } finally {
       if (generation === diffRefresh) diffLoading = false;
@@ -1652,7 +1763,7 @@
 
   function keydownWorkspace(event: KeyboardEvent) {
     if (
-      !sessionID ||
+      (!acpAgent && !sessionID) ||
       event.repeat ||
       event.key.toLowerCase() !== 'l' ||
       !(event.metaKey || event.ctrlKey) ||
@@ -1666,7 +1777,8 @@
   }
 
   function focusWorkspace() {
-    if (detailsOpen && activeSideTab === 'changes') void refreshDiff();
+    if (acpAgent && agentChangesOpen) void refreshAgentDiff();
+    else if (!acpAgent && detailsOpen && activeSideTab === 'changes') void refreshDiff();
   }
 
   function describe(cause: unknown): string {
@@ -1699,7 +1811,7 @@
     <ProjectSidebar
       catalog={projectCatalog}
       {directory}
-      disabled={runtimeState !== 'connected'}
+      disabled={runtimeState !== 'connected' && !agentAvailability.some((agent) => agent.available)}
       onselect={(path) => {
         if (path !== directory) void loadProject(path);
       }}
@@ -1731,6 +1843,44 @@
         aria-label="New plan">New plan</Button
       >
     </div>
+    <div class="session-heading"><span class="label">OTHER AGENTS</span></div>
+    <div class="agent-launches">
+      {#each agentAvailability as agent (agent.id)}
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={!directory || !agent.available}
+          title={agent.reason ?? `New ${agent.name} thread`}
+          onclick={() => openAgent(agent.id)}>+ {agent.name}</Button
+        >
+      {/each}
+    </div>
+    {#each agentThreads.filter((thread) => thread.directory === directory) as thread (`${thread.agent}:${thread.sessionId}`)}
+      <div
+        class:active={acpAgent === thread.agent && acpThread?.sessionId === thread.sessionId}
+        class="session-row"
+      >
+        <button
+          class="session-item"
+          aria-current={acpAgent === thread.agent && acpThread?.sessionId === thread.sessionId
+            ? 'page'
+            : undefined}
+          onclick={() => openAgent(thread.agent, thread)}
+          title={thread.title}
+        >
+          <span class="session-symbol">◇</span><span class="session-details"
+            ><strong>{thread.title}</strong><small
+              >{thread.agent} · {new Date(thread.updated).toLocaleString()}</small
+            ></span
+          >
+        </button>
+        <button
+          class="session-action"
+          aria-label={`Remove ${thread.title} from Sail`}
+          onclick={() => removeAgentThread(thread)}>×</button
+        >
+      </div>
+    {/each}
     {#if directory}<input
         class="session-search"
         aria-label="Search sessions"
@@ -1740,7 +1890,7 @@
       />{/if}
     <nav class="session-list" aria-label="Sessions">
       {#each visibleSessions as session (session.id)}<div
-          class:active={session.id === sessionID}
+          class:active={!acpAgent && session.id === sessionID}
           class="session-row"
         >
           {#if editingSessionID === session.id}<div class="session-edit">
@@ -1757,7 +1907,7 @@
               >
             </div>{:else}<button
               class="session-item"
-              aria-current={session.id === sessionID ? 'page' : undefined}
+              aria-current={!acpAgent && session.id === sessionID ? 'page' : undefined}
               onclick={() => selectSession(session.id)}
               title={session.title ?? 'Untitled session'}
               ><span class="session-symbol">◇</span><span class="session-details"
@@ -1806,7 +1956,7 @@
         >
         <button
           aria-pressed={mobileView === 'details'}
-          disabled={!sessionID}
+          disabled={!sessionID && !acpAgent}
           onclick={() => showMobileView('details')}>Details</button
         >
       </nav>
@@ -1814,20 +1964,23 @@
         <button
           class="breadcrumb-project"
           onclick={() => chooseProject()}
-          disabled={runtimeState !== 'connected'}
+          disabled={runtimeState !== 'connected' &&
+            !agentAvailability.some((agent) => agent.available)}
           >{directory ? directory.split('/').filter(Boolean).at(-1) : 'Workspace'} ⌄</button
         ><span class="slash">/</span><strong
-          >{currentSession?.title ??
-            (newSessionMode === 'work' ? 'New work' : 'New session')}</strong
+          >{acpAgent
+            ? (acpThread?.title ?? `New ${acpAgent} thread`)
+            : (currentSession?.title ??
+              (newSessionMode === 'work' ? 'New work' : 'New session'))}</strong
         >
       </div>
       <div class="topbar-actions">
-        {#if sessionID}<Button
+        {#if sessionID || acpAgent}<Button
             variant="ghost"
             size="sm"
             onclick={toggleChanges}
             aria-controls="session-details"
-            aria-expanded={detailsOpen && activeSideTab === 'changes'}
+            aria-expanded={acpAgent ? agentChangesOpen : detailsOpen && activeSideTab === 'changes'}
             title="Toggle Changes (⌘L)">Changes</Button
           >{/if}
         {#if directory}<Button variant="ghost" size="sm" onclick={() => (setupOpen = !setupOpen)}
@@ -1850,16 +2003,31 @@
             <Button size="sm" onclick={retryRuntime}>Save and reconnect</Button>
           </div>
         </details>
-        <span role="status"
-          ><Badge tone={workReady ? 'success' : 'neutral'}
-            >{running ? 'Running' : workReady ? 'Ready' : 'Setup needed'}</Badge
-          ></span
-        ><Button variant="ghost" size="sm" onclick={() => setTheme(!dark)}
+        <details class="runtime-settings">
+          <summary>Agent settings</summary>
+          <div class="runtime-settings-panel">
+            {#each agentAvailability as agent (agent.id)}
+              <p class="runtime-binary">
+                <strong>{agent.name}</strong>: {agent.binaryPath ?? agent.reason ?? 'Unavailable'}
+              </p>
+            {/each}
+            <Button
+              size="sm"
+              onclick={() => void acp.agents().then((agents) => (agentAvailability = agents))}
+              >Detect again</Button
+            >
+          </div>
+        </details>
+        {#if !acpAgent}<span role="status"
+            ><Badge tone={workReady ? 'success' : 'neutral'}
+              >{running ? 'Running' : workReady ? 'Ready' : 'Setup needed'}</Badge
+            ></span
+          >{/if}<Button variant="ghost" size="sm" onclick={() => setTheme(!dark)}
           >{dark ? 'Light' : 'Dark'} theme</Button
         >
       </div>
     </header>
-    {#if setupOpen && (directory || setupError)}<section
+    {#if !acpAgent && setupOpen && (directory || setupError)}<section
         class="setup-panel"
         aria-label="Repository setup"
       >
@@ -1909,174 +2077,187 @@
           </div>{/if}
       </section>{/if}
     <div
-      class:single={!sessionID || !detailsOpen}
-      class:closed={!detailsOpen}
+      class:single={acpAgent ? !agentChangesOpen : !sessionID || !detailsOpen}
+      class:closed={acpAgent ? !agentChangesOpen : !detailsOpen}
       class="workspace"
       style={`--details-width: ${visibleDetailsWidth}px`}
       bind:this={workspaceElement}
     >
       <main class="chat-area" aria-label="Session conversation" tabindex="-1" bind:this={chatArea}>
-        <div
-          class="conversation"
-          bind:this={chatScroll}
-          onscroll={() => (followChat = nearBottom(chatScroll))}
-        >
-          {#if olderMessageCursor}<button
-              class="older-messages"
-              onclick={loadOlderMessages}
-              disabled={loadingOlder}
-            >
-              {loadingOlder ? 'Loading older messages…' : 'Load older messages'}
-            </button>{/if}
-          {#if !sessionID && messages.length === 0}<div class="welcome">
-              <div class="welcome-mark">◇</div>
-              <p class="eyebrow">PLAN WITH ARCHITECT</p>
-              <h1>What are we working on?</h1>
-              <p>
-                Choose an agent and model, then describe the work. Use New plan for Architect-first
-                planning.
-              </p>
-              {#if !directory}<Button
-                  onclick={() => chooseProject()}
-                  disabled={runtimeState !== 'connected'}>Select repository</Button
-                >{/if}
-            </div>{/if}
-          {#each chatMessages as message (message.id)}
-            {#if message.type === 'user'}<article
-                class="message user-message"
-                data-message-id={message.id}
+        {#if acpAgent}
+          {#key acpAgent}
+            <AgentWorkspace
+              agent={acpAgent}
+              agentName={agentAvailability.find((agent) => agent.id === acpAgent)?.name ?? acpAgent}
+              {directory}
+              thread={acpThread}
+              oncreated={createAgentThread}
+              onactivity={saveAgentThread}
+            />
+          {/key}
+        {:else}
+          <div
+            class="conversation"
+            bind:this={chatScroll}
+            onscroll={() => (followChat = chatScroll ? nearBottom(chatScroll) : true)}
+          >
+            {#if olderMessageCursor}<button
+                class="older-messages"
+                onclick={loadOlderMessages}
+                disabled={loadingOlder}
               >
-                <div class="avatar user-avatar">You</div>
-                <div class="message-body">
-                  <div class="message-author">You</div>
-                  <Markdown source={message.text} />
-                  {#if message.files?.length}<div class="message-files">
-                      {#each message.files as file, fileIndex (fileIndex)}<span
-                          >{file.name ??
-                            (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
-                        >{/each}
-                    </div>{/if}
-                </div>
-              </article>
-            {:else if message.type === 'assistant'}<article
-                class="message assistant-message"
-                data-message-id={message.id}
-              >
+                {loadingOlder ? 'Loading older messages…' : 'Load older messages'}
+              </button>{/if}
+            {#if !sessionID && messages.length === 0}<div class="welcome">
+                <div class="welcome-mark">◇</div>
+                <p class="eyebrow">PLAN WITH ARCHITECT</p>
+                <h1>What are we working on?</h1>
+                <p>
+                  Choose an agent and model, then describe the work. Use New plan for
+                  Architect-first planning.
+                </p>
+                {#if !directory}<Button
+                    onclick={() => chooseProject()}
+                    disabled={runtimeState !== 'connected'}>Select repository</Button
+                  >{/if}
+              </div>{/if}
+            {#each chatMessages as message (message.id)}
+              {#if message.type === 'user'}<article
+                  class="message user-message"
+                  data-message-id={message.id}
+                >
+                  <div class="avatar user-avatar">You</div>
+                  <div class="message-body">
+                    <div class="message-author">You</div>
+                    <Markdown source={message.text} />
+                    {#if message.files?.length}<div class="message-files">
+                        {#each message.files as file, fileIndex (fileIndex)}<span
+                            >{file.name ??
+                              (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
+                          >{/each}
+                      </div>{/if}
+                  </div>
+                </article>
+              {:else if message.type === 'assistant'}<article
+                  class="message assistant-message"
+                  data-message-id={message.id}
+                >
+                  <div class="avatar agent-avatar">S.</div>
+                  <div class="message-body">
+                    <div class="message-author">{message.agent}</div>
+                    {#if assistantText(message)}<Markdown source={assistantText(message)} />{/if}
+                    {#each message.content as part, ordinal (ordinal)}
+                      {#if part.type === 'tool'}<details class="tool-card">
+                          <summary>{part.name} · {part.state.status}</summary>
+                          {#if part.state.status === 'streaming'}<pre>{part.state.input}</pre>
+                          {:else}<pre>{JSON.stringify(part.state.input, null, 2)}</pre>{/if}
+                          {#if part.state.status === 'completed' || part.state.status === 'error'}
+                            {#each part.state.content ?? [] as item, itemIndex (itemIndex)}
+                              {#if item.type === 'text'}<pre>{item.text}</pre>
+                              {:else}<p>{item.name ?? item.uri}</p>{/if}
+                            {/each}
+                          {/if}
+                          {#if part.state.status === 'error'}<p class="message-error">
+                              {part.state.error.message}
+                            </p>{/if}
+                        </details>{/if}
+                    {/each}
+                    {#if message.retry}<p class="retry-state" role="status">
+                        Retry {message.retry.attempt}: {message.retry.error.message}
+                      </p>{/if}
+                    {#if message.error}<p class="message-error" role="alert">
+                        {message.error.message}
+                      </p>{/if}
+                  </div>
+                </article>{/if}
+            {/each}
+            {#each liveOnly as [id, parts] (id)}
+              <article class="message assistant-message" data-message-id={id}>
                 <div class="avatar agent-avatar">S.</div>
                 <div class="message-body">
-                  <div class="message-author">{message.agent}</div>
-                  {#if assistantText(message)}<Markdown source={assistantText(message)} />{/if}
-                  {#each message.content as part, ordinal (ordinal)}
-                    {#if part.type === 'tool'}<details class="tool-card">
-                        <summary>{part.name} · {part.state.status}</summary>
-                        {#if part.state.status === 'streaming'}<pre>{part.state.input}</pre>
-                        {:else}<pre>{JSON.stringify(part.state.input, null, 2)}</pre>{/if}
-                        {#if part.state.status === 'completed' || part.state.status === 'error'}
-                          {#each part.state.content ?? [] as item, itemIndex (itemIndex)}
-                            {#if item.type === 'text'}<pre>{item.text}</pre>
-                            {:else}<p>{item.name ?? item.uri}</p>{/if}
-                          {/each}
-                        {/if}
-                        {#if part.state.status === 'error'}<p class="message-error">
-                            {part.state.error.message}
-                          </p>{/if}
-                      </details>{/if}
-                  {/each}
-                  {#if message.retry}<p class="retry-state" role="status">
-                      Retry {message.retry.attempt}: {message.retry.error.message}
-                    </p>{/if}
-                  {#if message.error}<p class="message-error" role="alert">
-                      {message.error.message}
-                    </p>{/if}
+                  <div class="message-author">{currentSession?.agent ?? 'Agent'} · streaming</div>
+                  <Markdown
+                    source={Object.entries(parts)
+                      .toSorted(([a], [b]) => Number(a) - Number(b))
+                      .map(([, value]) => value)
+                      .join('\n')}
+                  />
                 </div>
-              </article>{/if}
-          {/each}
-          {#each liveOnly as [id, parts] (id)}
-            <article class="message assistant-message" data-message-id={id}>
-              <div class="avatar agent-avatar">S.</div>
-              <div class="message-body">
-                <div class="message-author">{currentSession?.agent ?? 'Agent'} · streaming</div>
-                <Markdown
-                  source={Object.entries(parts)
-                    .toSorted(([a], [b]) => Number(a) - Number(b))
-                    .map(([, value]) => value)
-                    .join('\n')}
-                />
-              </div>
-            </article>
-          {/each}
-          {#if running && runtimeState === 'connected'}<div class="working">
-              <span class="activity-spinner" aria-hidden="true"></span>
-              <span class="working-label" role="status"
-                >{currentSession?.agent ?? 'Agent'} · {activity}</span
-              >
-              <Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
-            </div>{/if}
-        </div>
-        <div class="composer-wrap">
-          {#if error}<p class="notice error" role="alert">{error}</p>{/if}
-          <PromptPanel
-            {pendingPermissions}
-            {pendingForms}
-            client={connecting ? null : client}
-            {sessionID}
-            onchanged={() => refreshPrompts()}
-          />
-          <div class="composer">
-            <div class="work-controls">
-              <label
-                >Agent<select
-                  value={selectedAgentID}
-                  disabled={running || sending || switching || !workReady}
-                  onchange={(event) => void chooseAgent(event.currentTarget.value)}
+              </article>
+            {/each}
+            {#if running && runtimeState === 'connected'}<div class="working">
+                <span class="activity-spinner" aria-hidden="true"></span>
+                <span class="working-label" role="status"
+                  >{currentSession?.agent ?? 'Agent'} · {activity}</span
                 >
-                  {#each setup?.agents ?? [] as agent (agent.id)}<option value={agent.id}
-                      >{agent.name}</option
-                    >{/each}
-                </select></label
-              >
-              <label
-                >Model<select
-                  value={selectedModelKey}
-                  disabled={running || sending || switching || !workReady}
-                  onchange={(event) => void chooseModel(event.currentTarget.value)}
-                >
-                  {#each setup?.models ?? [] as model (modelKey(model))}<option
-                      value={modelKey(model)}>{model.providerID} / {model.name}</option
-                    >{/each}
-                </select></label
-              >
-            </div>
-            {#if attachedFiles.length}<div class="attachments">
-                {#each attachedFiles as path (path)}<span
-                    >{path.split(/[\\/]/).at(-1)}<button
-                      aria-label={`Remove ${path.split(/[\\/]/).at(-1)}`}
-                      onclick={() =>
-                        (attachedFiles = attachedFiles.filter((item) => item !== path))}>×</button
-                    ></span
-                  >{/each}
+                <Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
               </div>{/if}
-            <textarea
-              aria-label="Message"
-              bind:value={draft}
-              onkeydown={keydown}
-              rows="3"
-              placeholder={inputReady
-                ? 'Describe the work or ask a question…'
-                : 'Complete repository setup before planning…'}
-              disabled={!inputReady || sending}></textarea>
-            <div class="composer-bottom">
-              <span>Enter to send · Shift+Enter for newline</span><Button
-                variant="ghost"
-                size="sm"
-                onclick={attachFiles}
-                disabled={!inputReady || sending}>Attach files</Button
-              ><Button onclick={send} disabled={!canSend} loading={sending}>Send ↗</Button>
+          </div>
+          <div class="composer-wrap">
+            {#if error}<p class="notice error" role="alert">{error}</p>{/if}
+            <PromptPanel
+              {pendingPermissions}
+              {pendingForms}
+              client={connecting ? null : client}
+              {sessionID}
+              onchanged={() => refreshPrompts()}
+            />
+            <div class="composer">
+              <div class="work-controls">
+                <label
+                  >Agent<select
+                    value={selectedAgentID}
+                    disabled={running || sending || switching || !workReady}
+                    onchange={(event) => void chooseAgent(event.currentTarget.value)}
+                  >
+                    {#each setup?.agents ?? [] as agent (agent.id)}<option value={agent.id}
+                        >{agent.name}</option
+                      >{/each}
+                  </select></label
+                >
+                <label
+                  >Model<select
+                    value={selectedModelKey}
+                    disabled={running || sending || switching || !workReady}
+                    onchange={(event) => void chooseModel(event.currentTarget.value)}
+                  >
+                    {#each setup?.models ?? [] as model (modelKey(model))}<option
+                        value={modelKey(model)}>{model.providerID} / {model.name}</option
+                      >{/each}
+                  </select></label
+                >
+              </div>
+              {#if attachedFiles.length}<div class="attachments">
+                  {#each attachedFiles as path (path)}<span
+                      >{path.split(/[\\/]/).at(-1)}<button
+                        aria-label={`Remove ${path.split(/[\\/]/).at(-1)}`}
+                        onclick={() =>
+                          (attachedFiles = attachedFiles.filter((item) => item !== path))}>×</button
+                      ></span
+                    >{/each}
+                </div>{/if}
+              <textarea
+                aria-label="Message"
+                bind:value={draft}
+                onkeydown={keydown}
+                rows="3"
+                placeholder={inputReady
+                  ? 'Describe the work or ask a question…'
+                  : 'Complete repository setup before planning…'}
+                disabled={!inputReady || sending}></textarea>
+              <div class="composer-bottom">
+                <span>Enter to send · Shift+Enter for newline</span><Button
+                  variant="ghost"
+                  size="sm"
+                  onclick={attachFiles}
+                  disabled={!inputReady || sending}>Attach files</Button
+                ><Button onclick={send} disabled={!canSend} loading={sending}>Send ↗</Button>
+              </div>
             </div>
           </div>
-        </div>
+        {/if}
       </main>
-      {#if sessionID}<div
+      {#if sessionID || acpAgent}<div
           class="details-resizer"
           role="slider"
           tabindex="0"
@@ -2102,22 +2283,25 @@
           bind:this={detailsArea}
         >
           <nav class="side-tabs" aria-label="Session detail tabs">
-            {#if showPlanPanel}<button
+            {#if !acpAgent && showPlanPanel}<button
                 class:active={activeSideTab === 'plan'}
                 aria-current={activeSideTab === 'plan' ? 'page' : undefined}
                 onclick={() => switchSideTab('plan')}>Plan</button
               >{/if}<button
-              class:active={activeSideTab === 'changes'}
-              aria-current={activeSideTab === 'changes' ? 'page' : undefined}
+              class:active={acpAgent || activeSideTab === 'changes'}
+              aria-current={acpAgent || activeSideTab === 'changes' ? 'page' : undefined}
               onclick={toggleChanges}>Changes ({diffs.length})</button
-            ><button
-              class:active={activeSideTab === 'history'}
-              aria-current={activeSideTab === 'history' ? 'page' : undefined}
-              onclick={() => switchSideTab('history')}>History</button
-            >
+            >{#if !acpAgent}<button
+                class:active={activeSideTab === 'history'}
+                aria-current={activeSideTab === 'history' ? 'page' : undefined}
+                onclick={() => switchSideTab('history')}>History</button
+              >{/if}
           </nav>
           <div class="side-panel-body">
-            {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
+            {#if !acpAgent && showPlanPanel}<div
+                class:inactive={activeSideTab !== 'plan'}
+                class="side-view"
+              >
                 <PlanPanel
                   {snapshot}
                   client={connecting ? null : client}
@@ -2128,27 +2312,27 @@
                   onselectfile={selectDiffPath}
                 />
               </div>{/if}
-            <div class:inactive={activeSideTab !== 'changes'} class="side-view">
+            <div class:inactive={!acpAgent && activeSideTab !== 'changes'} class="side-view">
               <DiffPanel
                 files={diffs}
-                annotations={diffAnnotations}
+                annotations={acpAgent ? {} : diffAnnotations}
                 selected={selectedFilePath}
                 loading={diffLoading}
                 error={diffError}
                 onselect={(file) => (selectedFilePath = file)}
-                onrefresh={() => refreshDiff()}
+                onrefresh={() => (acpAgent ? refreshAgentDiff() : refreshDiff())}
                 onclose={toggleChanges}
               />
             </div>
-            <div class:inactive={activeSideTab !== 'history'} class="side-view">
-              <HistoryPanel
-                events={historyEvents}
-                session={currentSession}
-                loading={historyLoading}
-                error={historyError}
-                onrefresh={() => refreshHistory()}
-              />
-            </div>
+            {#if !acpAgent}<div class:inactive={activeSideTab !== 'history'} class="side-view">
+                <HistoryPanel
+                  events={historyEvents}
+                  session={currentSession}
+                  loading={historyLoading}
+                  error={historyError}
+                  onrefresh={() => refreshHistory()}
+                />
+              </div>{/if}
           </div>
         </section>{/if}
     </div>
