@@ -7,6 +7,9 @@
   import Markdown from './Markdown.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import PathPicker from './PathPicker.svelte';
+  import SkillMenu from './SkillMenu.svelte';
+  import { matchingSkills, promptSkill, type SkillChoice } from './lib/skills';
+  import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
   import type { BrowserAttachment } from './lib/browser-pick';
@@ -64,6 +67,44 @@
   let pendingPermissions = $state<PermissionRequest[]>([]);
   let pendingForms = $state<FormInfo[]>([]);
   let draft = $state('');
+  let skills = $state<SkillChoice[]>([]);
+  let skillSelected = $state(0);
+  const skillMenuId = crypto.randomUUID();
+  const skillMatches = $derived(matchingSkills(skills, draft));
+  $effect(() => {
+    const source = client;
+    const path = directory;
+    const canLoad = setup?.workReady || setup?.planReady;
+    if (!source || !path || !canLoad) {
+      skills = [];
+      return;
+    }
+    let cancelled = false;
+    void source.skill.list({ location: { directory: path } }).then(
+      (result) => {
+        if (!cancelled)
+          skills = result.data.map((skill) => ({
+            id: skill.id,
+            name: skill.name,
+            description: skill.description ?? '',
+          }));
+        return undefined;
+      },
+      () => {
+        if (!cancelled) skills = [];
+        return undefined;
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  function chooseSkill(skill: SkillChoice) {
+    draft = `/${skill.name} `;
+    skillSelected = 0;
+    void tick().then(() => prompt.focus());
+  }
   let files = $state<string[]>([]);
   let error = $state('');
   let loading = $state(false);
@@ -81,6 +122,7 @@
   let selectedThreadId: string | null | undefined;
   let selectedClient: OpenCodeClient | null = null;
   const pickedImages = new SvelteSet<string>();
+  const inFlightCaptures = new SvelteSet<string>();
   let generation = 0;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
@@ -184,10 +226,11 @@
     const current = ++generation;
     clearTimeout(refreshTimer);
     refreshTimer = undefined;
-    if (!sending) {
-      for (const path of pickedImages) void invoke('browser_remove_capture', { path });
-      pickedImages.clear();
-    }
+    for (const path of pickedImages)
+      if (!inFlightCaptures.has(path)) {
+        pickedImages.delete(path);
+        void invoke('browser_remove_capture', { path });
+      }
     draft = '';
     files = [];
     selectedThreadId = id;
@@ -256,7 +299,7 @@
   });
 
   $effect(() => {
-    if (focusPrompt && focused && !busy && !loading) {
+    if (focusPrompt && focused && !sending && !loading) {
       void tick().then(() => {
         prompt?.focus();
         onpromptfocused?.();
@@ -331,26 +374,28 @@
       mounted = false;
       ++generation;
       clearTimeout(refreshTimer);
-      if (!sending)
-        for (const path of pickedImages) void invoke('browser_remove_capture', { path });
+      for (const path of pickedImages)
+        if (!inFlightCaptures.has(path)) void invoke('browser_remove_capture', { path });
     };
   });
 
   async function send(externalText?: string) {
     const external = externalText !== undefined;
     const text = (externalText ?? draft).trim();
-    if (!client || (!text && (external || !files.length)) || !inputReady || busy) {
+    if (!client || (!text && (external || !files.length)) || !inputReady || sending) {
       if (external) throw new Error('Wait for the current OpenCode turn.');
       return;
     }
     const source = client;
     const paths = external ? [] : [...files];
+    for (const path of paths) if (pickedImages.has(path)) inFlightCaptures.add(path);
     const current = generation;
     let accepted = false;
     if (!external) {
       draft = '';
       files = [];
     }
+    const queued = running;
     sending = true;
     stopRequested = false;
     error = '';
@@ -379,15 +424,27 @@
       }
       running = true;
       if (session) onstatus(summary(session), 'working');
-      await invoke('record_turn_snapshot', { path: directory, thread: `opencode:${id}` });
-      await source.session.prompt({
-        sessionID: id,
-        text,
-        files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
+      const promptRequest = runSerialOpenCodeTurn(id, async () => {
+        await invoke('record_turn_snapshot', { path: directory, thread: `opencode:${id}` });
+        return source.session.prompt({
+          sessionID: id,
+          text,
+          skills: promptSkill(skills, text)?.id
+            ? [{ id: promptSkill(skills, text)!.id! }]
+            : undefined,
+          delivery: queued ? 'queue' : undefined,
+          files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
+        });
       });
+      sending = false;
+      await promptRequest;
       accepted = true;
       for (const path of paths)
         if (pickedImages.delete(path)) void invoke('browser_remove_capture', { path });
+      if (queued) {
+        await refreshMessages(id, current);
+        return;
+      }
       await source.session.wait({ sessionID: id });
       if (current === generation && id === activeID) {
         const latest = await source.session.get({ sessionID: id });
@@ -406,11 +463,14 @@
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
           files = [...paths, ...files];
         }
-        running = false;
-        if (session) onstatus(summary(session), 'failed');
+        if (!queued) {
+          running = false;
+          if (session) onstatus(summary(session), 'failed');
+        }
       }
       if (external) throw cause;
     } finally {
+      for (const path of paths) inFlightCaptures.delete(path);
       if (current === generation) sending = false;
       if (disposed || current !== generation)
         for (const path of paths)
@@ -479,6 +539,25 @@
   }
 
   function keydown(event: KeyboardEvent) {
+    if (skillMatches.length) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        skillSelected =
+          (skillSelected + (event.key === 'ArrowDown' ? 1 : -1) + skillMatches.length) %
+          skillMatches.length;
+        return;
+      }
+      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        chooseSkill(skillMatches[skillSelected] ?? skillMatches[0]);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        draft = '';
+        return;
+      }
+    }
     if (event.key === 'Escape' && busy) {
       event.preventDefault();
       void stop();
@@ -600,6 +679,14 @@
         }}
       />
       <textarea
+        role="combobox"
+        aria-autocomplete="list"
+        aria-haspopup="listbox"
+        aria-controls={skillMatches.length ? skillMenuId : undefined}
+        aria-expanded={skillMatches.length > 0}
+        aria-activedescendant={skillMatches.length
+          ? `${skillMenuId}-option-${Math.min(skillSelected, skillMatches.length - 1)}`
+          : undefined}
         bind:this={prompt}
         data-pane-prompt
         aria-label="Message OpenCode"
@@ -608,7 +695,13 @@
         rows="3"
         wrap="soft"
         placeholder="Message OpenCode…"
-        disabled={!inputReady || busy || loading}></textarea>
+        disabled={!inputReady || loading}></textarea>
+      <SkillMenu
+        id={skillMenuId}
+        skills={skillMatches}
+        selected={skillSelected}
+        choose={chooseSkill}
+      />
       {#if files.length}<div class="attachments">
           {#each files as file (file)}<span
               >{file.split(/[\\/]/).at(-1)}<button
@@ -651,12 +744,13 @@
           />
         </div>
         <div class="agent-actions">
-          <Button variant="ghost" size="sm" onclick={attachFiles} disabled={busy || !inputReady}
+          <Button variant="ghost" size="sm" onclick={attachFiles} disabled={sending || !inputReady}
             >Attach files</Button
           >
           <Button
             onclick={() => void send()}
-            disabled={busy || (!draft.trim() && !files.length) || !inputReady}>Send ↗</Button
+            disabled={sending || (!draft.trim() && !files.length) || !inputReady}
+            >{running ? 'Queue ↗' : 'Send ↗'}</Button
           >
         </div>
       </div>
@@ -735,6 +829,7 @@
     padding: 0 9px 9px 10px;
   }
   .opencode-pane .agent-composer {
+    position: relative;
     flex: 0 0 auto;
     padding-inline: 20px;
   }

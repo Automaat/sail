@@ -5,6 +5,15 @@
   import { Badge, Button } from '@smykla-skalski/sui';
   import Markdown from './Markdown.svelte';
   import OptionPicker from './OptionPicker.svelte';
+  import SkillMenu from './SkillMenu.svelte';
+  import { matchingSkills, skillQuery, type SkillChoice } from './lib/skills';
+  import {
+    agentQueuePaused,
+    queuedAgentMessages,
+    saveQueuedAgentMessages,
+    setAgentQueuePaused,
+    type QueuedAgentMessage,
+  } from './lib/agent-queue';
   import {
     acp,
     groupAgentEntries,
@@ -99,6 +108,46 @@
   let busy = $state(false);
   let connecting = $state(false);
   let draft = $state('');
+  let skills = $state<SkillChoice[]>([]);
+  const commandUpdates: Record<string, unknown[]> = {};
+  let skillSelected = $state(0);
+  const skillMenuId = crypto.randomUUID();
+  const skillMatches = $derived(matchingSkills(skills, draft));
+  $effect(() => {
+    if (skillQuery(draft) !== null && ready && directory && !activeSessionId && !creatingSession)
+      void ensureSession('New thread').catch((cause) => {
+        error = describe(cause);
+      });
+  });
+  let queued = $state<QueuedAgentMessage[]>([]);
+  let queuePaused = $state(false);
+  $effect(() => {
+    if (isBusy || !ready || queuePaused || !queued.length) return;
+    const [next, ...remaining] = queued;
+    queued = remaining;
+    if (activeSessionId) saveQueuedAgentMessages(agent, directory, activeSessionId, queued);
+    void send(next.text, next);
+  });
+
+  function updateSkills(value: unknown[]) {
+    skills = value
+      .filter(
+        (item): item is { name: string; description?: string } =>
+          typeof item === 'object' &&
+          item !== null &&
+          'name' in item &&
+          typeof item.name === 'string' &&
+          (!('description' in item) || typeof item.description === 'string'),
+      )
+      .map((item) => ({ name: item.name.replace(/^\//, ''), description: item.description ?? '' }))
+      .filter((item) => item.name !== 'model' && item.name !== 'effort');
+  }
+
+  function chooseSkill(skill: SkillChoice) {
+    draft = `/${skill.name} `;
+    skillSelected = 0;
+    void tick().then(() => prompt.focus());
+  }
   let images = $state<BrowserAttachment[]>([]);
   let clipboardAttachments = $state<{ path: string; name: string; image: boolean }[]>([]);
   let pendingPaste: Promise<void> = Promise.resolve();
@@ -403,6 +452,9 @@
 
   async function activate(id: string | null) {
     rememberTranscript();
+    const previousSessionId = activeSessionId;
+    const previousQueue = queued;
+    const wasPaused = queuePaused;
     const current = ++generation;
     clearTimeout(updateTimer);
     updateTimer = undefined;
@@ -419,6 +471,19 @@
     historyLoading = false;
     historyAttempted = false;
     configOptions = [];
+    skills = [];
+    queued =
+      id && id === previousSessionId
+        ? previousQueue
+        : id
+          ? queuedAgentMessages(agent, directory, id)
+          : [];
+    queuePaused =
+      id && id === previousSessionId
+        ? wasPaused
+        : id
+          ? agentQueuePaused(agent, directory, id)
+          : false;
     pickerOpen = null;
     creatingSession = null;
     settingConfig = null;
@@ -465,6 +530,9 @@
         }
         if (current === generation)
           configOptions = (session.configOptions as AgentConfigOption[] | undefined) ?? [];
+        if (current === generation && Array.isArray(session.availableCommands))
+          updateSkills(session.availableCommands);
+        if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
         const waiting = await acp.pendingPermissions(agent, id);
         if (current === generation) for (const request of waiting) queuePermission(request);
       }
@@ -504,7 +572,10 @@
         throw new Error('Agent pane closed while creating the thread.');
       }
       configOptions = session.configOptions ?? [];
+      if (Array.isArray(session.availableCommands)) updateSkills(session.availableCommands);
       activeSessionId = session.sessionId;
+      if (queued.length) saveQueuedAgentMessages(agent, directory, session.sessionId, queued);
+      if (commandUpdates[session.sessionId]) updateSkills(commandUpdates[session.sessionId]);
       selectedThreadId = session.sessionId;
       const created: AgentThread = {
         agent,
@@ -550,6 +621,18 @@
         return;
       }
       const params = message.params;
+      if (message.method === 'session/update' && typeof params?.sessionId === 'string') {
+        const update = params.update;
+        if (
+          update &&
+          typeof update === 'object' &&
+          'sessionUpdate' in update &&
+          update.sessionUpdate === 'available_commands_update' &&
+          'availableCommands' in update &&
+          Array.isArray(update.availableCommands)
+        )
+          commandUpdates[params.sessionId] = update.availableCommands;
+      }
       if (!params || params.sessionId !== activeSessionId) return;
       if (message.method === 'sail/permission_resolved') {
         permissions = permissions.filter(
@@ -562,6 +645,11 @@
         const data = update as Record<string, unknown>;
         if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions))
           configOptions = data.configOptions as AgentConfigOption[];
+        if (
+          data.sessionUpdate === 'available_commands_update' &&
+          Array.isArray(data.availableCommands)
+        )
+          updateSkills(data.availableCommands);
         if (data.sessionUpdate !== 'user_message_chunk' || replaying) applyUpdate(data);
       } else if (message.method === 'session/request_permission' && message.id != null) {
         queuePermission(message);
@@ -597,7 +685,7 @@
     };
   });
 
-  async function send(externalText?: string) {
+  async function send(externalText?: string, queuedMessage?: QueuedAgentMessage) {
     if (externalText === undefined) await pendingPaste;
     const external = externalText !== undefined;
     const text =
@@ -616,12 +704,20 @@
       await openPicker(command.slice(1) as 'model' | 'effort');
       return;
     }
+    if (!external && isBusy && (text || clipboardAttachments.length)) {
+      queued = [...queued, { text, images: [...images], attachments: [...clipboardAttachments] }];
+      if (activeSessionId) saveQueuedAgentMessages(agent, directory, activeSessionId, queued);
+      draft = '';
+      images = [];
+      clipboardAttachments = [];
+      return;
+    }
     if ((!text && (external || !clipboardAttachments.length)) || !ready || isBusy || !directory) {
       if (external) throw new Error('Wait for the current agent turn.');
       return;
     }
-    const sentImages = external ? [] : [...images];
-    const sentClipboard = external ? [] : [...clipboardAttachments];
+    const sentImages = queuedMessage?.images ?? (external ? [] : [...images]);
+    const sentClipboard = queuedMessage?.attachments ?? (external ? [] : [...clipboardAttachments]);
     const turnAgent = agent;
     const current = generation;
     const turnId = crypto.randomUUID();
@@ -630,6 +726,7 @@
     let finalStatus: ThreadStatus = 'done';
     let notifyOnDone = true;
     let keepImages = false;
+    let deliverySessionId = activeSessionId;
     busy = true;
     if (activityThread) onstatus(activityThread, 'working');
     stopRequested = false;
@@ -654,9 +751,10 @@
       if (configFailure) throw new Error(configFailure);
       if (activityThread) onactivity(activityThread);
       const id = activeSessionId;
+      deliverySessionId = id;
       if (stopRequested) {
         notifyOnDone = false;
-        if (external) throw new Error('Agent turn was cancelled.');
+        if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');
         if (current === generation) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
@@ -689,7 +787,7 @@
         ],
       );
       if (result.stopReason === 'cancelled' || stopRequested) notifyOnDone = false;
-      if (external && !notifyOnDone) throw new Error('Agent turn was cancelled.');
+      if (external && !queuedMessage && !notifyOnDone) throw new Error('Agent turn was cancelled.');
       if (current === generation && stopRequested)
         markTools(result.stopReason === 'cancelled' ? 'cancelled' : 'status unconfirmed', [
           'pending',
@@ -699,10 +797,28 @@
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
       finalStatus = 'failed';
+      const following = deliverySessionId
+        ? queuedAgentMessages(turnAgent, directory, deliverySessionId)
+        : [];
+      const retryQueued =
+        !!deliverySessionId && (queuedMessage !== undefined || following.length > 0);
+      if (retryQueued && deliverySessionId) {
+        const retry = { text, images: sentImages, attachments: sentClipboard };
+        const messages = [retry, ...following];
+        saveQueuedAgentMessages(turnAgent, directory, deliverySessionId, messages);
+        setAgentQueuePaused(turnAgent, directory, deliverySessionId, true);
+        keepImages = true;
+        if (current === generation && activeSessionId === deliverySessionId) {
+          queued = messages;
+          queuePaused = true;
+        }
+      }
       if (current === generation) {
         error = describe(cause);
         authNeeded = /auth|login|sign.?in/i.test(error);
-        if (!external) {
+        if (retryQueued) {
+          entries = entries.filter((entry) => entry.id !== userEntryId);
+        } else if (!external || queuedMessage) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
           images = [...sentImages, ...images];
@@ -711,7 +827,7 @@
         }
         if (stopRequested) markTools('status unconfirmed', ['stopping']);
       }
-      if (external) throw cause;
+      if (external && !queuedMessage) throw cause;
     } finally {
       if (current === generation) rememberTranscript();
       if (!keepImages)
@@ -726,7 +842,23 @@
       if (activeTurnId === turnId) activeTurnId = null;
       if (activityThread) onstatus(activityThread, finalStatus, notifyOnDone);
       if (current === generation) busy = false;
+      if (
+        !external &&
+        finalStatus === 'done' &&
+        deliverySessionId &&
+        deliverySessionId === activeSessionId &&
+        queuePaused
+      ) {
+        queuePaused = false;
+        setAgentQueuePaused(agent, directory, deliverySessionId, false);
+      }
     }
+  }
+
+  function retryQueue() {
+    if (!activeSessionId || !ready || isBusy || !queued.length) return;
+    queuePaused = false;
+    setAgentQueuePaused(agent, directory, activeSessionId, false);
   }
 
   async function stop() {
@@ -807,6 +939,25 @@
   }
 
   function keydown(event: KeyboardEvent) {
+    if (skillMatches.length) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        skillSelected =
+          (skillSelected + (event.key === 'ArrowDown' ? 1 : -1) + skillMatches.length) %
+          skillMatches.length;
+        return;
+      }
+      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        chooseSkill(skillMatches[skillSelected] ?? skillMatches[0]);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        draft = '';
+        return;
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       void send();
@@ -1081,7 +1232,15 @@
       <textarea
         bind:this={prompt}
         data-pane-prompt
+        role="combobox"
+        aria-autocomplete="list"
         aria-label={`Message ${name}`}
+        aria-haspopup="listbox"
+        aria-controls={skillMatches.length ? skillMenuId : undefined}
+        aria-expanded={skillMatches.length > 0}
+        aria-activedescendant={skillMatches.length
+          ? `${skillMenuId}-option-${Math.min(skillSelected, skillMatches.length - 1)}`
+          : undefined}
         bind:value={draft}
         onpaste={(event) => {
           pendingPaste = Promise.all([pendingPaste, pasteFiles(event)]).then(() => {});
@@ -1089,7 +1248,24 @@
         onkeydown={keydown}
         rows="3"
         placeholder={`Message ${name}…`}
-        disabled={!ready || isBusy || !directory}></textarea>
+        disabled={!ready || !directory}></textarea>
+      <SkillMenu
+        id={skillMenuId}
+        skills={skillMatches}
+        selected={skillSelected}
+        choose={chooseSkill}
+      />
+      {#if queued.length}<div class="queued-messages" role="status">
+          Queued: {queued.length}
+          {#if queuePaused}<Button size="sm" variant="secondary" onclick={retryQueue}
+              >Retry queue</Button
+            >{/if}
+          {#each queued as message, index (index)}<div>
+              {index + 1}. {message.text || 'Attachments'}{message.attachments.length
+                ? ` · ${message.attachments.length} files`
+                : ''}
+            </div>{/each}
+        </div>{/if}
       {#if images.length}<div class="attachments">
           {#each images as image (image.id)}<span
               >📷 {image.imagePath.split(/[\\/]/).at(-1)}
@@ -1140,8 +1316,8 @@
         <div class="agent-actions">
           <Button
             onclick={() => void send()}
-            disabled={!ready || isBusy || (!draft.trim() && !clipboardAttachments.length)}
-            loading={isBusy}>Send ↗</Button
+            disabled={!ready || (!draft.trim() && !clipboardAttachments.length)}
+            >{isBusy ? 'Queue ↗' : 'Send ↗'}</Button
           >
         </div>
       </div>
@@ -1326,6 +1502,7 @@
     gap: 12px;
   }
   .agent-composer {
+    position: relative;
     flex: 0 0 auto;
     padding-inline: 20px;
   }

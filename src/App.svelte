@@ -19,6 +19,9 @@
   import type { GitHubIssue, PullRequestCheck } from './ProjectSidebar.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
   import OptionPicker from './OptionPicker.svelte';
+  import SkillMenu from './SkillMenu.svelte';
+  import { matchingSkills, promptSkill, type SkillChoice } from './lib/skills';
+  import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import type { Confirmation } from './ConfirmDialog.svelte';
   import PathPicker from './PathPicker.svelte';
@@ -527,6 +530,46 @@
   let diffRevisionPath = '';
   let historyRefresh = 0;
   let draft = $state('');
+  let skills = $state<SkillChoice[]>([]);
+  let skillSelected = $state(0);
+  const skillMenuId = crypto.randomUUID();
+  const skillMatches = $derived(matchingSkills(skills, draft));
+  $effect(() => {
+    const source = client;
+    const path = directory;
+    const canLoad = setup?.workReady || setup?.planReady;
+    if (!source || !path || !canLoad) {
+      skills = [];
+      return;
+    }
+    let cancelled = false;
+    void source.skill.list({ location: { directory: path } }).then(
+      (result) => {
+        if (!cancelled)
+          skills = result.data.map((skill) => ({
+            id: skill.id,
+            name: skill.name,
+            description: skill.description ?? '',
+          }));
+        return undefined;
+      },
+      () => {
+        if (!cancelled) skills = [];
+        return undefined;
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  function chooseSkill(skill: SkillChoice) {
+    draft = `/${skill.name} `;
+    skillSelected = 0;
+    void tick().then(() =>
+      document.querySelector<HTMLTextAreaElement>('.chat-area .composer textarea')?.focus(),
+    );
+  }
   let mobileView = $state<'sessions' | 'chat' | 'details'>('chat');
   const viewStates = new SvelteMap<
     string,
@@ -4922,9 +4965,11 @@
       return;
     }
     if (!client || !canSend) return;
+    const source = client;
     let current = selection;
     const path = directory;
     const text = draft.trim();
+    const queueTurn = running;
     const files = [...attachedFiles];
     let accepted = false;
     for (const file of files) {
@@ -4976,15 +5021,23 @@
         activity = 'Thinking';
         activityTool = '';
       }
-      await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
-      await client.session.prompt({
-        sessionID: id,
-        text,
-        files: files.map((filePath) => ({
-          uri: fileUri(filePath),
-          name: clipboardAttachmentNames.get(filePath) ?? filePath.split(/[\\/]/).at(-1),
-        })),
+      const promptRequest = runSerialOpenCodeTurn(id, async () => {
+        await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
+        return source.session.prompt({
+          sessionID: id,
+          text,
+          skills: promptSkill(skills, text)?.id
+            ? [{ id: promptSkill(skills, text)!.id! }]
+            : undefined,
+          delivery: queueTurn ? 'queue' : undefined,
+          files: files.map((filePath) => ({
+            uri: fileUri(filePath),
+            name: clipboardAttachmentNames.get(filePath) ?? filePath.split(/[\\/]/).at(-1),
+          })),
+        });
       });
+      sending = false;
+      await promptRequest;
       accepted = true;
       const staged = files.filter((file) => clipboardAttachmentPaths.delete(file));
       staged.forEach((file) => clipboardAttachmentNames.delete(file));
@@ -5004,7 +5057,7 @@
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
           attachedFiles = [...files, ...attachedFiles.filter((file) => !files.includes(file))];
         }
-        running = false;
+        if (!queueTurn) running = false;
         error = describe(cause);
       } else {
         for (const file of files) {
@@ -5033,6 +5086,25 @@
   }
 
   function keydown(event: KeyboardEvent) {
+    if (skillMatches.length) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        skillSelected =
+          (skillSelected + (event.key === 'ArrowDown' ? 1 : -1) + skillMatches.length) %
+          skillMatches.length;
+        return;
+      }
+      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        chooseSkill(skillMatches[skillSelected] ?? skillMatches[0]);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        draft = '';
+        return;
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       void send();
@@ -5806,6 +5878,14 @@
                         >{/each}
                     </div>{/if}
                   <textarea
+                    role="combobox"
+                    aria-autocomplete="list"
+                    aria-haspopup="listbox"
+                    aria-controls={skillMatches.length ? skillMenuId : undefined}
+                    aria-expanded={skillMatches.length > 0}
+                    aria-activedescendant={skillMatches.length
+                      ? `${skillMenuId}-option-${Math.min(skillSelected, skillMatches.length - 1)}`
+                      : undefined}
                     data-pane-prompt
                     aria-label="Message"
                     bind:value={draft}
@@ -5819,6 +5899,12 @@
                       ? 'Describe the work or ask a question…'
                       : 'OpenCode needs a connected model…'}
                     disabled={!inputReady || sending}></textarea>
+                  <SkillMenu
+                    id={skillMenuId}
+                    skills={skillMatches}
+                    selected={skillSelected}
+                    choose={chooseSkill}
+                  />
                   <div class="composer-bottom">
                     <div class="composer-controls">
                       <OptionPicker
@@ -5859,7 +5945,9 @@
                         onclick={attachFiles}
                         disabled={!inputReady || sending}>Attach files</Button
                       >
-                      <Button onclick={send} disabled={!canSend} loading={sending}>Send ↗</Button>
+                      <Button onclick={send} disabled={!canSend} loading={sending}
+                        >{running ? 'Queue ↗' : 'Send ↗'}</Button
+                      >
                     </div>
                   </div>
                 </div>
