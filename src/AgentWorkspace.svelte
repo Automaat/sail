@@ -19,6 +19,7 @@
     type AgentThread,
   } from './lib/acp';
   import type { ThreadStatus } from './lib/attention';
+  import type { AgentUsage } from './lib/agent-usage';
   import type { BrowserAttachment } from './lib/browser-pick';
   import {
     coordinationMessageForText,
@@ -31,6 +32,7 @@
     agentName: string;
     directory: string;
     thread: AgentThread | null;
+    usage?: AgentUsage;
     running: boolean;
     focused?: boolean;
     focusPrompt?: boolean;
@@ -44,6 +46,7 @@
     oncreated: (thread: AgentThread) => void;
     onactivity: (thread: AgentThread) => void;
     onstatus: (thread: AgentThread, status: ThreadStatus, notifyOnDone?: boolean) => void;
+    onreplaychange?: (agent: AgentId, sessionId: string | null, replaying: boolean) => void;
     onterminal: (id: string) => void;
     onentrieschange?: (entries: AgentEntry[], sessionId: string | null, ready: boolean) => void;
     ephemeral?: boolean;
@@ -55,6 +58,7 @@
     agentName,
     directory,
     thread,
+    usage,
     running,
     focused = true,
     focusPrompt = false,
@@ -68,6 +72,7 @@
     oncreated,
     onactivity,
     onstatus,
+    onreplaychange,
     onterminal,
     onentrieschange,
     ephemeral = false,
@@ -99,6 +104,11 @@
   let expandedTools = $state<string[]>([]);
   const visibleEntries = $derived(entries.slice(-visibleCount));
   let replaying = false;
+  function setReplaying(value: boolean) {
+    if (replaying === value) return;
+    replaying = value;
+    onreplaychange?.(agent, activeSessionId, value);
+  }
   let replayEntries: AgentEntry[] = [];
   let pendingUpdates: Record<string, unknown>[] = [];
   let updateTimer: ReturnType<typeof setTimeout> | undefined;
@@ -260,7 +270,7 @@
     const current = generation;
     historyAttempted = true;
     historyLoading = true;
-    replaying = true;
+    setReplaying(true);
     replayEntries = [];
     try {
       await acp.load(agent, directory, id);
@@ -281,7 +291,7 @@
       if (current === generation) error = describe(cause);
     } finally {
       if (current === generation) {
-        replaying = false;
+        setReplaying(false);
         replayEntries = [];
         historyLoading = false;
       }
@@ -331,7 +341,7 @@
     clearTimeout(updateTimer);
     updateTimer = undefined;
     pendingUpdates = [];
-    replaying = false;
+    setReplaying(false);
     replayEntries = [];
     permissions = [];
     selectedThreadId = id;
@@ -374,7 +384,7 @@
           typeof sessionCapabilities === 'object' &&
           'resume' in sessionCapabilities;
         if (!canResume) {
-          replaying = true;
+          setReplaying(true);
           replayEntries = [];
         }
         const session = canResume
@@ -382,7 +392,7 @@
           : await acp.load(agent, directory, id);
         if (current === generation && !canResume) {
           entries = replayEntries;
-          replaying = false;
+          setReplaying(false);
           replayEntries = [];
           historyLoaded = true;
           rememberTranscript();
@@ -396,7 +406,7 @@
     } catch (cause) {
       if (current === generation) {
         error = describe(cause);
-        replaying = false;
+        setReplaying(false);
         authNeeded = /auth|login|sign.?in/i.test(error);
         if (thread) onstatus(thread, 'failed');
       }
@@ -505,6 +515,7 @@
       });
     return () => {
       disposed = true;
+      setReplaying(false);
       rememberTranscript();
       generation++;
       clearTimeout(updateTimer);
@@ -739,6 +750,10 @@
     <div class="agent-heading">
       <strong>{name}</strong><span>{thread?.title ?? 'New thread'}</span>
     </div>
+    {#if usage?.context !== undefined}<span class="agent-usage">Context {usage.context}%</span>{/if}
+    {#each usage?.rates ?? [] as rate (rate.label)}<span class="agent-usage"
+        >{rate.label} {rate.remaining}% left</span
+      >{/each}
     <div class="agent-config">
       {#each configOptions.filter((option) => option.type === 'select' && Array.isArray(option.options) && option.id !== modelOption?.id && option.id !== effortOption?.id) as option (option.id)}
         <label
@@ -964,6 +979,11 @@
   }
   .agent-heading strong {
     flex: none;
+  }
+  .agent-header .agent-usage {
+    flex: none;
+    font-size: 11px;
+    white-space: nowrap;
   }
   .agent-header span {
     opacity: 0.65;
