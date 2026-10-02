@@ -66,6 +66,7 @@
     migratePaneDirectory,
     newBrowserTab,
     splitPane,
+    terminalRuntimeId,
     updatePane,
     type BrowserTab,
     type Pane,
@@ -453,6 +454,22 @@
   let editingSessionID = $state<string | null>(null);
   let editedTitle = $state('');
   let sessionID = $state<string | null>(null);
+  let mainPickerDirectory = $state<string | null>(null);
+  let showMainPicker = $derived.by(() => {
+    const panes = leaves(paneLayout);
+    const main = panes[0];
+    return (
+      mainPickerDirectory === directory &&
+      panes.length === 1 &&
+      main?.id === 'main' &&
+      !main.agent &&
+      !main.thread &&
+      !main.kind &&
+      !acpAgent &&
+      !sessionID &&
+      !newSessionMode
+    );
+  });
   $effect(() => {
     const side = sideChat;
     if (!side) return;
@@ -1312,7 +1329,7 @@
     await reconcileNativeActivity();
     if (current !== selection || path !== directory) return;
     if (!workReady && !planReady) return;
-    if (acpAgent) return;
+    if (acpAgent || leaves(paneLayout).some((pane) => pane.id === 'main' && !!pane.kind)) return;
     const saved = getSetting(`sai-session:${path}`);
     const initial = sessionID ?? saved ?? sessions[0]?.id;
     if (initial && initial !== sessionID) {
@@ -2077,7 +2094,7 @@
       await Promise.all(
         leaves(paneLayouts[path] ?? mainPane())
           .filter((pane) => pane.kind === 'terminal')
-          .map((pane) => invoke('terminal_close', { id: pane.id })),
+          .map((pane) => invoke('terminal_close', { id: terminalRuntimeId(path, pane.id) })),
       );
       await invoke('delete_worktree', { repository, worktree: path, force: !!config });
       saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
@@ -2262,6 +2279,7 @@
     try {
       await refreshSessions();
       if (current !== selection) return;
+      if (leaves(paneLayout).some((pane) => pane.id === 'main' && !!pane.kind)) return;
       const saved = getSetting(`sai-session:${directory}`);
       if (saved && (await restoreSession(saved))) return;
       if (current !== selection) return;
@@ -2270,6 +2288,33 @@
     } catch (cause) {
       error = describe(cause);
     }
+  }
+
+  async function selectDefaultWorktree(path: string) {
+    if (path !== directory) await loadProject(path);
+    if (path !== directory) return;
+    const panes = leaves(paneLayout);
+    const main = panes[0];
+    if (
+      panes.length !== 1 ||
+      main?.id !== 'main' ||
+      main.agent ||
+      main.thread ||
+      main.kind ||
+      acpAgent ||
+      sessionID ||
+      newSessionMode
+    )
+      return;
+    mainPickerDirectory = path;
+    focusPaneForTyping('main');
+    await tick();
+    setTimeout(() => {
+      if (directory === path && mainPickerDirectory === path)
+        document
+          .querySelector<HTMLButtonElement>('[data-pane-id="main"] [data-pane-picker]')
+          ?.focus();
+    }, 0);
   }
 
   async function refreshSetup(path = directory) {
@@ -2533,13 +2578,13 @@
     }
     if (focusedPane !== 'main' && leaves(paneLayout).some((leaf) => leaf.id === focusedPane)) {
       invalidatePaneSelection(focusedPane);
-      savePaneLayout(updatePane(paneLayout, focusedPane, { agent, thread }));
+      savePaneLayout(updatePane(paneLayout, focusedPane, { agent, thread, kind: undefined }));
       return;
     }
     saveViewState();
     acpAgent = agent;
     acpThread = thread;
-    savePaneLayout(updatePane(paneLayout, 'main', { agent, thread }));
+    savePaneLayout(updatePane(paneLayout, 'main', { agent, thread, kind: undefined }));
     mobileView = 'chat';
   }
 
@@ -3056,7 +3101,9 @@
         `${directory}\0main\0acp:${thread.agent}:${thread.sessionId}`,
       );
       acpThread = thread;
-      savePaneLayout(updatePane(paneLayout, 'main', { agent: thread.agent, thread }));
+      savePaneLayout(
+        updatePane(paneLayout, 'main', { agent: thread.agent, thread, kind: undefined }),
+      );
     }
   }
 
@@ -3328,7 +3375,7 @@
     terminalExitWaiters.delete(id);
     finishCoordinationSetup(id, 1);
     if (leaves(paneLayout).find((leaf) => leaf.id === id)?.kind === 'terminal')
-      void invoke('terminal_close', { id });
+      void invoke('terminal_close', { id: terminalRuntimeId(directory, id) });
     let layout = closePane(paneLayout, id);
     if (!('direction' in layout) && layout.id === 'main')
       layout = { id: 'main', agent: acpAgent, thread: acpThread };
@@ -3348,9 +3395,15 @@
       closeFocusedPane(focusedPane);
       return;
     }
-    if (acpAgent || !leaves(paneLayout).some((pane) => pane.id === 'main')) {
+    if (
+      acpAgent ||
+      !leaves(paneLayout).some((pane) => pane.id === 'main') ||
+      leaves(paneLayout).some((pane) => pane.id === 'main' && !!pane.kind)
+    ) {
       if (leaves(paneLayout)[0]?.kind === 'terminal')
-        void invoke('terminal_close', { id: leaves(paneLayout)[0].id });
+        void invoke('terminal_close', {
+          id: terminalRuntimeId(directory, leaves(paneLayout)[0].id),
+        });
       acpAgent = null;
       acpThread = null;
       savePaneLayout(mainPane());
@@ -3396,6 +3449,11 @@
   }
 
   function choosePaneAgent(id: string, agent: AgentId) {
+    if (id === 'main') {
+      if (agent === 'opencode') newWork();
+      else openAgent(agent);
+      return;
+    }
     invalidatePaneSelection(id);
     const batch = pendingAgentBatches[id];
     if (batch) completeAgentBatch(batch.id, 'Agent pane changed before comments were sent.');
@@ -3559,7 +3617,9 @@
       acpAgent === thread.agent
     ) {
       acpThread = null;
-      savePaneLayout(updatePane(paneLayout, 'main', { agent: thread.agent, thread: null }));
+      savePaneLayout(
+        updatePane(paneLayout, 'main', { agent: thread.agent, thread: null, kind: undefined }),
+      );
     }
     void tick().then(() => forgetRecentTranscript(thread));
   }
@@ -3897,7 +3957,9 @@
       focusMainPane();
       acpAgent = null;
       acpThread = null;
-      savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null }));
+      savePaneLayout(
+        updatePane(paneLayout, 'main', { agent: null, thread: null, kind: undefined }),
+      );
       if (sessionID || newSessionMode || draft !== (viewStates.get(viewKey())?.draft ?? ''))
         saveViewState();
     }
@@ -4003,7 +4065,7 @@
     focusMainPane();
     acpAgent = null;
     acpThread = null;
-    savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null }));
+    savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null, kind: undefined }));
     saveViewState();
     ++selection;
     sessionID = null;
@@ -4038,7 +4100,7 @@
     focusMainPane();
     acpAgent = null;
     acpThread = null;
-    savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null }));
+    savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null, kind: undefined }));
     const path = directory;
     const current = selection;
     try {
@@ -5200,6 +5262,7 @@
         onselect={(path) => {
           if (path !== directory) void loadProject(path);
         }}
+        onselectdefault={(path) => void selectDefaultWorktree(path)}
         onaddrepository={(groupID) => void chooseProject(groupID)}
         onaddgroup={addProjectGroup}
         onrenamegroup={renameProjectGroup}
@@ -5870,7 +5933,10 @@
         (agentEntrySnapshots = { ...agentEntrySnapshots, [id]: { entries, sessionId, ready } })}
       {changesPanes}
       main={mainPaneContent}
-      canClose={leaves(paneLayout).length > 1 || !!sideChat}
+      mainPicker={showMainPicker}
+      canClose={leaves(paneLayout).length > 1 ||
+        !!sideChat ||
+        leaves(paneLayout).some((pane) => pane.id === 'main' && !!pane.kind)}
       onfocus={focusPane}
       onclose={closeFocusedPane}
       onratio={updatePaneRatio}
