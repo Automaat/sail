@@ -137,6 +137,7 @@
     loadProjectCatalog,
     removeRepository,
     removeWorktree,
+    worktreeAt,
     replaceRepositoryPath,
     setWorktreePullRequest,
     setWorktreeStatus,
@@ -1021,6 +1022,7 @@
     let stopSettingsAction: (() => void) | undefined;
     let stopCloseRequest: (() => void) | undefined;
     let stopPaneClose: (() => void) | undefined;
+    let stopWorktreeClose: (() => void) | undefined;
     if (isTauri()) {
       void listen<BrowserAccessRequest>('browser:access-request', ({ payload }) => {
         const previousApproval = browserApprovalQueue;
@@ -1056,6 +1058,9 @@
       void listen('pane:close', () => {
         if (!document.querySelector('dialog[open]')) closeCurrentPane();
       }).then((unlisten) => (stopPaneClose = unlisten));
+      void listen('worktree:close', () => {
+        if (!document.querySelector('dialog[open]')) closeCurrentWorktree();
+      }).then((unlisten) => (stopWorktreeClose = unlisten));
       void getCurrentWindow()
         .onCloseRequested((event) => {
           event.preventDefault();
@@ -1154,6 +1159,7 @@
       stopSettingsAction?.();
       stopCloseRequest?.();
       stopPaneClose?.();
+      stopWorktreeClose?.();
       disposed = true;
       finishWorktreeApproval(false);
       clearInterval(coordinationRetry);
@@ -2113,6 +2119,25 @@
       if (directory !== path) await loadProject(path);
       error = describe(cause);
     }
+  }
+
+  let closingWorktree: string | null = null;
+
+  function closeCurrentWorktree() {
+    if (closingWorktree) return;
+    const target = worktreeAt(projectCatalog, directory);
+    if (!target) {
+      error = projectCatalog.repositories.includes(directory)
+        ? 'The main checkout cannot be deleted. Select a worktree to close it.'
+        : 'Select a worktree to close it.';
+      return;
+    }
+    closingWorktree = target.worktree.path;
+    void deleteProjectWorktree(
+      target.repository,
+      target.worktree.path,
+      target.worktree.branch,
+    ).finally(() => (closingWorktree = null));
   }
 
   async function createProjectPullRequest(
@@ -5082,6 +5107,16 @@
     ) {
       event.preventDefault();
       openCommandPalette();
+      return;
+    }
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      !event.altKey &&
+      event.shiftKey &&
+      event.key.toLowerCase() === 'w'
+    ) {
+      event.preventDefault();
+      if (!event.repeat && !document.querySelector('dialog[open]')) closeCurrentWorktree();
       return;
     }
     if (

@@ -17,6 +17,13 @@ fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 
     let menu = Menu::default(app)?;
     let close_pane = MenuItem::with_id(app, "close-pane", "Close Pane", true, Some("CmdOrCtrl+W"))?;
+    let close_worktree = MenuItem::with_id(
+        app,
+        "close-worktree",
+        "Close Session and Delete Worktree",
+        true,
+        Some("CmdOrCtrl+Shift+W"),
+    )?;
     for item in menu.items()? {
         if let Some(submenu) = item.as_submenu() {
             for (index, entry) in submenu.items()?.into_iter().enumerate().rev() {
@@ -28,21 +35,26 @@ fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
             }
             if submenu.text()? == "File" {
                 submenu.insert(&close_pane, 0)?;
+                submenu.insert(&close_worktree, 1)?;
             }
         }
     }
     app.set_menu(menu)?;
     app.on_menu_event(|app, event| {
-        if event.id() != "close-pane" {
-            return;
-        }
+        let event_name = match event.id().as_ref() {
+            "close-pane" => "pane:close",
+            "close-worktree" => "worktree:close",
+            _ => return,
+        };
         if let Some(settings) = app.get_webview_window("settings") {
             if settings.is_focused().unwrap_or(false) {
-                let _ = settings.close();
+                if event_name == "pane:close" {
+                    let _ = settings.close();
+                }
                 return;
             }
         }
-        let _ = app.emit_to("main", "pane:close", ());
+        let _ = app.emit_to("main", event_name, ());
     });
     Ok(())
 }
@@ -1159,7 +1171,17 @@ fn create_worktree(
 }
 
 #[tauri::command]
-fn delete_worktree(
+async fn delete_worktree(
+    repository: String,
+    worktree: String,
+    force: Option<bool>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || remove_worktree(repository, worktree, force))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn remove_worktree(
     repository: String,
     worktree: String,
     force: Option<bool>,
