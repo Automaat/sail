@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   adjacentPaneId,
+  browserPopIndex,
   closePane,
   leaves,
   loadPaneLayouts,
@@ -12,6 +13,14 @@ import {
   splitPane,
   updatePane,
 } from '../src/lib/panes.ts';
+
+void test('browser pop history selects duplicate URLs in travel direction', () => {
+  const history = ['https://example.com/a', 'https://example.com/b', 'https://example.com/a'];
+  assert.equal(browserPopIndex(history, 2, history[1], -1), 1);
+  assert.equal(browserPopIndex(history, 1, history[0], -1), 0);
+  assert.equal(browserPopIndex(history, 0, history[1], 1), 1);
+  assert.equal(browserPopIndex(history, 1, history[2], 1), 2);
+});
 
 void test('split ratios keep both panes usable at narrow sizes', () => {
   const bounds = paneRatioBounds(370);
@@ -80,13 +89,21 @@ void test('pane layouts survive serialization and reject malformed saved trees',
   assert.deepEqual(loadPaneLayouts(JSON.stringify({ '/repo': layout }))['/repo'], layout);
   const terminal = updatePane(layout, leaves(layout)[1].id, { kind: 'terminal' });
   assert.deepEqual(loadPaneLayouts(JSON.stringify({ '/repo': terminal }))['/repo'], terminal);
+  const browserTab = { id: 'tab-1', history: ['http://localhost:3000/'], index: 0 };
+  const browser = updatePane(layout, leaves(layout)[1].id, {
+    kind: 'browser',
+    tabs: [browserTab],
+    activeTab: browserTab.id,
+  });
+  assert.deepEqual(loadPaneLayouts(JSON.stringify({ '/repo': browser }))['/repo'], browser);
+  const invalidBrowser = updatePane(browser, leaves(browser)[1].id, {
+    tabs: [{ ...browserTab, history: ['javascript:alert(1)'] }],
+  });
+  assert.deepEqual(loadPaneLayouts(JSON.stringify({ '/repo': invalidBrowser })), {});
   const hybrid = { id: 'main', kind: 'terminal', agent: 'claude', thread: null };
   assert.deepEqual(loadPaneLayouts(JSON.stringify({ '/repo': hybrid })), {});
   const mainTerminal = updatePane(mainPane(), 'main', { kind: 'terminal' });
-  assert.deepEqual(
-    loadPaneLayouts(JSON.stringify({ '/repo': mainTerminal }))['/repo'],
-    mainTerminal,
-  );
+  assert.deepEqual(loadPaneLayouts(JSON.stringify({ '/repo': mainTerminal })), {});
   const duplicate = {
     id: 'split',
     direction: 'row',
