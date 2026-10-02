@@ -457,9 +457,8 @@ impl BrowserManager {
         arguments: Value,
     ) -> Result<Value, String> {
         let setting = match name {
-            "worktree_create" | "worktree_list" | "worktree_info" | "agent_spawn" => {
-                "sai-agent-worktrees-enabled"
-            }
+            "worktree_create" | "worktree_list" | "worktree_info" | "agent_spawn"
+            | "agent_status" | "agent_wait" | "agent_result" => "sai-agent-worktrees-enabled",
             "worktree_status" => "sai-agent-status-enabled",
             "project_threads" => "sai-agent-thread-list-enabled",
             "thread_message" => "sai-agent-messages-enabled",
@@ -531,6 +530,9 @@ impl BrowserManager {
                 | "worktree_list"
                 | "worktree_info"
                 | "agent_spawn"
+                | "agent_status"
+                | "agent_wait"
+                | "agent_result"
                 | "worktree_status"
                 | "project_threads"
                 | "thread_message"
@@ -1061,6 +1063,21 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "provider,prompt",
     ),
     (
+        "agent_status",
+        "Inspect the state of a launch receipt returned by agent_spawn. Only the launching thread can read it.",
+        "receiptId",
+    ),
+    (
+        "agent_wait",
+        "Wait up to 30 seconds for a launch receipt to finish or require input. Returns timedOut if the wait expires.",
+        "receiptId",
+    ),
+    (
+        "agent_result",
+        "Read a bounded completion result for a launch receipt. Only the launching thread can read it.",
+        "receiptId",
+    ),
+    (
         "worktree_status",
         "Set a short status comment on the current worktree in the Sail sidebar. Empty text clears it.",
         "comment",
@@ -1134,6 +1151,14 @@ pub fn run_mcp_stdio() {
                             ]}
                         },
                         "required":["provider","prompt"]
+                    }});
+                }
+                if *name == "agent_wait" {
+                    return json!({"name":name,"description":description,"inputSchema":{
+                        "type":"object","properties":{
+                            "receiptId":{"type":"string"},
+                            "timeoutMs":{"type":"integer","minimum":0,"maximum":30000}
+                        },"required":["receiptId"]
                     }});
                 }
                 let properties: serde_json::Map<String, Value> = fields.split(',').filter(|field| !field.is_empty()).map(|field| (field.to_string(), json!({"type":"string"}))).collect();
