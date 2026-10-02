@@ -80,6 +80,66 @@ export interface AcpPendingInboxItem {
 }
 
 const storageKey = 'sail-agent-threads';
+const transcriptKey = 'sai-agent-transcript-cache';
+const transcriptLimit = 50;
+const threadLimit = 20;
+
+function transcriptId(agent: AgentId, directory: string, sessionId: string): string {
+  return JSON.stringify([agent, directory, sessionId]);
+}
+
+type SavedTranscript = { id: string; entries: AgentEntry[] };
+
+function savedTranscripts(): SavedTranscript[] {
+  try {
+    const value: unknown = JSON.parse(getSetting(transcriptKey) ?? '[]');
+    if (!Array.isArray(value)) return [];
+    return value.filter(
+      (item): item is SavedTranscript =>
+        item &&
+        typeof item === 'object' &&
+        typeof item.id === 'string' &&
+        Array.isArray(item.entries),
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function loadRecentTranscript(thread: AgentThread): AgentEntry[] {
+  return (
+    savedTranscripts().find(
+      (item) => item.id === transcriptId(thread.agent, thread.directory, thread.sessionId),
+    )?.entries ?? []
+  );
+}
+
+export function saveRecentTranscript(thread: AgentThread, entries: AgentEntry[]): void {
+  const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  const recent: AgentEntry[] = [];
+  const encoder = new TextEncoder();
+  let remaining = 128 * 1024 - encoder.encode(JSON.stringify({ id, entries: [] })).length;
+  if (remaining <= 0) return;
+  for (const entry of entries.slice(-transcriptLimit).toReversed()) {
+    const saved: AgentEntry =
+      entry.type === 'tool'
+        ? { ...entry, content: entry.content.slice(0, 4096), terminalIds: [] }
+        : { ...entry, text: entry.text.slice(-20000) };
+    const size = encoder.encode(JSON.stringify(saved)).length + Number(recent.length > 0);
+    if (size > remaining) continue;
+    recent.push(saved);
+    remaining -= size;
+  }
+  recent.reverse();
+  const saved = savedTranscripts().filter((item) => item.id !== id);
+  saved.push({ id, entries: recent });
+  setSetting(transcriptKey, JSON.stringify(saved.slice(-threadLimit)));
+}
+
+export function forgetRecentTranscript(thread: AgentThread): void {
+  const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  setSetting(transcriptKey, JSON.stringify(savedTranscripts().filter((item) => item.id !== id)));
+}
 
 export function loadAgentThreads(): AgentThread[] {
   try {
@@ -193,6 +253,8 @@ export const acp = {
     }),
   load: (agent: AgentId, cwd: string, sessionId: string) =>
     invoke<Record<string, unknown>>('acp_load_session', { agent, cwd, sessionId }),
+  resume: (agent: AgentId, cwd: string, sessionId: string) =>
+    invoke<Record<string, unknown>>('acp_resume_session', { agent, cwd, sessionId }),
   prompt: (
     agent: AgentId,
     sessionId: string,

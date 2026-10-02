@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -704,6 +705,68 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+async fn working_tree_revision(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = validate_repository(path)?;
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &root,
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--no-renames",
+                "--untracked-files=all",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err("Could not read working tree changes.".into());
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        output.stdout.hash(&mut hash);
+        for record in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| record.len() >= 4)
+        {
+            let path = String::from_utf8_lossy(&record[3..]);
+            if let Ok(metadata) = Path::new(&root).join(path.as_ref()).symlink_metadata() {
+                metadata.len().hash(&mut hash);
+                metadata.modified().ok().hash(&mut hash);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode().hash(&mut hash);
+                }
+                #[cfg(not(unix))]
+                metadata.permissions().readonly().hash(&mut hash);
+            }
+        }
+        let index = Command::new("git")
+            .args(["-C", &root, "rev-parse", "--git-path", "index"])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if index.status.success() {
+            let path = String::from_utf8_lossy(&index.stdout);
+            let path = Path::new(path.trim());
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                Path::new(&root).join(path)
+            };
+            if let Ok(metadata) = path.metadata() {
+                metadata.len().hash(&mut hash);
+                metadata.modified().ok().hash(&mut hash);
+            }
+        }
+        Ok(format!("{:016x}", hash.finish()))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn selected_hunk(patch: &str, ordinal: usize) -> Result<String, String> {
     let lines = patch.split_inclusive('\n').collect::<Vec<_>>();
     let headers = lines
@@ -1132,6 +1195,7 @@ pub fn run() {
             start_runtime,
             validate_repository,
             working_tree_diff,
+            working_tree_revision,
             worktree_snapshots::record_turn_snapshot,
             worktree_snapshots::list_turn_snapshots,
             worktree_snapshots::restore_turn_snapshot,
@@ -1149,12 +1213,14 @@ pub fn run() {
             github::open_check_url,
             github::open_external_url,
             acp_terminal::acp_terminal_snapshot,
+            acp_terminal::acp_terminal_delta,
             acp_terminal::acp_terminal_stop,
             local_plugin_version,
             acp::acp_agents,
             acp::acp_connect,
             acp::acp_new_session,
             acp::acp_load_session,
+            acp::acp_resume_session,
             acp::acp_prompt,
             acp::acp_cancel,
             acp::acp_permission,
@@ -1204,6 +1270,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::working_tree_revision;
     use super::{
         git_change_action, git_patch, repository_namespace, server_args, version_number,
         working_tree_diff,
@@ -1223,6 +1291,34 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_revision_detects_mode_changes_to_modified_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("sail-revision-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        git(path, &["config", "core.filemode", "true"]);
+        let file = root.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+        git(path, &["add", "file.txt"]);
+        git(path, &["commit", "-qm", "seed"]);
+        fs::write(&file, "changed\n").unwrap();
+        let before = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_mode(permissions.mode() ^ 0o111);
+        fs::set_permissions(&file, permissions).unwrap();
+        let after = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        assert_ne!(before, after);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
