@@ -155,6 +155,32 @@ describe('split agent panes', () => {
     await $('button[aria-label="Close pane"]').click();
     await browser.refresh();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Parent memory');
+    await $('.agent-actions button').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    await $('.agent-permission button').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Parent memory'),
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const savedLayout = await browser.execute(() => localStorage.getItem('sai-pane-layouts'));
+    const savedThreads = await browser.execute(() => localStorage.getItem('sail-agent-threads'));
+    await browser.keys(['Meta', 'Shift', 'j']);
+    await expect($('[aria-label="Side chat pane"]')).toBeDisplayed();
+    await expect($('[aria-label="Side chat pane"] [data-pane-prompt]')).toBeFocused();
+    expect(await browser.execute(() => localStorage.getItem('sai-pane-layouts'))).toBe(savedLayout);
+    expect(await browser.execute(() => localStorage.getItem('sail-agent-threads'))).toBe(
+      savedThreads,
+    );
+    await browser.keys(['Meta', 'w']);
+    await expect($('[aria-label="Side chat pane"]')).not.toExist();
+    await expect($('.agent-composer textarea')).toBeFocused();
+    await browser.refresh();
+    await expect($('[aria-label="Side chat pane"]')).not.toExist();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Parent memory'),
+    );
     await browser.keys(['Meta', 'w']);
     await expect($('.agent-header')).not.toExist();
     await expect($('.workspace')).toBeDisplayed();

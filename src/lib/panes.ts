@@ -14,6 +14,14 @@ export type Pane =
     }
   | { id: string; direction: 'row' | 'column'; ratio: number; first: Pane; second: Pane };
 
+export type SideChat = {
+  id: string;
+  parentId: string;
+  parentThreadId?: string;
+  source:
+    { kind: 'opencode'; sessionID: string } | { kind: 'acp'; agent: AgentId; context: string };
+};
+
 export type BrowserTab = { id: string; history: string[]; index: number };
 
 export function browserPopIndex(
