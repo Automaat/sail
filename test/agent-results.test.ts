@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  acpReceiptState,
   loadSpawnReceipts,
   receiptForSource,
   receiptIsSettled,
@@ -10,13 +11,17 @@ import {
 
 const receipt: SpawnReceipt = {
   receiptId: 'request-one',
+  accessKey: 'secret-one',
+  requestId: 'bridge-one',
   project: '/repo',
   sourceId: 'acp:claude:source',
   sourceDirectory: '/repo',
   targetId: 'acp:codex:target',
+  turnId: 'turn-one',
   targetDirectory: '/repo/task',
   worktreeId: '/repo/task',
   provider: 'codex',
+  prompt: 'Do the task',
   state: 'completed',
   created: 1,
   updated: 2,
@@ -26,23 +31,62 @@ const receipt: SpawnReceipt = {
 
 await test('spawn receipts stay scoped to the launching source and project', () => {
   assert.deepEqual(
-    receiptForSource([receipt], 'request-one', '/repo', receipt.sourceId, '/repo'),
+    receiptForSource(
+      [receipt],
+      'request-one',
+      receipt.accessKey,
+      '/repo',
+      receipt.sourceId,
+      '/repo',
+    ),
     receipt,
   );
   assert.equal(
-    receiptForSource([receipt], 'request-one', '/other', receipt.sourceId, '/repo'),
+    receiptForSource(
+      [receipt],
+      'request-one',
+      receipt.accessKey,
+      '/other',
+      receipt.sourceId,
+      '/repo',
+    ),
     null,
   );
   assert.equal(
-    receiptForSource([receipt], 'request-one', '/repo', 'acp:claude:other', '/repo'),
+    receiptForSource(
+      [receipt],
+      'request-one',
+      receipt.accessKey,
+      '/repo',
+      'acp:claude:other',
+      '/repo',
+    ),
     null,
   );
   assert.equal(
-    receiptForSource([receipt], 'request-one', '/repo', receipt.sourceId, '/other'),
+    receiptForSource(
+      [receipt],
+      'request-one',
+      receipt.accessKey,
+      '/repo',
+      receipt.sourceId,
+      '/other',
+    ),
     null,
   );
   assert.equal(
-    receiptForSource([receipt], 'request-two', '/repo', receipt.sourceId, '/repo'),
+    receiptForSource(
+      [receipt],
+      'request-two',
+      receipt.accessKey,
+      '/repo',
+      receipt.sourceId,
+      '/repo',
+    ),
+    null,
+  );
+  assert.equal(
+    receiptForSource([receipt], 'request-one', 'wrong-key', '/repo', receipt.sourceId, '/repo'),
     null,
   );
 });
@@ -55,8 +99,34 @@ await test('receipts survive restart with bounded results and honest states', ()
   assert.equal(receiptIsSettled('waiting'), false);
   assert.equal(
     loadSpawnReceipts(JSON.stringify([{ ...receipt, state: 'working' }]))[0].state,
-    'unavailable',
+    'working',
   );
   assert.deepEqual(loadSpawnReceipts('{invalid'), []);
   assert.deepEqual(loadSpawnReceipts(JSON.stringify([{ ...receipt, targetId: 1 }])), []);
+});
+
+await test('ACP reconnect requires the same turn to prove state', () => {
+  const working = { ...receipt, state: 'working' as const };
+  const activity = {
+    alive: true,
+    active: ['target'],
+    activeTurns: { target: 'turn-one' },
+    waiting: ['target'],
+    sessions: ['target'],
+    finished: {},
+  };
+  assert.equal(acpReceiptState(working, activity), 'waiting');
+  assert.equal(acpReceiptState(working, { ...activity, waiting: [] }), 'working');
+  assert.equal(
+    acpReceiptState(working, { ...activity, activeTurns: { target: 'other-turn' } }),
+    'unavailable',
+  );
+  assert.equal(
+    acpReceiptState(working, {
+      ...activity,
+      activeTurns: {},
+      finished: { target: { turnId: 'turn-one', status: 'done', notify: true } },
+    }),
+    'completed',
+  );
 });
