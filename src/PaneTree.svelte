@@ -4,20 +4,26 @@
   import type { WorkingDiffInfo } from './lib/diff';
   import PaneTree from './PaneTree.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
+  import OpenCodePane from './OpenCodePane.svelte';
   import DiffPanel from './DiffPanel.svelte';
+  import PlanPanel from './PlanPanel.svelte';
+  import HistoryPanel from './HistoryPanel.svelte';
   import EmptyPanePicker from './EmptyPanePicker.svelte';
   import TerminalPane from './TerminalPane.svelte';
   import AgentTerminalPane from './AgentTerminalPane.svelte';
   import BrowserPane from './BrowserPane.svelte';
   import SideChat from './SideChat.svelte';
   import type { AgentThread, AgentAvailability, AgentEntry } from './lib/acp';
-  import type { OpenCodeClient } from './lib/opencode';
+  import type { OpenCodeClient, SessionInfo } from './lib/opencode';
+  import type { SetupReport } from './lib/onboarding';
   import type { BrowserAttachment } from './lib/browser-pick';
   import type { DiffComment } from './lib/diff-comments';
   import { coordinationKey, type CoordinationMessage } from './lib/coordination';
   import type { ThreadStatus } from './lib/attention';
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import { threadKey } from './lib/recent-threads';
+  import { getPlan, getHistory, type PlanSnapshot, type HistoryEntry } from './lib/plan';
+  import { annotateDiffs } from './lib/diff';
   import {
     clampPaneRatio,
     paneRatioBounds,
@@ -34,6 +40,7 @@
     agents: AgentAvailability[];
     sideChat: SideChatState | null;
     client: OpenCodeClient | null;
+    setup: SetupReport | null;
     coordinationMessages: CoordinationMessage[];
     agentUsage: Record<string, AgentUsage>;
     agentRates: Record<string, RateWindow[]>;
@@ -65,6 +72,7 @@
     onbatchcomplete: (id: string, failure: string | null) => void;
     onshortcut: (event: KeyboardEvent) => void;
     onactivity: (thread: AgentThread) => void;
+    onusage: (sessionID: string, context: number | undefined) => void;
     focusPromptPane: string | null;
     onpromptfocused: () => void;
     running: (thread: AgentThread | null) => boolean;
@@ -85,6 +93,7 @@
     agents,
     sideChat,
     client,
+    setup,
     coordinationMessages,
     agentUsage,
     agentRates,
@@ -111,6 +120,7 @@
     onbatchcomplete,
     onshortcut,
     onactivity,
+    onusage,
     focusPromptPane,
     onpromptfocused,
     running,
@@ -141,6 +151,100 @@
   let diffGeneration = 0;
   let diffRevision = '';
   let diffRevisionPath = '';
+  let nativeSnapshot = $state<PlanSnapshot>({ plan: null, questions: null });
+  let nativeHistory = $state<HistoryEntry[]>([]);
+  let nativeSession = $state<SessionInfo>();
+  let nativeHistoryError = $state('');
+  let nativeDetailsOpen = $state(false);
+  let nativeTab = $state<'plan' | 'changes' | 'history'>('changes');
+  let nativeDetailsGeneration = 0;
+  const nativeDetailsVisible = $derived(nativeDetailsOpen || changesPanes.includes(pane.id));
+  let previousChangesOpen = false;
+
+  async function refreshNativeDetails() {
+    if (!client || 'direction' in pane || !pane.thread || pane.agent !== 'opencode') return;
+    const id = pane.thread.sessionId;
+    const path = directory;
+    const generation = ++nativeDetailsGeneration;
+    if (setup?.rpc.state !== 'ready') {
+      nativeSnapshot = { plan: null, questions: null };
+      nativeHistory = [];
+      nativeHistoryError = 'Install the plan-review plugin to record plan history.';
+      return;
+    }
+    const [plan, history, session] = await Promise.allSettled([
+      getPlan(client, path, id),
+      getHistory(client, path, id),
+      client.session.get({ sessionID: id }),
+    ]);
+    if (
+      generation !== nativeDetailsGeneration ||
+      path !== directory ||
+      'direction' in pane ||
+      id !== pane.thread?.sessionId
+    )
+      return;
+    if (plan.status === 'fulfilled') {
+      nativeSnapshot = plan.value;
+      if ((plan.value.plan || plan.value.questions) && !nativeDetailsOpen) {
+        nativeDetailsOpen = true;
+        nativeTab = 'plan';
+      }
+    } else nativeHistoryError = String(plan.reason);
+    if (history.status === 'fulfilled') {
+      nativeHistory = history.value;
+      nativeHistoryError = '';
+    } else nativeHistoryError = String(history.reason);
+    if (session.status === 'fulfilled') nativeSession = session.value;
+  }
+
+  $effect(() => {
+    if ('direction' in pane) return;
+    ++nativeDetailsGeneration;
+    nativeSnapshot = { plan: null, questions: null };
+    nativeHistory = [];
+    nativeSession = undefined;
+    nativeDetailsOpen = false;
+    nativeTab = 'changes';
+    const id = pane.thread?.sessionId;
+    const source = client;
+    const rpc = setup?.rpc.state;
+    if (pane.agent !== 'opencode' || !id || !source || !rpc) return;
+    void refreshNativeDetails();
+  });
+
+  $effect(() => {
+    if ('direction' in pane || pane.agent !== 'opencode') return;
+    const changesOpen = changesPanes.includes(pane.id);
+    if (changesOpen === previousChangesOpen) return;
+    previousChangesOpen = changesOpen;
+    nativeDetailsOpen = changesOpen;
+    if (changesOpen) nativeTab = 'changes';
+  });
+
+  $effect(() => {
+    if ('direction' in pane || pane.agent !== 'opencode' || !pane.thread || !client) return;
+    const source = client;
+    const id = pane.thread.sessionId;
+    const path = directory;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of source.event.subscribe({ signal: controller.signal })) {
+          if (controller.signal.aborted) return;
+          if (
+            event.type === 'rpc.planreview.changed' &&
+            event.location?.directory === path &&
+            id === pane.thread?.sessionId
+          )
+            void refreshNativeDetails();
+        }
+      } catch {
+        return;
+      }
+    })();
+    return () => controller.abort();
+  });
 
   async function refreshDiff(quiet = false) {
     const current = ++diffGeneration;
@@ -166,7 +270,13 @@
   }
 
   $effect(() => {
-    if ('direction' in pane || pane.id === 'main' || !changesPanes.includes(pane.id)) return;
+    if ('direction' in pane || pane.id === 'main') return;
+    if (
+      pane.agent === 'opencode'
+        ? !nativeDetailsVisible || nativeTab !== 'changes'
+        : !changesPanes.includes(pane.id)
+    )
+      return;
     void refreshDiff();
     const timer = setInterval(() => void refreshDiff(true), 5000);
     return () => clearInterval(timer);
@@ -225,6 +335,7 @@
       {agents}
       {sideChat}
       {client}
+      {setup}
       {onentries}
       {changesPanes}
       {main}
@@ -248,6 +359,7 @@
       {onbatchcomplete}
       {onshortcut}
       {onactivity}
+      {onusage}
       {focusPromptPane}
       {onpromptfocused}
       {running}
@@ -298,6 +410,7 @@
       {agents}
       {sideChat}
       {client}
+      {setup}
       {onentries}
       {changesPanes}
       {main}
@@ -321,6 +434,7 @@
       {onbatchcomplete}
       {onshortcut}
       {onactivity}
+      {onusage}
       {focusPromptPane}
       {onpromptfocused}
       {running}
@@ -423,6 +537,103 @@
             onfocus={() => onfocus(pane.id)}
             {onshortcut}
           />
+        {/key}
+      {:else if pane.agent === 'opencode'}
+        {#key `${pane.id}:opencode`}
+          <div class="pane-agent-content" class:changes-open={nativeDetailsVisible}>
+            <OpenCodePane
+              {client}
+              {directory}
+              thread={pane.thread}
+              {setup}
+              coordinationMessages={coordinationMessages.filter(
+                (message) =>
+                  pane.thread &&
+                  message.target ===
+                    coordinationKey(directory, `opencode:${pane.thread.sessionId}`),
+              )}
+              focused={focused === pane.id}
+              focusPrompt={focusPromptPane === pane.id}
+              picked={pickedAttachments[pane.id]}
+              externalPrompt={pendingAgentBatches[pane.id]}
+              onexternalresult={onbatchcomplete}
+              {onpickedconsumed}
+              {onpromptfocused}
+              oncreated={(thread) => oncreated(pane.id, thread)}
+              onactivity={(thread) => {
+                onactivity(thread);
+                void refreshNativeDetails();
+              }}
+              {onusage}
+              {onstatus}
+            />
+            {#if nativeDetailsVisible}
+              <section class="native-details side-area" aria-label="OpenCode session details">
+                <nav class="side-tabs" aria-label="OpenCode detail tabs">
+                  {#if nativeSnapshot.plan || nativeSnapshot.questions}<button
+                      class:active={nativeTab === 'plan'}
+                      onclick={() => (nativeTab = 'plan')}>Plan</button
+                    >{/if}<button
+                    class:active={nativeTab === 'changes'}
+                    onclick={() => (nativeTab = 'changes')}>Changes ({diffs.length})</button
+                  ><button
+                    class:active={nativeTab === 'history'}
+                    onclick={() => (nativeTab = 'history')}>History</button
+                  ><button
+                    aria-label="Close OpenCode details"
+                    onclick={() => {
+                      nativeDetailsOpen = false;
+                      if (changesPanes.includes(pane.id)) onchanges(pane.id);
+                    }}>×</button
+                  >
+                </nav>
+                {#if nativeTab === 'plan'}
+                  <PlanPanel
+                    snapshot={nativeSnapshot}
+                    {client}
+                    {directory}
+                    sessionID={pane.thread?.sessionId ?? null}
+                    {dark}
+                    onchanged={refreshNativeDetails}
+                    onselectfile={(file) => {
+                      selectedFile = file;
+                      nativeTab = 'changes';
+                    }}
+                  />
+                {:else if nativeTab === 'history'}
+                  <HistoryPanel
+                    events={nativeHistory}
+                    session={nativeSession}
+                    loading={false}
+                    error={nativeHistoryError}
+                    onrefresh={refreshNativeDetails}
+                  />
+                {:else}
+                  <DiffPanel
+                    {directory}
+                    files={diffs}
+                    annotations={annotateDiffs(diffs, nativeSnapshot.plan, directory)}
+                    selected={selectedFile}
+                    loading={diffLoading}
+                    error={diffError}
+                    onselect={(file) => (selectedFile = file)}
+                    onrefresh={refreshDiff}
+                    onclose={() => {
+                      nativeDetailsOpen = false;
+                      if (changesPanes.includes(pane.id)) onchanges(pane.id);
+                    }}
+                    scope={`${directory}\0${pane.id}\0opencode:${pane.thread?.sessionId ?? 'new'}`}
+                    comments={diffComments[
+                      `${directory}\0${pane.id}\0opencode:${pane.thread?.sessionId ?? 'new'}`
+                    ] ?? []}
+                    oncomments={ondiffcomments}
+                    oncommentssent={ondiffcommentssent}
+                    onsendcomments={(scope, text) => onsenddiffcomments(pane.id, scope, text)}
+                  />
+                {/if}
+              </section>
+            {/if}
+          </div>
         {/key}
       {:else if pane.agent}
         {#key `${pane.id}:${pane.agent}`}
