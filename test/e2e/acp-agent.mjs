@@ -73,16 +73,33 @@ function runTerminal(sessionId, text, promptId) {
   );
 }
 
-function configOptions() {
-  return [
+function configOptions(sessionId) {
+  const session = sessions.get(sessionId);
+  const config = session?.config ?? { model: 'test', effort: 'medium' };
+  const options = [
     {
       id: 'model',
       name: 'Model',
       type: 'select',
-      currentValue: 'test',
-      options: [{ value: 'test', name: 'Test model' }],
+      currentValue: config.model,
+      options: [
+        { value: 'test', name: 'Test model' },
+        { value: 'fast', name: 'Fast model' },
+        { value: 'broken', name: 'Reject model' },
+      ],
+    },
+    {
+      id: 'effort',
+      name: 'Effort',
+      type: 'select',
+      currentValue: config.effort,
+      options: [
+        { value: 'medium', name: 'Medium' },
+        { value: 'high', name: 'High' },
+      ],
     },
   ];
+  return session?.noEffort ? options.slice(0, 1) : options;
 }
 
 function requestPermission(sessionId, text, promptId) {
@@ -128,32 +145,51 @@ for await (const line of createInterface({ input: process.stdin })) {
       continue;
     }
     const sessionId = `test-${++nextSession}`;
-    sessions.set(sessionId, []);
+    sessions.set(sessionId, { history: [], config: { model: 'test', effort: 'medium' } });
     setTimeout(
-      () => send({ id: message.id, result: { sessionId, configOptions: configOptions() } }),
+      () =>
+        send({ id: message.id, result: { sessionId, configOptions: configOptions(sessionId) } }),
       1000,
     );
   } else if (message.method === 'session/load') {
-    const history = sessions.get(message.params.sessionId);
-    if (!history) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
+    const session = sessions.get(message.params.sessionId);
+    if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
     else {
-      for (const item of history) update(message.params.sessionId, item);
+      for (const item of session.history) update(message.params.sessionId, item);
       send({
         id: message.id,
-        result: { sessionId: message.params.sessionId, configOptions: configOptions() },
+        result: {
+          sessionId: message.params.sessionId,
+          configOptions: configOptions(message.params.sessionId),
+        },
       });
     }
   } else if (message.method === 'session/set_config_option') {
-    send({ id: message.id, result: { configOptions: configOptions() } });
+    const { sessionId, configId, value } = message.params;
+    if (value === 'broken') {
+      send({ id: message.id, error: { code: -1, message: 'Model change rejected' } });
+      continue;
+    }
+    sessions.get(sessionId).config[configId] = value;
+    send({ id: message.id, result: { configOptions: configOptions(sessionId) } });
   } else if (message.method === 'session/prompt') {
     const { sessionId } = message.params;
     const text = message.params.prompt[0].text;
+    if (text === 'Disable effort') {
+      sessions.get(sessionId).noEffort = true;
+      update(sessionId, {
+        sessionUpdate: 'config_option_update',
+        configOptions: configOptions(sessionId),
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text.startsWith('Terminal:')) {
       runTerminal(sessionId, text, message.id);
       continue;
     }
     const user = { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } };
-    sessions.get(sessionId).push(user);
+    sessions.get(sessionId).history.push(user);
     update(sessionId, user);
     update(sessionId, {
       sessionUpdate: 'tool_call',
@@ -189,7 +225,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         : 'Rejected';
     const finish = () => {
       const reply = { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } };
-      sessions.get(pending.sessionId).push(reply);
+      sessions.get(pending.sessionId).history.push(reply);
       update(pending.sessionId, reply);
       send({ id: pending.promptId, result: { stopReason: 'end_turn' } });
     };

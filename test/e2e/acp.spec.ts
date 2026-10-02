@@ -47,13 +47,45 @@ describe('ACP agent threads', () => {
       });
       throw cause;
     }
+    await expect($('.agent-picker-controls')).toHaveText(expect.stringContaining('Model'));
+    await expect($('.agent-picker-controls')).toHaveText(expect.stringContaining('Effort'));
+    await $('.agent-composer textarea').setValue('/model');
+    await browser.keys('Enter');
+    await expect($('.option-menu[role="listbox"]')).toBeDisplayed();
+    await expect($('.option-menu button[role="option"]:nth-child(2)')).toBeDisplayed();
+    await browser.keys('ArrowDown');
+    await browser.keys('Enter');
+    await expect($('.option-trigger[aria-label="Choose model"]')).toHaveText(
+      expect.stringContaining('Fast model'),
+    );
+    await $('.option-trigger[aria-label="Choose model"]').click();
+    await $('.option-menu button[role="option"]:nth-child(3)').click();
+    await $('.agent-composer textarea').setValue('Keep this draft');
+    await $('.agent-actions button').click();
+    await expect($('.agent-error')).toHaveText(expect.stringContaining('Model change rejected'));
+    await expect($('.agent-composer textarea')).toHaveValue('Keep this draft');
+    await expect($('.agent-conversation')).not.toHaveText(
+      expect.stringContaining('Keep this draft'),
+    );
+    await $('.option-trigger[aria-label="Choose model"]').click();
+    await $('.option-menu button[role="option"]:nth-child(2)').click();
+    await $('.agent-composer textarea').setValue('');
+    await $('.agent-composer textarea').setValue('/effort');
+    await browser.keys('Enter');
+    await browser.keys('ArrowDown');
+    await browser.keys('Enter');
+    await expect($('.option-trigger[aria-label="Choose effort"]')).toHaveText(
+      expect.stringContaining('High'),
+    );
     await $('.agent-composer textarea').setValue('Do a small thing');
     await $('.agent-actions button').click();
-    await expect($('.agent-config select')).toHaveValue('test');
     await expect($('.agent-permission')).toHaveText(expect.stringContaining('Run test action'));
     await $('.agent-permission button').click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Done: Do a small thing'),
+    );
+    await expect($('.option-trigger[aria-label="Choose model"]')).toHaveText(
+      expect.stringContaining('Fast model'),
     );
     writeFileSync(join(repository, 'agent-change.txt'), 'Changed by agent\n');
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
@@ -73,6 +105,12 @@ describe('ACP agent threads', () => {
     await $('.agent-actions button').click();
     await $('.agent-permission button').click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Done: Try Codex'));
+    await $('.agent-picker-controls .option-trigger[aria-label="Choose effort"]').click();
+    await browser.keys('ArrowDown');
+    await browser.keys('Enter');
+    await expect($('.option-trigger[aria-label="Choose effort"]')).toHaveText(
+      expect.stringContaining('High'),
+    );
 
     try {
       await $('.session-row .session-item[title="Do a small thing"]').click();
@@ -86,6 +124,12 @@ describe('ACP agent threads', () => {
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Done: Do a small thing'),
+    );
+    await expect($('.option-trigger[aria-label="Choose model"]')).toHaveText(
+      expect.stringContaining('Fast model'),
+    );
+    await expect($('.option-trigger[aria-label="Choose effort"]')).toHaveText(
+      expect.stringContaining('High'),
     );
     await browser.refresh();
     try {
@@ -103,6 +147,12 @@ describe('ACP agent threads', () => {
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Done: Do a small thing'),
     );
+    await expect($('.option-trigger[aria-label="Choose model"]')).toHaveText(
+      expect.stringContaining('Fast model'),
+    );
+    await expect($('.option-trigger[aria-label="Choose effort"]')).toHaveText(
+      expect.stringContaining('High'),
+    );
 
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
@@ -112,7 +162,7 @@ describe('ACP agent threads', () => {
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
     await $('.agent-launches button:nth-child(2)').click();
     await expect($('.session-row .session-item[title="Delayed approval"]')).toHaveText(
-      expect.stringContaining('Running'),
+      expect.stringMatching(/Running|Waiting for input/),
     );
     await browser.pause(1800);
     await $('.session-row .session-item[title="Delayed approval"]').click();
@@ -138,7 +188,7 @@ describe('ACP agent threads', () => {
     await expect($('.agent-tool')).toHaveText(expect.stringContaining('stopping'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
     await expect($('.session-row .session-item[title="Delayed approval"]')).toHaveText(
-      expect.stringContaining('Running'),
+      expect.stringContaining('working'),
     );
     await expect($('.agent-tool')).toHaveText(expect.stringContaining('cancelled'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
@@ -170,6 +220,18 @@ describe('ACP agent threads', () => {
     await expect($('.agent-composer textarea')).toHaveValue('Cancel creation');
     await expect($('.agent-conversation')).not.toHaveText(
       expect.stringContaining('Cancel creation'),
+    );
+
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Disable effort');
+    await $('.agent-actions button').click();
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Disable effort'));
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('/effort');
+    await browser.keys('Enter');
+    await expect($('.option-menu')).toHaveText(
+      expect.stringContaining('No choices available for this model or agent.'),
     );
   });
 });
