@@ -1784,6 +1784,16 @@
     });
   }
 
+  function toggleProjectRepository(path: string) {
+    const collapsed = projectCatalog.collapsedRepositories ?? [];
+    saveProjectCatalog({
+      ...projectCatalog,
+      collapsedRepositories: collapsed.includes(path)
+        ? collapsed.filter((repository) => repository !== path)
+        : [...collapsed, path],
+    });
+  }
+
   function moveProjectRepository(path: string, groupID: string | null) {
     saveProjectCatalog(assignRepository(projectCatalog, path, groupID));
   }
@@ -1819,7 +1829,12 @@
         baseRef,
       },
     );
-    saveProjectCatalog(addWorktree(projectCatalog, path, created));
+    saveProjectCatalog({
+      ...addWorktree(projectCatalog, path, created),
+      collapsedRepositories: projectCatalog.collapsedRepositories?.filter(
+        (repository) => repository !== path,
+      ),
+    });
     await loadProject(created.path);
     const startAgent = () => {
       if (directory !== created.path) return;
@@ -4669,6 +4684,7 @@
         onrenamegroup={renameProjectGroup}
         ondeletegroup={deleteProjectGroup}
         ontogglegroup={toggleProjectGroup}
+        ontogglerepository={toggleProjectRepository}
         onmoverepository={moveProjectRepository}
         onremoverepository={removeProjectRepository}
         oncreateworktree={createProjectWorktree}
