@@ -145,6 +145,7 @@
     worktreeAt,
     replaceRepositoryPath,
     setWorktreePullRequest,
+    setWorktreeSetupStatus,
     setWorktreeStatus,
     type ProjectCatalog,
     type ProjectWorktree,
@@ -176,6 +177,7 @@
     directory: string;
     name:
       | 'worktree_create'
+      | 'agent_spawn'
       | 'worktree_list'
       | 'worktree_info'
       | 'worktree_status'
@@ -201,6 +203,8 @@
     name: string;
     project: string;
     prompt: string;
+    provider?: string;
+    existingPath?: string;
   } | null>(null);
   let resolveWorktreeApproval: ((allowed: boolean) => void) | null = null;
   let worktreeApprovalTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1671,6 +1675,7 @@
       setTimeout(retryCoordinationDeliveries, 200);
       return { queuedFor: target.id, queued: true, messageId: message.id };
     }
+    if (request.name === 'agent_spawn') return spawnCoordinatedAgent(request, project, source);
     if (!agentWorktreesEnabled) throw new Error('Agent worktree creation is disabled in settings.');
     const name = request.arguments.name;
     const prompt = request.arguments.prompt;
@@ -1702,9 +1707,13 @@
       if (!paneId) throw new Error('Enlarge a pane before running worktree setup.');
       coordinationSetupWaiters.set(paneId, (code) => {
         if (code !== 0) {
+          saveProjectCatalog(
+            setWorktreeSetupStatus(projectCatalog, project, created.path, 'failed'),
+          );
           error = `Worktree setup exited with code ${code}. The agent thread was not started.`;
           return;
         }
+        saveProjectCatalog(setWorktreeSetupStatus(projectCatalog, project, created.path, 'ready'));
         void startCoordinatedThread(created, source, prompt.trim()).catch((cause) => {
           error = `Could not start coordinated thread: ${describe(cause)}`;
         });
@@ -1717,6 +1726,173 @@
       };
     }
     return startCoordinatedThread(created, source, prompt.trim());
+  }
+
+  async function spawnCoordinatedAgent(
+    request: CoordinationRequest,
+    project: string,
+    source: CoordinationSource,
+  ) {
+    if (!agentWorktreesEnabled) throw new Error('Agent worktree access is disabled in settings.');
+    const provider = request.arguments.provider;
+    const prompt = request.arguments.prompt;
+    const target = request.arguments.target;
+    if (typeof provider !== 'string' || !['claude', 'codex', 'opencode'].includes(provider))
+      throw new Error('Choose Claude, Codex, or OpenCode as the provider.');
+    if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
+      throw new Error('Starting prompt must be 1–8000 characters.');
+    if (target !== undefined && (typeof target !== 'object' || target === null))
+      throw new Error('Target must describe a new or existing worktree.');
+    const selectedTarget = target as { kind?: unknown; name?: unknown; path?: unknown } | undefined;
+    const existing = selectedTarget?.kind === 'existing';
+    if (selectedTarget && !existing && selectedTarget.kind !== 'new')
+      throw new Error('Target kind must be new or existing.');
+    const name = existing
+      ? ''
+      : selectedTarget
+        ? selectedTarget.name
+        : `agent-${crypto.randomUUID().slice(0, 8)}`;
+    if (!existing && (typeof name !== 'string' || !name.trim()))
+      throw new Error('New worktree name is required.');
+    if (!existing && typeof name === 'string' && name.length > 64)
+      throw new Error('Worktree name must be at most 64 characters.');
+    const path = existing ? selectedTarget?.path : null;
+    if (existing && typeof path !== 'string')
+      throw new Error('Existing worktree path is required.');
+
+    const chosenProvider = provider;
+    if (chosenProvider === 'opencode') {
+      if (!client || runtimeState !== 'connected') throw new Error('OpenCode is unavailable.');
+    } else {
+      const available = (await acp.agents()).find((agent) => agent.id === chosenProvider);
+      if (!available?.available)
+        throw new Error(available?.reason ?? `${chosenProvider} is unavailable.`);
+    }
+
+    let destination: { path: string; branch: string } | null = null;
+    if (existing) {
+      const selectedPath = path as string;
+      if (
+        selectedPath !== project &&
+        !(projectCatalog.worktrees[project] ?? []).some(
+          (worktree) => worktree.path === selectedPath,
+        )
+      )
+        throw new Error('Target worktree is not in this project.');
+      const catalogWorktree = (projectCatalog.worktrees[project] ?? []).find(
+        (worktree) => worktree.path === selectedPath,
+      );
+      if (catalogWorktree?.setupStatus === 'pending' || catalogWorktree?.setupStatus === 'failed')
+        throw new Error('Complete worktree setup before spawning another agent there.');
+      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+        repository: project,
+        paths: [selectedPath],
+      });
+      const live = registered.find((worktree) => worktree.path === selectedPath);
+      if (!live) throw new Error('Target worktree is no longer registered with Git.');
+      destination = { path: selectedPath, branch: live.branch ?? '' };
+      if (chosenProvider === 'opencode') {
+        const report = await inspectRepository(client!, selectedPath);
+        if (!report.workReady)
+          throw new Error('Complete OpenCode setup in the target worktree before spawning.');
+      }
+    }
+
+    const approval = browserApprovalQueue.then(() =>
+      confirmWorktreeApproval(request.expiresAt, {
+        agent: source.agent,
+        title: source.title,
+        name: String(name),
+        project,
+        prompt: prompt.trim(),
+        provider: chosenProvider,
+        existingPath: destination?.path,
+      }),
+    );
+    browserApprovalQueue = approval.catch(() => undefined);
+    if (!(await approval)) throw new Error('User declined the agent spawn request.');
+    if (Date.now() >= request.expiresAt)
+      throw new Error('The agent spawn request expired before approval.');
+    await coordinationSource(request);
+
+    if (destination) {
+      const targetPath = destination.path;
+      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+        repository: project,
+        paths: [targetPath],
+      });
+      if (!registered.some((worktree) => worktree.path === targetPath))
+        throw new Error('Target worktree is no longer registered with Git.');
+    }
+
+    if (chosenProvider !== 'opencode') await acp.connect(chosenProvider);
+    if (!destination) {
+      const created = await invoke<{ path: string; branch: string; setup: string }>(
+        'create_worktree',
+        { repository: project, name, destinationParent: null, baseRef: null },
+      );
+      saveProjectCatalog(addWorktree(projectCatalog, project, created));
+      destination = created;
+      if (created.setup) {
+        let setupTimedOut = false;
+        try {
+          await loadProject(created.path);
+          if (directory !== created.path) throw new Error('Worktree changed before setup started.');
+          const paneId = splitFocusedPane('row', 'terminal', created.setup);
+          if (!paneId) throw new Error('Enlarge a pane before running worktree setup.');
+          await new Promise<void>((resolve, reject) => {
+            const remaining = request.expiresAt + 90_000 - Date.now();
+            let expired = false;
+            const timer = setTimeout(
+              () => {
+                expired = true;
+                setupTimedOut = true;
+                reject(new Error('Agent spawn timed out before worktree setup completed.'));
+              },
+              Math.max(0, remaining),
+            );
+            coordinationSetupWaiters.set(paneId, (code) => {
+              clearTimeout(timer);
+              if (expired) {
+                saveProjectCatalog(
+                  setWorktreeSetupStatus(
+                    projectCatalog,
+                    project,
+                    created.path,
+                    code === 0 ? 'ready' : 'failed',
+                  ),
+                );
+                return;
+              }
+              if (code === 0) resolve();
+              else reject(new Error(`Worktree setup exited with code ${code}. Agent not started.`));
+            });
+          });
+          saveProjectCatalog(
+            setWorktreeSetupStatus(projectCatalog, project, created.path, 'ready'),
+          );
+        } catch (cause) {
+          if (!setupTimedOut)
+            saveProjectCatalog(
+              setWorktreeSetupStatus(projectCatalog, project, created.path, 'failed'),
+            );
+          throw cause;
+        }
+      }
+    }
+
+    if (chosenProvider === 'opencode') {
+      const report = await inspectRepository(client!, destination.path);
+      if (!report.workReady)
+        throw new Error('Complete OpenCode setup in the target worktree before spawning.');
+    }
+    await coordinationSource(request);
+    const selectedSource: CoordinationSource =
+      chosenProvider === 'opencode'
+        ? { kind: 'opencode', agent: 'OpenCode', title: source.title }
+        : { kind: 'acp', agent: chosenProvider, title: source.title };
+    const started = await startCoordinatedThread(destination, selectedSource, prompt.trim());
+    return { ...started, worktreeId: destination.path, status: 'started' };
   }
 
   async function startCoordinatedThread(
@@ -1770,6 +1946,13 @@
       title: prompt.slice(0, 60),
       agent: source.agent === 'OpenCode' ? undefined : source.agent,
       model: source.model,
+    });
+    rememberRecentThread({
+      agent: 'opencode',
+      sessionId: session.id,
+      directory: created.path,
+      title: prompt.slice(0, 60),
+      updated: Date.now(),
     });
     await invoke('record_turn_snapshot', {
       path: created.path,
@@ -2111,6 +2294,14 @@
       const paneId = splitFocusedPane('row', 'terminal', created.setup);
       if (!paneId) return;
       terminalExitWaiters.set(paneId, (code) => {
+        saveProjectCatalog(
+          setWorktreeSetupStatus(
+            projectCatalog,
+            path,
+            created.path,
+            code === 0 ? 'ready' : 'failed',
+          ),
+        );
         if (code === 0) startAgent();
         else if (code >= 0) error = `Worktree setup exited with code ${code}.`;
       });
@@ -6158,14 +6349,24 @@
 >
   {#if worktreeApproval}
     <div class="commands-header"><h2>Agent worktree request</h2></div>
-    <p>
-      Allow {worktreeApproval.agent} thread “{worktreeApproval.title}” to create worktree “{worktreeApproval.name}”
-      in {worktreeApproval.project} and start a new thread?
-    </p>
+    {#if worktreeApproval.existingPath}
+      <p>
+        Allow {worktreeApproval.agent} thread “{worktreeApproval.title}” to start a new
+        {worktreeApproval.provider} thread in {worktreeApproval.existingPath}?
+      </p>
+      <p>The new agent will share this worktree’s files with other agents running there.</p>
+    {:else}
+      <p>
+        Allow {worktreeApproval.agent} thread “{worktreeApproval.title}” to create worktree “{worktreeApproval.name}”
+        in {worktreeApproval.project} and start a new {worktreeApproval.provider ?? 'agent'} thread?
+      </p>
+    {/if}
     <p class="worktree-approval-prompt">{worktreeApproval.prompt}</p>
     <div class="worktree-approval-actions">
       <button type="button" onclick={() => finishWorktreeApproval(false)}>Deny</button>
-      <button type="button" onclick={() => finishWorktreeApproval(true)}>Allow worktree</button>
+      <button type="button" onclick={() => finishWorktreeApproval(true)}
+        >{worktreeApproval.existingPath ? 'Allow shared worktree' : 'Allow worktree'}</button
+      >
     </div>
   {/if}
 </dialog>
