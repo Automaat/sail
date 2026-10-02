@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -7,6 +8,35 @@ use std::process::{Command, Output};
 pub struct PullRequest {
     number: u64,
     url: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestCheck {
+    name: String,
+    state: String,
+    url: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestChecks {
+    number: u64,
+    url: String,
+    checks: Vec<PullRequestCheck>,
+}
+
+#[derive(Deserialize)]
+pub struct WorktreeBranch {
+    path: String,
+    branch: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryChecks {
+    checks: HashMap<String, Option<PullRequestChecks>>,
+    errors: HashMap<String, String>,
 }
 
 fn gh_binary() -> OsString {
@@ -88,12 +118,25 @@ fn pull_request_repos(
     remote: &str,
     branch: &str,
 ) -> Result<(String, String), String> {
+    let source = source_repository(worktree, remote)?;
+    let target = target_repository(worktree)?;
+    let head = if source.eq_ignore_ascii_case(&target) {
+        branch.to_string()
+    } else {
+        format!("{}:{branch}", source.split('/').next().unwrap_or_default())
+    };
+    Ok((target, head))
+}
+
+fn source_repository(worktree: &Path, remote: &str) -> Result<String, String> {
     let remote_url = output_or_error(
         run(worktree, "git", &["remote", "get-url", "--push", remote])?,
         "Cannot find push remote",
     )?;
-    let source =
-        github_remote(&remote_url).ok_or("Push remote must be a github.com repository.")?;
+    github_remote(&remote_url).ok_or("Push remote must be a github.com repository.".to_string())
+}
+
+fn target_repository(worktree: &Path) -> Result<String, String> {
     let repository = gh_command(
         worktree,
         &["repo", "view", "--json", "nameWithOwner,isFork,parent"],
@@ -110,12 +153,7 @@ fn pull_request_repos(
     } else {
         selected
     };
-    let head = if source.eq_ignore_ascii_case(target) {
-        branch.to_string()
-    } else {
-        format!("{}:{branch}", source.split('/').next().unwrap_or_default())
-    };
-    Ok((target.to_string(), head))
+    Ok(target.to_string())
 }
 
 fn checked_worktree(repository: String, worktree: String, branch: &str) -> Result<PathBuf, String> {
@@ -145,6 +183,174 @@ fn checked_worktree(repository: String, worktree: String, branch: &str) -> Resul
         ));
     }
     Ok(worktree)
+}
+
+#[tauri::command]
+pub async fn pull_request_checks(
+    repository: String,
+    worktrees: Vec<WorktreeBranch>,
+) -> Result<RepositoryChecks, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = crate::validate_repository(repository)?;
+        let target = target_repository(Path::new(&repository))?;
+        let response = gh_command(
+            Path::new(&repository),
+            &[
+                "pr",
+                "list",
+                "--repo",
+                &target,
+                "--state",
+                "open",
+                "--limit",
+                "500",
+                "--json",
+                "number,url,statusCheckRollup,headRepositoryOwner,headRefName",
+            ],
+        )?;
+        let prs: Vec<serde_json::Value> = serde_json::from_str(&response)
+            .map_err(|_| "GitHub CLI returned invalid pull request checks.".to_string())?;
+        let mut checks = HashMap::new();
+        let mut errors = HashMap::new();
+        for entry in worktrees {
+            let result = (|| {
+                let worktree =
+                    checked_worktree(repository.clone(), entry.path.clone(), &entry.branch)?;
+                let remote = branch_remote(&worktree, &entry.branch)?;
+                let source = source_repository(&worktree, &remote)?;
+                let owner = source.split('/').next().unwrap_or_default();
+                let Some(pr) = prs.iter().find(|pr| {
+                    pr["headRefName"].as_str() == Some(&entry.branch)
+                        && pr["headRepositoryOwner"]["login"]
+                            .as_str()
+                            .is_some_and(|login| login.eq_ignore_ascii_case(owner))
+                }) else {
+                    return Ok(None);
+                };
+                Ok(Some(parse_pull_request_checks(pr)?))
+            })();
+            match result {
+                Ok(pr) => {
+                    checks.insert(entry.path, pr);
+                }
+                Err(cause) => {
+                    errors.insert(entry.path, cause);
+                }
+            }
+        }
+        Ok(RepositoryChecks { checks, errors })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn branch_remote(worktree: &Path, branch: &str) -> Result<String, String> {
+    let remote = run(
+        worktree,
+        "git",
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    )?;
+    if remote.status.success() {
+        output_or_error(remote, "Cannot find branch remote")
+    } else {
+        Ok("origin".to_string())
+    }
+}
+
+fn parse_pull_request_checks(pr: &serde_json::Value) -> Result<PullRequestChecks, String> {
+    let number = pr["number"].as_u64().ok_or("Pull request has no number.")?;
+    let url = pr["url"]
+        .as_str()
+        .ok_or("Pull request has no link.")?
+        .to_string();
+    let checks = pr["statusCheckRollup"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|check| {
+            let state = if check["__typename"] == "StatusContext" {
+                check["state"].as_str().unwrap_or("PENDING")
+            } else if check["status"] != "COMPLETED" {
+                "PENDING"
+            } else {
+                check["conclusion"].as_str().unwrap_or("PENDING")
+            };
+            PullRequestCheck {
+                name: check["name"]
+                    .as_str()
+                    .or_else(|| check["context"].as_str())
+                    .unwrap_or("Unknown check")
+                    .to_string(),
+                state: state.to_string(),
+                url: check["detailsUrl"]
+                    .as_str()
+                    .or_else(|| check["targetUrl"].as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }
+        })
+        .collect();
+    Ok(PullRequestChecks {
+        number,
+        url,
+        checks,
+    })
+}
+
+#[tauri::command]
+pub async fn failed_check_log(
+    repository: String,
+    worktree: String,
+    branch: String,
+    url: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let worktree = checked_worktree(repository, worktree, &branch)?;
+        let parsed = tauri::Url::parse(&url).map_err(|_| "Invalid check link.")?;
+        let parts = parsed
+            .path_segments()
+            .ok_or("Invalid check link.")?
+            .collect::<Vec<_>>();
+        if parsed.scheme() != "https"
+            || parsed.host_str() != Some("github.com")
+            || parts.len() != 7
+            || parts[2] != "actions"
+            || parts[3] != "runs"
+            || parts[5] != "job"
+            || parts[4].parse::<u64>().is_err()
+            || parts[6].parse::<u64>().is_err()
+        {
+            return Err("This check has no GitHub Actions job log. Open its link instead.".into());
+        }
+        let check_repo = format!("{}/{}", parts[0], parts[1]);
+        let remote = branch_remote(&worktree, &branch)?;
+        let source = source_repository(&worktree, &remote)?;
+        let target = target_repository(&worktree)?;
+        if !check_repo.eq_ignore_ascii_case(&source) && !check_repo.eq_ignore_ascii_case(&target) {
+            return Err("Check log belongs to another repository.".to_string());
+        }
+        let log = gh_command(
+            &worktree,
+            &[
+                "run",
+                "view",
+                parts[4],
+                "--repo",
+                &check_repo,
+                "--job",
+                parts[6],
+                "--log",
+            ],
+        )?;
+        let start = log
+            .char_indices()
+            .rev()
+            .nth(99_999)
+            .map_or(0, |(index, _)| index);
+        Ok(log[start..].to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -258,16 +464,25 @@ pub fn open_pull_request(url: String) -> Result<(), String> {
     {
         return Err("Invalid pull request link.".to_string());
     }
+    open_url(url)
+}
+
+#[tauri::command]
+pub fn open_check_url(url: String) -> Result<(), String> {
+    let parsed = tauri::Url::parse(&url).map_err(|_| "Invalid check link.")?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err("Invalid check link.".to_string());
+    }
+    open_url(url)
+}
+
+fn open_url(url: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut command = Command::new("/usr/bin/open");
     #[cfg(target_os = "linux")]
     let mut command = Command::new("xdg-open");
     #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", ""]);
-        command
-    };
+    let mut command = Command::new("explorer.exe");
     command
         .arg(url)
         .spawn()
