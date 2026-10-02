@@ -2409,6 +2409,7 @@
       delete paneLayouts[path];
       persistPaneLayouts();
       removeSetting(`sai-session:${path}`);
+      removeSetting(`sai-main-pane-empty:${path}`);
       error = '';
     } catch (cause) {
       if (directory !== path) await loadProject(path);
