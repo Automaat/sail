@@ -1,6 +1,7 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Mutex};
@@ -433,12 +434,164 @@ fn validate_repository(path: String) -> Result<String, String> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkingDiff {
     file: String,
     patch: String,
+    staged_patch: String,
+    unstaged_patch: String,
+    untracked: bool,
     additions: usize,
     deletions: usize,
     status: &'static str,
+}
+
+fn git_patch(root: &str, file: &str, area: &str, untracked: bool) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.args(["-C", root]);
+    if untracked {
+        command.args([
+            "diff",
+            "--no-index",
+            "--binary",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--",
+            "/dev/null",
+        ]);
+        command.arg(file);
+    } else {
+        command.args([
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-renames",
+            "--binary",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        ]);
+        if area == "staged" {
+            command.arg("--cached");
+        } else if area == "all" {
+            command.arg("HEAD");
+        }
+        command.args(["--", &format!(":(literal){file}")]);
+    }
+    let output = command.output().map_err(|error| error.to_string())?;
+    if !output.status.success() && !(untracked && output.status.code() == Some(1)) {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+struct TemporaryIndex(PathBuf);
+
+impl Drop for TemporaryIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(self.0.with_extension("lock"));
+    }
+}
+
+fn index_with_intent(
+    root: &str,
+    files: &[String],
+    copy_current: bool,
+) -> Result<TemporaryIndex, String> {
+    let output = Command::new("git")
+        .args(["-C", root, "rev-parse", "--git-path", "index"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("Could not locate the Git index.".into());
+    }
+    let index = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let index = Path::new(&index);
+    let index = if index.is_absolute() {
+        index.to_path_buf()
+    } else {
+        Path::new(root).join(index)
+    };
+    let temporary =
+        TemporaryIndex(index.with_file_name(format!("sail-index-{}", uuid::Uuid::new_v4())));
+    if copy_current && index.exists() {
+        std::fs::copy(&index, &temporary.0).map_err(|error| error.to_string())?;
+    }
+    let pathspecs = files
+        .iter()
+        .map(|file| format!(":(literal){file}"))
+        .collect::<Vec<_>>();
+    let output = Command::new("git")
+        .args(["-C", root, "add", "-N", "--"])
+        .args(&pathspecs)
+        .env("GIT_INDEX_FILE", &temporary.0)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(temporary)
+}
+
+fn git_patches(
+    root: &str,
+    area: &str,
+    index: Option<&Path>,
+) -> Result<HashMap<String, String>, String> {
+    let run = |names: bool| -> Result<Vec<u8>, String> {
+        let mut command = Command::new("git");
+        command.args([
+            "-C",
+            root,
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-renames",
+            "--binary",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        ]);
+        if area == "staged" {
+            command.arg("--cached");
+        } else if area == "all" {
+            command.arg("HEAD");
+        }
+        if names {
+            command.args(["--name-only", "-z"]);
+        }
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        let output = command.output().map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        Ok(output.stdout)
+    };
+    let names_raw = run(true)?;
+    let patch_raw = run(false)?;
+    if run(true)? != names_raw {
+        return Err("Changes moved during refresh. Retry.".into());
+    }
+    let names = names_raw
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect::<Vec<_>>();
+    let patch = String::from_utf8_lossy(&patch_raw).into_owned();
+    let mut chunks = Vec::new();
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            chunks.push(String::new());
+        }
+        if let Some(chunk) = chunks.last_mut() {
+            chunk.push_str(line);
+        }
+    }
+    if names.len() != chunks.len() {
+        return Err("Could not match Git patches to changed files.".into());
+    }
+    Ok(names.into_iter().zip(chunks).collect())
 }
 
 #[tauri::command]
@@ -464,36 +617,67 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
             .args(["-C", &root, "rev-parse", "--verify", "HEAD"])
             .output()
             .is_ok_and(|result| result.status.success());
-        let mut files = Vec::new();
-        for record in output
+        let records = output
             .stdout
             .split(|byte| *byte == 0)
             .filter(|record| !record.is_empty())
-        {
-            if record.len() < 4 {
-                continue;
-            }
-            let file = String::from_utf8_lossy(&record[3..]).into_owned();
-            let untracked = &record[..2] == b"??";
-            let status = if untracked || record[..2].contains(&b'A') {
-                "added"
-            } else if record[..2].contains(&b'D') {
-                "deleted"
+            .filter(|record| record.len() >= 4)
+            .map(|record| {
+                let file = String::from_utf8_lossy(&record[3..]).into_owned();
+                let untracked = &record[..2] == b"??";
+                let status = if untracked || record[..2].contains(&b'A') {
+                    "added"
+                } else if record[..2].contains(&b'D') {
+                    "deleted"
+                } else {
+                    "modified"
+                };
+                (file, untracked, status)
+            })
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let untracked = records
+            .iter()
+            .filter(|(_, untracked, _)| *untracked)
+            .map(|(file, _, _)| file.clone())
+            .collect::<Vec<_>>();
+        let temporary = if untracked.is_empty() {
+            None
+        } else {
+            Some(index_with_intent(&root, &untracked, true)?)
+        };
+        let staged = git_patches(&root, "staged", None)?;
+        let unstaged = git_patches(
+            &root,
+            "unstaged",
+            temporary.as_ref().map(|index| index.0.as_path()),
+        )?;
+        let all = if has_head {
+            git_patches(&root, "all", None)?
+        } else {
+            let existing = records
+                .iter()
+                .filter(|(file, _, _)| Path::new(&root).join(file).symlink_metadata().is_ok())
+                .map(|(file, _, _)| file.clone())
+                .collect::<Vec<_>>();
+            if existing.is_empty() {
+                HashMap::new()
             } else {
-                "modified"
+                let empty_index = index_with_intent(&root, &existing, false)?;
+                git_patches(&root, "unstaged", Some(&empty_index.0))?
+            }
+        };
+        let mut files = Vec::new();
+        for (file, untracked, status) in records {
+            let staged_patch = staged.get(&file).cloned().unwrap_or_default();
+            let unstaged_patch = unstaged.get(&file).cloned().unwrap_or_default();
+            let patch = if untracked && has_head {
+                unstaged_patch.clone()
+            } else {
+                all.get(&file).cloned().unwrap_or_default()
             };
-            let patch = if untracked || !has_head {
-                Command::new("git")
-                    .args(["-C", &root, "diff", "--no-index", "--", "/dev/null"])
-                    .arg(Path::new(&root).join(&file))
-                    .output()
-            } else {
-                Command::new("git")
-                    .args(["-C", &root, "diff", "HEAD", "--", &file])
-                    .output()
-            }
-            .map_err(|error| error.to_string())?;
-            let patch = String::from_utf8_lossy(&patch.stdout).into_owned();
             let additions = patch
                 .lines()
                 .filter(|line| line.starts_with('+') && !line.starts_with("+++ "))
@@ -505,12 +689,109 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
             files.push(WorkingDiff {
                 file,
                 patch,
+                staged_patch,
+                unstaged_patch,
+                untracked,
                 additions,
                 deletions,
                 status,
             });
         }
         Ok(files)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn selected_hunk(patch: &str, ordinal: usize) -> Result<String, String> {
+    let lines = patch.split_inclusive('\n').collect::<Vec<_>>();
+    let headers = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.starts_with("@@ ").then_some(index))
+        .collect::<Vec<_>>();
+    let start = *headers
+        .get(ordinal)
+        .ok_or_else(|| "The selected hunk is no longer available.".to_string())?;
+    let end = headers.get(ordinal + 1).copied().unwrap_or(lines.len());
+    Ok(lines[..headers[0]]
+        .iter()
+        .filter(|line| !line.starts_with("old mode ") && !line.starts_with("new mode "))
+        .chain(&lines[start..end])
+        .copied()
+        .collect())
+}
+
+#[tauri::command]
+async fn git_change_action(
+    path: String,
+    file: String,
+    area: String,
+    action: String,
+    expected_patch: String,
+    hunk: Option<usize>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = validate_repository(path)?;
+        let relative = Path::new(&file);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("Invalid diff file path.".to_string());
+        }
+        if !matches!(area.as_str(), "staged" | "unstaged")
+            || !matches!(
+                (area.as_str(), action.as_str()),
+                ("unstaged", "stage" | "revert") | ("staged", "unstage")
+            )
+        {
+            return Err("Invalid change action.".to_string());
+        }
+        let pathspec = format!(":(literal){file}");
+        let untracked = !Command::new("git")
+            .args(["-C", &root, "ls-files", "--error-unmatch", "--", &pathspec])
+            .output()
+            .map_err(|error| error.to_string())?
+            .status
+            .success();
+        let current = git_patch(&root, &file, &area, untracked && area == "unstaged")?;
+        if current.is_empty() || current != expected_patch {
+            return Err("The diff changed. Refresh before applying this action.".into());
+        }
+        let patch = if let Some(ordinal) = hunk {
+            selected_hunk(&current, ordinal)?
+        } else {
+            current
+        };
+        let mut command = Command::new("git");
+        command.args(["-C", &root, "apply"]);
+        if area == "staged" || action == "stage" {
+            command.arg("--cached");
+        }
+        if action != "stage" {
+            command.arg("--reverse");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "Could not apply selected change.".to_string())?
+            .write_all(patch.as_bytes())
+            .map_err(|error| error.to_string())?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        Ok(())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -850,6 +1131,7 @@ pub fn run() {
             start_runtime,
             validate_repository,
             working_tree_diff,
+            git_change_action,
             diff_file_contents,
             create_worktree,
             delete_worktree,
@@ -912,8 +1194,378 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{repository_namespace, server_args, version_number};
+    use super::{
+        git_change_action, git_patch, repository_namespace, server_args, version_number,
+        working_tree_diff,
+    };
+    use std::fs;
     use std::path::Path;
+    use std::process::Command;
+
+    fn git(root: &str, args: &[&str]) {
+        let result = Command::new("git")
+            .args(["-C", root])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn git_change_actions_handle_hunks_stale_patches_and_untracked_files() {
+        let root = std::env::temp_dir().join(format!("sail-change-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        let original = (1..=16)
+            .map(|number| format!("line {number}\n"))
+            .collect::<String>();
+        fs::write(root.join("file.txt"), &original).unwrap();
+        git(path, &["add", "--", "file.txt"]);
+        git(
+            path,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        let changed = original
+            .replace("line 2\n", "changed 2\n")
+            .replace("line 14\n", "changed 14\n");
+        fs::write(root.join("file.txt"), changed).unwrap();
+        let patch = git_patch(path, "file.txt", "unstaged", false).unwrap();
+        assert_eq!(
+            patch.lines().filter(|line| line.starts_with("@@ ")).count(),
+            2
+        );
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "file.txt".into(),
+            "unstaged".into(),
+            "stage".into(),
+            patch.clone(),
+            Some(0),
+        ))
+        .unwrap();
+        assert!(git_patch(path, "file.txt", "staged", false)
+            .unwrap()
+            .contains("changed 2"));
+        assert!(git_patch(path, "file.txt", "unstaged", false)
+            .unwrap()
+            .contains("changed 14"));
+        let mixed = tauri::async_runtime::block_on(working_tree_diff(path.into())).unwrap();
+        let mixed_file = mixed
+            .iter()
+            .find(|change| change.file == "file.txt")
+            .unwrap();
+        assert!(!mixed_file.staged_patch.is_empty());
+        assert!(!mixed_file.unstaged_patch.is_empty());
+        assert!(tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "file.txt".into(),
+            "unstaged".into(),
+            "revert".into(),
+            patch,
+            Some(1),
+        ))
+        .is_err());
+        let staged = git_patch(path, "file.txt", "staged", false).unwrap();
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "file.txt".into(),
+            "staged".into(),
+            "unstage".into(),
+            staged,
+            Some(0),
+        ))
+        .unwrap();
+        assert!(git_patch(path, "file.txt", "staged", false)
+            .unwrap()
+            .is_empty());
+        let unstaged = git_patch(path, "file.txt", "unstaged", false).unwrap();
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "file.txt".into(),
+            "unstaged".into(),
+            "revert".into(),
+            unstaged,
+            Some(1),
+        ))
+        .unwrap();
+        assert!(!fs::read_to_string(root.join("file.txt"))
+            .unwrap()
+            .contains("changed 14"));
+        let remaining = git_patch(path, "file.txt", "unstaged", false).unwrap();
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "file.txt".into(),
+            "unstaged".into(),
+            "revert".into(),
+            remaining,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(root.join("file.txt")).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(root.join("file.txt"), permissions).unwrap();
+            fs::write(
+                root.join("file.txt"),
+                original.replace("line 2\n", "mode test\n"),
+            )
+            .unwrap();
+            let mode_patch = git_patch(path, "file.txt", "unstaged", false).unwrap();
+            tauri::async_runtime::block_on(git_change_action(
+                path.into(),
+                "file.txt".into(),
+                "unstaged".into(),
+                "stage".into(),
+                mode_patch,
+                Some(0),
+            ))
+            .unwrap();
+            assert!(!git_patch(path, "file.txt", "staged", false)
+                .unwrap()
+                .contains("new mode"));
+        }
+        fs::write(root.join("new.txt"), "new line\n").unwrap();
+        let real_index = fs::read(root.join(".git/index")).unwrap();
+        let changes = tauri::async_runtime::block_on(working_tree_diff(path.into())).unwrap();
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), real_index);
+        let untracked = changes
+            .iter()
+            .find(|change| change.file == "new.txt")
+            .unwrap();
+        assert!(untracked.untracked);
+        assert!(!untracked.unstaged_patch.is_empty());
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "new.txt".into(),
+            "unstaged".into(),
+            "stage".into(),
+            untracked.unstaged_patch.clone(),
+            None,
+        ))
+        .unwrap();
+        assert!(!git_patch(path, "new.txt", "staged", false)
+            .unwrap()
+            .is_empty());
+        let new_staged = git_patch(path, "new.txt", "staged", false).unwrap();
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "new.txt".into(),
+            "staged".into(),
+            "unstage".into(),
+            new_staged,
+            Some(0),
+        ))
+        .unwrap();
+        assert!(git_patch(path, "new.txt", "staged", false)
+            .unwrap()
+            .is_empty());
+        assert!(root.join("new.txt").exists());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/outside/sail-missing-target", root.join("linked"))
+                .unwrap();
+            let link_patch = git_patch(path, "linked", "unstaged", true).unwrap();
+            tauri::async_runtime::block_on(git_change_action(
+                path.into(),
+                "linked".into(),
+                "unstaged".into(),
+                "revert".into(),
+                link_patch,
+                None,
+            ))
+            .unwrap();
+            assert!(fs::symlink_metadata(root.join("linked")).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unstage_file_before_first_commit_preserves_worktree() {
+        let root = std::env::temp_dir().join(format!("sail-unborn-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q"]);
+        fs::write(root.join("new.txt"), "new line\n").unwrap();
+        git(path, &["add", "--", "new.txt"]);
+        fs::write(root.join("new.txt"), "new line\nmore work\n").unwrap();
+        let changes = tauri::async_runtime::block_on(working_tree_diff(path.into())).unwrap();
+        let new = changes
+            .iter()
+            .find(|change| change.file == "new.txt")
+            .unwrap();
+        assert!(new.patch.contains("new line"));
+        assert!(new.patch.contains("more work"));
+        assert!(!new.staged_patch.is_empty());
+        assert!(!new.unstaged_patch.is_empty());
+        let staged = git_patch(path, "new.txt", "staged", false).unwrap();
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "new.txt".into(),
+            "staged".into(),
+            "unstage".into(),
+            staged,
+            None,
+        ))
+        .unwrap();
+        assert!(root.join("new.txt").exists());
+        assert!(fs::read_to_string(root.join("new.txt"))
+            .unwrap()
+            .contains("more work"));
+        assert!(git_patch(path, "new.txt", "staged", false)
+            .unwrap()
+            .is_empty());
+        fs::write(root.join("gone.txt"), "staged then removed\n").unwrap();
+        git(path, &["add", "--", "gone.txt"]);
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        let changes = tauri::async_runtime::block_on(working_tree_diff(path.into())).unwrap();
+        let gone = changes
+            .iter()
+            .find(|change| change.file == "gone.txt")
+            .unwrap();
+        assert!(gone.patch.is_empty());
+        assert!(!gone.staged_patch.is_empty());
+        assert!(!gone.unstaged_patch.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_actions_use_literal_pathspecs() {
+        let root = std::env::temp_dir().join(format!("sail-literal-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        fs::write(root.join("*.txt"), "literal\n").unwrap();
+        fs::write(root.join("other.txt"), "other\n").unwrap();
+        git(path, &["add", "--", ":(literal)*.txt", "other.txt"]);
+        git(
+            path,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        fs::write(root.join("*.txt"), "changed literal\n").unwrap();
+        fs::write(root.join("other.txt"), "changed other\n").unwrap();
+        let changes = tauri::async_runtime::block_on(working_tree_diff(path.into())).unwrap();
+        assert!(changes
+            .iter()
+            .find(|change| change.file == "*.txt")
+            .unwrap()
+            .patch
+            .contains("changed literal"));
+        assert!(changes
+            .iter()
+            .find(|change| change.file == "other.txt")
+            .unwrap()
+            .patch
+            .contains("changed other"));
+        let patch = git_patch(path, "*.txt", "unstaged", false).unwrap();
+        assert!(patch.contains("changed literal"));
+        assert!(!patch.contains("changed other"));
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "*.txt".into(),
+            "unstaged".into(),
+            "stage".into(),
+            patch,
+            None,
+        ))
+        .unwrap();
+        assert!(git_patch(path, "*.txt", "staged", false)
+            .unwrap()
+            .contains("changed literal"));
+        assert!(git_patch(path, "other.txt", "staged", false)
+            .unwrap()
+            .is_empty());
+        assert!(git_patch(path, "other.txt", "unstaged", false)
+            .unwrap()
+            .contains("changed other"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_file_actions_apply_complete_patches() {
+        let root = std::env::temp_dir().join(format!("sail-binary-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        let original = [0, 1, 2, 3];
+        fs::write(root.join("file.bin"), original).unwrap();
+        git(path, &["add", "--", "file.bin"]);
+        git(
+            path,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        fs::write(root.join("file.bin"), [0, 4, 5, 6]).unwrap();
+        let patch = git_patch(path, "file.bin", "unstaged", false).unwrap();
+        assert!(patch.contains("GIT binary patch"));
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "file.bin".into(),
+            "unstaged".into(),
+            "stage".into(),
+            patch,
+            None,
+        ))
+        .unwrap();
+        let staged = git_patch(path, "file.bin", "staged", false).unwrap();
+        assert!(staged.contains("GIT binary patch"));
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "file.bin".into(),
+            "staged".into(),
+            "unstage".into(),
+            staged,
+            None,
+        ))
+        .unwrap();
+        let patch = git_patch(path, "file.bin", "unstaged", false).unwrap();
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "file.bin".into(),
+            "unstaged".into(),
+            "revert".into(),
+            patch,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(fs::read(root.join("file.bin")).unwrap(), original);
+        fs::write(root.join("new.bin"), [0, 7, 8, 9]).unwrap();
+        let changes = tauri::async_runtime::block_on(working_tree_diff(path.into())).unwrap();
+        let new = changes
+            .iter()
+            .find(|change| change.file == "new.bin")
+            .unwrap();
+        assert!(new.unstaged_patch.contains("GIT binary patch"));
+        tauri::async_runtime::block_on(git_change_action(
+            path.into(),
+            "new.bin".into(),
+            "unstaged".into(),
+            "stage".into(),
+            new.unstaged_patch.clone(),
+            None,
+        ))
+        .unwrap();
+        assert!(!git_patch(path, "new.bin", "staged", false)
+            .unwrap()
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn same_named_repositories_have_distinct_worktree_folders() {
