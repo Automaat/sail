@@ -371,6 +371,7 @@
   let messages = $state<SessionMessageInfo[]>([]);
   let olderMessageCursor = $state<string | null>(null);
   let loadingOlder = $state(false);
+  let restoringTimelineSelection: number | null = null;
   let liveText = $state<Record<string, Record<number, string>>>({});
   let pendingTextDeltas: Record<string, Record<number, string[]>> = {};
   let textTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3626,11 +3627,18 @@
     if (!automatic) mobileView = 'chat';
     error = '';
     setSetting(`sai-session:${directory}`, id);
-    await refreshSession(id, current);
-    if (current === selection) {
-      await restoreViewState();
-      if (!automatic && window.matchMedia('(max-width: 850px)').matches) chatArea?.focus();
+    restoringTimelineSelection = current;
+    try {
+      await refreshSession(id, current);
+      if (current === selection) {
+        await restoreViewState();
+        if (!automatic && window.matchMedia('(max-width: 850px)').matches) chatArea?.focus();
+      }
+    } finally {
+      if (restoringTimelineSelection === current) restoringTimelineSelection = null;
     }
+    if (current === selection && chatScroll && chatScroll.scrollHeight <= chatScroll.clientHeight)
+      void loadOlderMessages();
   }
 
   function syncSessionChoice(session: SessionInfo) {
@@ -3964,26 +3972,47 @@
   }
 
   async function loadOlderMessages() {
-    if (!client || !sessionID || !olderMessageCursor || loadingOlder) return;
+    if (
+      !client ||
+      !sessionID ||
+      !olderMessageCursor ||
+      loadingOlder ||
+      restoringTimelineSelection === selection
+    )
+      return;
     const id = sessionID;
     const current = selection;
     const cursor = olderMessageCursor;
     const observed = Object.fromEntries(messageGeneration);
     const height = chatScroll?.scrollHeight ?? 0;
     const top = chatScroll?.scrollTop ?? 0;
+    const underfilled = !!chatScroll && height <= chatScroll.clientHeight;
+    let loaded = false;
     loadingOlder = true;
     try {
       const page = await client.message.list({ sessionID: id, limit: 50, cursor });
       if (current !== selection || id !== sessionID) return;
       messages = mergeMessages(messages, acceptProjectedMessages(page.data, observed));
-      olderMessageCursor = page.cursor.next ?? null;
-      followChat = false;
+      olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
+      if (!underfilled) followChat = false;
       await tick();
-      if (chatScroll) chatScroll.scrollTop = top + chatScroll.scrollHeight - height;
+      if (chatScroll)
+        chatScroll.scrollTop =
+          underfilled && followChat
+            ? chatScroll.scrollHeight
+            : top + chatScroll.scrollHeight - height;
+      loaded = true;
     } catch (cause) {
       error = describe(cause);
     } finally {
       loadingOlder = false;
+      if (
+        loaded &&
+        chatScroll &&
+        chatScroll.scrollHeight <= chatScroll.clientHeight &&
+        olderMessageCursor
+      )
+        void loadOlderMessages();
     }
   }
 
@@ -5003,15 +5032,11 @@
             <div
               class="conversation"
               bind:this={chatScroll}
-              onscroll={() => (followChat = chatScroll ? nearBottom(chatScroll) : true)}
+              onscroll={() => {
+                followChat = chatScroll ? nearBottom(chatScroll) : true;
+                if (chatScroll && chatScroll.scrollTop <= 80) void loadOlderMessages();
+              }}
             >
-              {#if olderMessageCursor}<button
-                  class="older-messages"
-                  onclick={loadOlderMessages}
-                  disabled={loadingOlder}
-                >
-                  {loadingOlder ? 'Loading older messages…' : 'Load older messages'}
-                </button>{/if}
               {#if !sessionID && messages.length === 0}<div class="welcome">
                   <div class="welcome-mark">◇</div>
                   <p class="eyebrow">{planReady ? 'PLAN WITH ARCHITECT' : 'START WORK'}</p>
