@@ -1,4 +1,4 @@
-import { browser, $, expect } from '@wdio/globals';
+import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -155,15 +155,28 @@ describe('ACP agent threads', () => {
     );
 
     await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer textarea').setValue('Delayed approval');
     await $('.agent-actions button').click();
-    await expect($('.session-row .session-item[title="Delayed approval"]')).toBeDisplayed();
+    await $('.session-row .session-item[title="Delayed approval"]').waitForDisplayed({
+      timeout: 10_000,
+    });
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
     await $('.agent-launches button:nth-child(2)').click();
-    await expect($('.session-row .session-item[title="Delayed approval"]')).toHaveText(
-      expect.stringMatching(/Running|Waiting for input/),
-    );
+    try {
+      await expect($('.session-row .session-item[title="Delayed approval"]')).toHaveText(
+        expect.stringMatching(/Running|Waiting for input/),
+      );
+    } catch (cause) {
+      await $('.session-row .session-item[title="Delayed approval"]').click();
+      console.error('ACP pending thread diagnostic', {
+        sidebar: await $('.sidebar').getText(),
+        workspace: await $('.agent-workspace').getText(),
+        threads: await browser.execute(() => localStorage.getItem('sail-agent-threads')),
+      });
+      throw cause;
+    }
     await browser.pause(1800);
     await $('.session-row .session-item[title="Delayed approval"]').click();
     await expect($('.agent-permission')).toHaveText(expect.stringContaining('Run test action'));
@@ -179,26 +192,30 @@ describe('ACP agent threads', () => {
     await browser.keys('Escape');
     await expect($('.agent-permission')).not.toBeDisplayed();
     await expect($('.agent-busy')).not.toBeDisplayed();
-    await expect($('.agent-tool')).toHaveText(expect.stringContaining('cancelled'));
+    await expect($('.agent-tool-group')).toHaveText(expect.stringContaining('cancelled'));
 
     await $('.agent-composer textarea').setValue('Slow cancel');
     await $('.agent-actions button').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await browser.keys('Escape');
-    await expect($('.agent-tool')).toHaveText(expect.stringContaining('stopping'));
+    await expect($('.agent-tool-current')).toHaveText(expect.stringContaining('stopping'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
     await expect($('.session-row .session-item[title="Delayed approval"]')).toHaveText(
       expect.stringContaining('working'),
     );
-    await expect($('.agent-tool')).toHaveText(expect.stringContaining('cancelled'));
+    await expect($('.agent-tool-group')).toHaveText(expect.stringContaining('cancelled'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
 
     await $('.agent-composer textarea').setValue('Long answer');
     await $('.agent-actions button').click();
     await expect($('.agent-permission')).toBeDisplayed();
-    const beforeReply = await browser.execute(
-      () => document.querySelector('.agent-conversation')?.scrollTop ?? -1,
-    );
+    const beforeReply = await browser.execute(() => {
+      const conversation = document.querySelector('.agent-conversation');
+      if (!conversation) return -1;
+      conversation.scrollTop = conversation.scrollHeight;
+      conversation.dispatchEvent(new Event('scroll'));
+      return conversation.scrollTop;
+    });
     await $('.agent-permission button').click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Answer line 99'));
     expect(
@@ -209,7 +226,24 @@ describe('ACP agent threads', () => {
     ).toBe(true);
     expect(
       await browser.execute(() => document.querySelector('.agent-conversation')?.scrollTop ?? -1),
-    ).toBe(beforeReply);
+    ).toBeGreaterThan(beforeReply);
+
+    await $('.agent-composer textarea').setValue('Activity demo');
+    await $('.agent-actions button').click();
+    await expect($('.agent-tool-current')).toBeDisplayed();
+    await browser.execute(() => {
+      const conversation = document.querySelector('.agent-conversation');
+      if (conversation) {
+        conversation.scrollTop = 0;
+        conversation.dispatchEvent(new Event('scroll'));
+      }
+    });
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('The checks passed. The tool details are available above.'),
+    );
+    expect(
+      await browser.execute(() => document.querySelector('.agent-conversation')?.scrollTop),
+    ).toBe(0);
 
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
@@ -233,5 +267,26 @@ describe('ACP agent threads', () => {
     await expect($('.option-menu')).toHaveText(
       expect.stringContaining('No choices available for this model or agent.'),
     );
+  });
+
+  it('keeps agent messages and failures visible around grouped tool activity', async () => {
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Activity failure demo');
+    await $('.agent-actions button').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('I recovered from the read failure'),
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const group = $('.agent-tool-group');
+    await expect($$('.agent-tool-group')).toBeElementsArrayOfSize(2);
+    await expect(group).toHaveText(expect.stringContaining('2 actions'));
+    await expect(group).toHaveText(expect.stringContaining('Failed'));
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('The first read failed. I’m searching another path.'),
+    );
+    await group.$('summary').click();
+    await expect(group.$$('.agent-tool-item')).toBeElementsArrayOfSize(2);
+    await expect(group).toHaveText(expect.stringContaining('Could not read the first path.'));
   });
 });
