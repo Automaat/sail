@@ -24,6 +24,13 @@
   import type { AgentUsage } from './lib/agent-usage';
   import type { BrowserAttachment } from './lib/browser-pick';
   import {
+    clipboardFiles,
+    insertClipboardText,
+    removeClipboardFile,
+    stageClipboardFile,
+    stageClipboardImage,
+  } from './lib/attachments';
+  import {
     coordinationMessageForText,
     coordinationPrompt,
     type CoordinationMessage,
@@ -87,6 +94,8 @@
   let connecting = $state(false);
   let draft = $state('');
   let images = $state<BrowserAttachment[]>([]);
+  let clipboardAttachments = $state<{ path: string; name: string; image: boolean }[]>([]);
+  let pendingPaste: Promise<void> = Promise.resolve();
   let lastPicked = '';
   let lastPrefill = '';
   let lastExternalPrompt = '';
@@ -95,6 +104,47 @@
     images = images.filter((item) => item.id !== image.id);
     draft = draft.replace(image.text, '').trim();
     void invoke('browser_remove_capture', { path: image.imagePath });
+  }
+  function removeClipboardAttachment(attachment: { path: string; image: boolean }) {
+    clipboardAttachments = clipboardAttachments.filter((item) => item.path !== attachment.path);
+    if (attachment.image) void invoke('browser_remove_capture', { path: attachment.path });
+    else void removeClipboardFile(attachment.path);
+  }
+
+  async function pasteFiles(event: ClipboardEvent) {
+    const files = clipboardFiles(event);
+    if (!files.length) return;
+    event.preventDefault();
+    const pastedText = event.clipboardData?.getData('text/plain') ?? '';
+    if (pastedText && event.target instanceof HTMLTextAreaElement) {
+      const input = event.target;
+      const caret = input.selectionStart + pastedText.length;
+      draft = insertClipboardText(draft, pastedText, input.selectionStart, input.selectionEnd);
+      void tick().then(() => input.setSelectionRange(caret, caret));
+    }
+    const current = generation;
+    const staged = await Promise.all(
+      files.map(async (file) => {
+        const image = file.type.startsWith('image/');
+        try {
+          const path = image ? await stageClipboardImage(file) : await stageClipboardFile(file);
+          return { path, name: file.name || 'image.png', image, failure: null };
+        } catch (cause) {
+          return { path: null, name: file.name, image, failure: describe(cause) };
+        }
+      }),
+    );
+    const stagedAttachments: { path: string; name: string; image: boolean }[] = [];
+    for (const item of staged) {
+      if (item.failure) error = `Could not paste ${item.name}: ${item.failure}`;
+      else if (item.path) {
+        if (current !== generation) {
+          if (item.image) void invoke('browser_remove_capture', { path: item.path });
+          else void removeClipboardFile(item.path);
+        } else stagedAttachments.push({ path: item.path, name: item.name, image: item.image });
+      }
+    }
+    clipboardAttachments = [...clipboardAttachments, ...stagedAttachments];
   }
   let error = $state('');
   let entries = $state<AgentEntry[]>([]);
@@ -538,15 +588,20 @@
           void acp.permission(agent, permission.id, null).catch(() => {});
       }
       images.forEach((image) => void invoke('browser_remove_capture', { path: image.imagePath }));
+      clipboardAttachments.forEach((attachment) => removeClipboardAttachment(attachment));
     };
   });
 
   async function send(externalText?: string) {
+    if (externalText === undefined) await pendingPaste;
     const external = externalText !== undefined;
-    const text = (externalText ?? draft).trim();
+    const text =
+      (externalText ?? draft).trim() ||
+      (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
     const command = text.toLowerCase();
     if (
       !external &&
+      !clipboardAttachments.length &&
       !isBusy &&
       ready &&
       directory &&
@@ -556,11 +611,12 @@
       await openPicker(command.slice(1) as 'model' | 'effort');
       return;
     }
-    if (!text || !ready || isBusy || !directory) {
+    if ((!text && (external || !clipboardAttachments.length)) || !ready || isBusy || !directory) {
       if (external) throw new Error('Wait for the current agent turn.');
       return;
     }
     const sentImages = external ? [] : [...images];
+    const sentClipboard = external ? [] : [...clipboardAttachments];
     const turnAgent = agent;
     const current = generation;
     const turnId = crypto.randomUUID();
@@ -576,13 +632,15 @@
     if (!external) {
       draft = '';
       images = [];
+      clipboardAttachments = [];
     }
     const userEntryId = crypto.randomUUID();
     flushUpdates();
     entries = [...entries, { id: userEntryId, type: 'user', text }];
     void follow();
     try {
-      if (!activeSessionId) activityThread = await ensureSession(text.slice(0, 60));
+      if (!activeSessionId)
+        activityThread = await ensureSession(text.slice(0, 60) || 'Attached files');
       else if (activityThread?.title === 'New thread')
         activityThread = { ...activityThread, title: text.slice(0, 60) };
       if (current !== generation) return;
@@ -598,6 +656,7 @@
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
           images = [...sentImages, ...images];
+          clipboardAttachments = [...sentClipboard, ...clipboardAttachments];
           keepImages = true;
         }
         return;
@@ -611,12 +670,18 @@
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${text}`
           : text;
+      const filePaths = sentClipboard.filter((item) => !item.image).map((item) => item.path);
       const result = await acp.prompt(
         turnAgent,
         id!,
-        promptText,
+        filePaths.length
+          ? `${promptText}\n\nAttached files (read these paths):\n${filePaths.join('\n')}`
+          : promptText,
         turnId,
-        sentImages.map((item) => item.imagePath),
+        [
+          ...sentImages.map((item) => item.imagePath),
+          ...sentClipboard.filter((item) => item.image).map((item) => item.path),
+        ],
       );
       if (result.stopReason === 'cancelled' || stopRequested) notifyOnDone = false;
       if (external && !notifyOnDone) throw new Error('Agent turn was cancelled.');
@@ -636,6 +701,7 @@
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
           images = [...sentImages, ...images];
+          clipboardAttachments = [...sentClipboard, ...clipboardAttachments];
           keepImages = true;
         }
         if (stopRequested) markTools('status unconfirmed', ['stopping']);
@@ -647,6 +713,11 @@
         sentImages.forEach(
           (image) => void invoke('browser_remove_capture', { path: image.imagePath }),
         );
+      if (!keepImages)
+        sentClipboard.forEach((attachment) => {
+          if (attachment.image) void invoke('browser_remove_capture', { path: attachment.path });
+          else void removeClipboardFile(attachment.path);
+        });
       if (activeTurnId === turnId) activeTurnId = null;
       if (activityThread) onstatus(activityThread, finalStatus, notifyOnDone);
       if (current === generation) busy = false;
@@ -982,6 +1053,9 @@
         data-pane-prompt
         aria-label={`Message ${name}`}
         bind:value={draft}
+        onpaste={(event) => {
+          pendingPaste = Promise.all([pendingPaste, pasteFiles(event)]).then(() => {});
+        }}
         onkeydown={keydown}
         rows="3"
         placeholder={`Message ${name}…`}
@@ -991,6 +1065,16 @@
               >📷 {image.imagePath.split(/[\\/]/).at(-1)}
               <button aria-label="Remove picked element" onclick={() => removeImage(image)}
                 >×</button
+              ></span
+            >{/each}
+        </div>{/if}
+      {#if clipboardAttachments.length}<div class="attachments">
+          {#each clipboardAttachments as attachment (attachment.path)}<span
+              >{attachment.image ? '📷' : '📎'}
+              {attachment.name}
+              <button
+                aria-label={`Remove ${attachment.name}`}
+                onclick={() => removeClipboardAttachment(attachment)}>×</button
               ></span
             >{/each}
         </div>{/if}
@@ -1026,7 +1110,7 @@
         <div class="agent-actions">
           <Button
             onclick={() => void send()}
-            disabled={!ready || isBusy || !draft.trim()}
+            disabled={!ready || isBusy || (!draft.trim() && !clipboardAttachments.length)}
             loading={isBusy}>Send ↗</Button
           >
         </div>
