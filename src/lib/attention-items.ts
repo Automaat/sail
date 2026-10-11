@@ -1,6 +1,8 @@
 import { isInboxOutcome, repositoryName, type InboxItem } from './inbox.ts';
 import type { MergeOwner, ShipIssue, ShipRun } from './issue-shipping.ts';
 import type { SpawnReceipt } from './agent-results.ts';
+import type { ProjectCatalog } from './projects.ts';
+import { selectedRepository } from './saved-commands.ts';
 import {
   shipClosedBeforeLaunch,
   shipClosedWithoutMerge,
@@ -41,8 +43,10 @@ export type AttentionItem = {
   id: string;
   kind: AttentionKind;
   target: AttentionTarget;
-  /** Repository name the Inbox groups by. */
+  /** Repository name displayed in the Inbox. */
   repo: string;
+  /** Stable repository identity, including its parent path or owner. */
+  repository: string;
   /** When the state began. */
   since: number;
   severity: AttentionSeverity;
@@ -105,6 +109,7 @@ export function sessionRequestCandidates(items: InboxItem[]): AttentionCandidate
     return [
       candidate(item.kind === 'question' ? 'question' : 'permission', target, {
         repo: item.project,
+        repository: item.repository,
         since: item.receivedAt,
         severity: 'critical',
         dismissible: false,
@@ -190,7 +195,11 @@ export function shipAttentionCandidates(
         issueId: issue.id,
         repository: run.repository,
       };
-      const common = { repo: shipRepositoryName(run), dismissible: true };
+      const common = {
+        repo: shipRepositoryName(run),
+        repository: run.repository,
+        dismissible: true,
+      };
       if (shipClosedWithoutMerge(issue)) {
         const prTarget: AttentionTarget = issue.pullRequest
           ? {
@@ -271,11 +280,13 @@ export function subagentAttentionCandidates(
   receipts: SpawnReceipt[],
   requestThreads: ReadonlySet<string> = new Set(),
   excludedReceipts: ReadonlySet<string> = new Set(),
+  catalog?: ProjectCatalog,
 ): AttentionCandidate[] {
   return receipts.flatMap((receipt) => {
     if (receipt.state !== 'waiting' || !receipt.targetId || receipt.validation) return [];
     if (excludedReceipts.has(receipt.receiptId)) return [];
     const directory = receipt.targetDirectory ?? receipt.sourceDirectory;
+    const repository = (catalog && selectedRepository(catalog, directory)) || receipt.project;
     const parts = shipThreadParts(receipt.targetId);
     if (parts && requestThreads.has(threadKeyOf(directory, parts.agentId, parts.sessionId)))
       return [];
@@ -289,7 +300,8 @@ export function subagentAttentionCandidates(
           targetId: receipt.targetId,
         },
         {
-          repo: repositoryName(receipt.project),
+          repo: repositoryName(repository),
+          repository,
           since: receipt.updated,
           severity: 'warning',
           dismissible: true,
