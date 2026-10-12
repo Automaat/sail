@@ -689,6 +689,7 @@ export function claimRefreshRequiresFence(
   const message = cause instanceof Error ? cause.message : String(cause);
   return (
     message === 'Shipping claim fence is no longer owned by this claim.' ||
+    message === 'Local shipping claim no longer exists.' ||
     /superseded|expired|released|comment no longer exists|identity no longer matches|heartbeat is stale|update revision is stale|id already belongs/i.test(
       message,
     )

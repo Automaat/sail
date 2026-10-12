@@ -1396,6 +1396,15 @@ void test('fences a worker only when its monotonic lease expires or ownership is
     true,
   );
   assert.equal(
+    claimRefreshRequiresFence(
+      claim,
+      new Error('Local shipping claim no longer exists.'),
+      119_999,
+      120_000,
+    ),
+    true,
+  );
+  assert.equal(
     claimRefreshRequiresFence(claim, new Error('temporary network failure'), 120_000, 120_000),
     true,
   );
