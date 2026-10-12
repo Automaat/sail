@@ -1338,18 +1338,8 @@
     elicitations = id ? loadStructuredQuestions({ agent, directory, sessionId: id }) : [];
     elicitationDrafts = {};
     onnativeplan?.(nativePlan);
-    entries = id && thread ? loadRecentTranscript(thread) : [];
-    let transcriptStorageError = '';
-    if (id && thread && acpSessionOwner(id)) {
-      try {
-        const durable = await loadOwnedTranscript(ownedTranscriptKey(agent, directory, id));
-        if (current !== generation) return;
-        if (durable.length > entries.length) entries = durable;
-      } catch (cause) {
-        transcriptStorageError = `Could not load saved conversation: ${describe(cause)}`;
-      }
-    }
     const kept = id && !nativeEntries ? takeLiveTranscript(agent, directory, id) : null;
+    entries = id && thread && !kept && !nativeEntries ? loadRecentTranscript(thread) : [];
     const liveView =
       id && !nativeEntries
         ? liveSessionView(entries, kept, sessionState(agent, directory, id))
@@ -1393,9 +1383,22 @@
     activeTurnId = null;
     finishedTurnIds = [];
     turnEnded = false;
-    error = transcriptStorageError;
+    error = '';
     ready = false;
     connecting = true;
+    if (id && thread && acpSessionOwner(id) && !kept && !nativeEntries) {
+      try {
+        const durable = await loadOwnedTranscript(ownedTranscriptKey(agent, directory, id));
+        if (current !== generation) return;
+        if (durable.length > entries.length) {
+          entries = durable;
+          if (liveView) liveView.entries = durable;
+          historicalToolIds = presentToolIds(durable);
+        }
+      } catch (cause) {
+        if (current === generation) error = `Could not load saved conversation: ${describe(cause)}`;
+      }
+    }
     if (nativeEntries) {
       entries = nativeEntries;
       historyLoaded = true;

@@ -10101,15 +10101,6 @@
     const jump = ++recentJumpGeneration;
     let expectedProjectLoad = projectLoadGeneration;
     if (thread.directory === directory) {
-      const available = await invoke<boolean>('repository_path_available', {
-        path: directory,
-      }).catch(() => false);
-      if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
-        return false;
-      if (!available) {
-        jumpFailure = 'This session is no longer available.';
-        return false;
-      }
       showSidebarThread(thread);
       focusMainPane();
       openAgent(thread.agent, thread, true);
