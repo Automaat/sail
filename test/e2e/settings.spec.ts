@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -153,9 +154,23 @@ describe('disk-backed settings', () => {
     );
 
     await browser.refresh();
-    await browser.waitUntil(async () => (await read())[key] === recent, {
-      timeoutMsg: 'The pending transcript was not restored to native settings',
-    });
+    const configDirectory = process.env.SAIL_E2E_CONFIG_DIR;
+    if (!configDirectory) throw new Error('The E2E settings directory is missing.');
+    await browser.waitUntil(
+      () => {
+        try {
+          const saved: unknown = JSON.parse(
+            readFileSync(join(configDirectory, 'settings.json'), 'utf8'),
+          );
+          return typeof saved === 'object' && saved !== null && Reflect.get(saved, key) === recent;
+        } catch {
+          return false;
+        }
+      },
+      {
+        timeoutMsg: 'The pending transcript was not restored to native settings',
+      },
+    );
     expect(await browser.execute((setting) => localStorage.getItem(setting), key)).toBe(recent);
     await browser.waitUntil(
       async () =>
