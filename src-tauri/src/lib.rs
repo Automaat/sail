@@ -501,8 +501,7 @@ fn repository_path_available(path: String) -> bool {
     directory.is_dir() && directory.join(".git").exists()
 }
 
-#[tauri::command]
-fn validate_repository(path: String) -> Result<String, String> {
+fn validate_repository_path(path: String) -> Result<String, String> {
     let directory = Path::new(&path)
         .git_canonical()
         .map_err(|_| "Repository path does not exist. Choose an existing directory.".to_string())?;
@@ -521,6 +520,13 @@ fn validate_repository(path: String) -> Result<String, String> {
     let root = String::from_utf8(output.stdout)
         .map_err(|_| "Git returned a repository path that cannot be displayed.".to_string())?;
     Ok(root.trim().to_string())
+}
+
+#[tauri::command]
+async fn validate_repository(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || validate_repository_path(path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 fn task_git_command(directory: &Path) -> Result<Command, String> {
@@ -742,7 +748,7 @@ fn git_patches(
 #[tauri::command]
 async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = validate_repository(path)?;
+        let root = validate_repository_path(path)?;
         let snapshot = index_copy(&root, true)?;
         let output = task_git_command(Path::new(&root))?
             .args([
@@ -854,7 +860,7 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
 #[tauri::command]
 async fn working_tree_revision(path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = validate_repository(path)?;
+        let root = validate_repository_path(path)?;
         git_directory_revision(Path::new(&root))
     })
     .await
@@ -864,7 +870,7 @@ async fn working_tree_revision(path: String) -> Result<String, String> {
 #[tauri::command]
 async fn working_tree_generation(path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = validate_repository(path)?;
+        let root = validate_repository_path(path)?;
         git_directory_generation(Path::new(&root))
     })
     .await
@@ -874,7 +880,7 @@ async fn working_tree_generation(path: String) -> Result<String, String> {
 #[tauri::command]
 async fn working_tree_commit(path: String) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = validate_repository(path)?;
+        let root = validate_repository_path(path)?;
         let status = task_git_command(Path::new(&root))?
             .args([
                 "-C",
@@ -909,7 +915,7 @@ async fn working_tree_commit(path: String) -> Result<Option<String>, String> {
 #[tauri::command]
 async fn shipping_base_revision(path: String, base_ref: Option<String>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = validate_repository(path)?;
+        let root = validate_repository_path(path)?;
         let base = match base_ref {
             Some(value) if value.starts_with("refs/") && !value.contains(char::is_whitespace) => {
                 value
@@ -933,7 +939,7 @@ async fn shipping_changed_paths(
     base_revision: Option<String>,
 ) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = validate_repository(path)?;
+        let root = validate_repository_path(path)?;
         let base = match base_revision {
             Some(base) => task_git_reference(
                 Path::new(&root),
@@ -1007,7 +1013,7 @@ struct WorktreeOverview {
 }
 
 fn inspect_worktree(path: String) -> WorktreeOverview {
-    let root = match validate_repository(path.clone()) {
+    let root = match validate_repository_path(path.clone()) {
         Ok(root) => root,
         Err(error) => {
             return WorktreeOverview {
@@ -1295,7 +1301,7 @@ async fn git_change_action(
     hunk: Option<usize>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = validate_repository(path)?;
+        let root = validate_repository_path(path)?;
         let relative = Path::new(&file);
         if relative.is_absolute()
             || relative
@@ -1362,7 +1368,7 @@ async fn git_change_action(
 
 #[tauri::command]
 fn diff_file_contents(path: String, file: String, side: String) -> Result<Option<String>, String> {
-    let root = validate_repository(path)?;
+    let root = validate_repository_path(path)?;
     let relative = Path::new(&file);
     if relative.is_absolute()
         || relative
@@ -1457,8 +1463,8 @@ async fn shipping_worktree_target(
     branch: String,
 ) -> Result<ShippingTarget, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = validate_repository(repository)?;
-        let worktree = validate_repository(worktree)?;
+        let repository = validate_repository_path(repository)?;
+        let worktree = validate_repository_path(worktree)?;
         git_overlay::require_shared_current(Path::new(&worktree))?;
         let actual_branch = git_reference(Path::new(&worktree), &["branch", "--show-current"])
             .ok_or("Shipping worktree is detached.".to_string())?;
@@ -1478,7 +1484,7 @@ async fn shipping_repository_target(
     branch: String,
 ) -> Result<ShippingTarget, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = validate_repository(repository)?;
+        let repository = validate_repository_path(repository)?;
         shipping_target(Path::new(&repository), Path::new(&repository), &branch)
     })
     .await
@@ -1499,7 +1505,7 @@ fn registered_worktrees(
     repository: String,
     paths: Vec<String>,
 ) -> Result<Vec<RegisteredWorktree>, String> {
-    let repository = validate_repository(repository)?;
+    let repository = validate_repository_path(repository)?;
     let listed = git_reference(
         Path::new(&repository),
         &["worktree", "list", "--porcelain", "-z"],
@@ -1533,7 +1539,7 @@ fn registered_worktrees(
 #[tauri::command]
 async fn repository_worktrees(repository: String) -> Result<Vec<RegisteredWorktree>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = validate_repository(repository)?;
+        let repository = validate_repository_path(repository)?;
         let listed = git_reference(
             Path::new(&repository),
             &["worktree", "list", "--porcelain", "-z"],
@@ -1580,7 +1586,7 @@ fn parse_registered_worktrees(listed: &str) -> Vec<RegisteredWorktree> {
 
 #[tauri::command]
 fn worktree_config(worktree: String) -> Result<Option<worktree_config::WorktreeConfig>, String> {
-    let root = validate_repository(worktree)?;
+    let root = validate_repository_path(worktree)?;
     worktree_config::read(Path::new(&root))
 }
 
@@ -1656,7 +1662,7 @@ fn default_worktree_parent(repository: &Path) -> Result<PathBuf, String> {
 
 #[tauri::command]
 async fn worktree_pressure_directory(repository: String) -> Result<String, String> {
-    let repository = validate_repository(repository)?;
+    let repository = validate_repository_path(repository)?;
     let mut path = default_worktree_parent(Path::new(&repository))?;
     while !path.try_exists().map_err(|error| error.to_string())? {
         path = path
@@ -1678,7 +1684,7 @@ async fn create_worktree(
 ) -> Result<CreatedWorktree, String> {
     let operation_locks = operation_locks.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = validate_repository(repository)?;
+        let repository = validate_repository_path(repository)?;
         let _lock = operation_locks.lock(Path::new(&repository))?;
         let created = add_worktree(repository, name, destination_parent, base_ref)?;
         allow_worktree_terminal_creation(&app, Path::new(&created.path));
@@ -1697,7 +1703,7 @@ async fn create_shipping_worktree(
 ) -> Result<CreatedWorktree, String> {
     let operation_locks = operation_locks.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let checked = validate_repository(repository)?;
+        let checked = validate_repository_path(repository)?;
         let _lock = operation_locks.lock(Path::new(&checked))?;
         if let Some(existing) = existing_shipping_worktree(Path::new(&checked), &name)? {
             allow_worktree_terminal_creation(&app, Path::new(&existing.path));
@@ -1857,7 +1863,7 @@ async fn create_shipping_replacement_worktree(
 ) -> Result<CreatedWorktree, String> {
     let operation_locks = operation_locks.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = validate_repository(repository)?;
+        let repository = validate_repository_path(repository)?;
         let path = Path::new(&repository);
         let _lock = operation_locks.lock(path)?;
         let created = replacement_shipping_worktree(
@@ -1880,7 +1886,7 @@ async fn find_shipping_worktree(
     name: String,
 ) -> Result<Option<CreatedWorktree>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = validate_repository(repository)?;
+        let repository = validate_repository_path(repository)?;
         existing_shipping_worktree(Path::new(&repository), &name)
     })
     .await
@@ -1890,7 +1896,7 @@ async fn find_shipping_worktree(
 #[tauri::command]
 async fn run_shipping_setup(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let path = validate_repository(path)?;
+        let path = validate_repository_path(path)?;
         if git_overlay::known_worktree(Path::new(&path)).is_some() {
             return Err(
                 "Shipping setup cannot use shared Git metadata while a private Git overlay exists."
@@ -1968,7 +1974,7 @@ fn add_worktree_with_branch_creation(
     base_ref: Option<String>,
     create_branch: bool,
 ) -> Result<CreatedWorktree, String> {
-    let repository = validate_repository(repository)?;
+    let repository = validate_repository_path(repository)?;
     let repository = Path::new(&repository);
     let name = name.trim();
     if name.is_empty()
@@ -2112,7 +2118,7 @@ async fn delete_worktree(
     let agents = agents.inner().clone();
     let fence = fence.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let checked = validate_repository(repository)?;
+        let checked = validate_repository_path(repository)?;
         let _lock = operation_locks.lock(Path::new(&checked))?;
         let directory = PathBuf::from(&worktree)
             .git_canonical()
@@ -3039,7 +3045,7 @@ where
     H: FnOnce() -> Result<(), String>,
 {
     let (before_final_identity_check, after_final_identity_check, after_remove) = hooks;
-    let repository = PathBuf::from(validate_repository(repository)?)
+    let repository = PathBuf::from(validate_repository_path(repository)?)
         .git_canonical()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
     let requested_worktree = acp_terminal::stable_worktree_identity(Path::new(&worktree));
