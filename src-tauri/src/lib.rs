@@ -1374,7 +1374,21 @@ async fn git_change_action(
 }
 
 #[tauri::command]
-fn diff_file_contents(path: String, file: String, side: String) -> Result<Option<String>, String> {
+async fn diff_file_contents(
+    path: String,
+    file: String,
+    side: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || diff_file_contents_sync(path, file, side))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn diff_file_contents_sync(
+    path: String,
+    file: String,
+    side: String,
+) -> Result<Option<String>, String> {
     let root = validate_repository_path(path)?;
     let relative = Path::new(&file);
     if relative.is_absolute()
