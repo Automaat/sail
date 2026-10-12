@@ -15,6 +15,7 @@
     checkItems,
     hookItems,
     nativeItems,
+    presentToolIds,
     pendingCoordinationItems,
     queuedItems,
     shellItems,
@@ -513,6 +514,7 @@
   let historyLoaded = $state(true);
   let historyLoading = $state(false);
   let historyAttempted = $state(false);
+  let historicalToolIds = $state.raw<ReadonlySet<string>>(new Set());
   let showingEarlier = false;
   const visibleEntries = $derived(entries.slice(-visibleCount));
   let seenEntryCount = 0;
@@ -679,6 +681,7 @@
         name,
         provider: agent,
         toolOutput: (tool) => tool.content || toolInput(tool.output),
+        historicalToolIds,
       }),
       timed: [
         ...hookItems(visibleHookActivities),
@@ -1020,6 +1023,8 @@
       acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
     onnativeplan?.(nativePlan);
     if (replaying) {
+      // ACP does not identify live updates interleaved with session/load replay (#342).
+      // A mutable running flag cannot establish provenance for old failed tools.
       updateEntriesInPlace(replayEntries, update);
       return;
     }
@@ -1074,9 +1079,14 @@
     try {
       const session = await acp.load(agent, directory, id, activeCapabilityProfile);
       if (current !== generation) return;
+      historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
       if (!configOptions.length && Array.isArray(session.configOptions))
         configOptions = session.configOptions as AgentConfigOption[];
       entries = restoreEntryTimes(replayEntries, entries);
+      // Switch the event sink before yielding to Svelte. An update delivered during tick()
+      // must reach entries rather than a replay buffer that finally discards.
+      setReplaying(false);
+      replayEntries = [];
       visibleCount = 50;
       historyLoaded = true;
       rememberTranscript();
@@ -1271,6 +1281,9 @@
         ? liveSessionView(entries, kept, sessionState(agent, directory, id))
         : null;
     if (liveView) entries = liveView.entries;
+    // Tools already present when this pane opens are history, even if the child is still working.
+    // A failed tool arriving afterward is absent from this set and announces on its first render.
+    historicalToolIds = presentToolIds(nativeEntries ?? entries);
     visibleCount = 50;
     historyLoaded = !id;
     historyLoading = false;
@@ -1381,6 +1394,7 @@
               ? await acp.load(agent, directory, id, activeCapabilityProfile)
               : await acp.resume(agent, directory, id, activeCapabilityProfile);
           if (current === generation && (restoresSubagents || !canResume)) {
+            historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
             entries = restoreEntryTimes(replayEntries, entries);
             setReplaying(false);
             replayEntries = [];
@@ -2684,6 +2698,7 @@
       {/snippet}
       <Transcript
         items={transcriptItems}
+        activityScope={JSON.stringify([agent, directory, activeSessionId])}
         busy={shownBusy}
         {coordinationMessages}
         onopen={onopensubagent}
