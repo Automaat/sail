@@ -401,10 +401,11 @@ if (typeof window !== 'undefined') {
 }
 
 function savedTranscripts(): SavedTranscript[] {
-  if (transcriptCache && transcriptCacheStorage === globalThis.localStorage) return transcriptCache;
   try {
+    const storage = globalThis.localStorage;
+    if (transcriptCache && transcriptCacheStorage === storage) return transcriptCache;
     const value: unknown = JSON.parse(getSetting(transcriptKey) ?? '[]');
-    transcriptCacheStorage = globalThis.localStorage;
+    transcriptCacheStorage = storage;
     if (!Array.isArray(value)) return (transcriptCache = []);
     return (transcriptCache = value.filter(
       (item): item is SavedTranscript =>
@@ -414,6 +415,7 @@ function savedTranscripts(): SavedTranscript[] {
         Array.isArray(item.entries),
     ));
   } catch {
+    transcriptCacheStorage = null;
     return (transcriptCache = []);
   }
 }

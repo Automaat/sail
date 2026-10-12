@@ -558,6 +558,30 @@ void test('recent transcript cache keeps the latest entries within a size budget
   }
 });
 
+void test('recent transcript reads stay safe when browser storage is blocked', () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    get: () => {
+      throw new DOMException('Storage blocked', 'SecurityError');
+    },
+  });
+  const thread: AgentThread = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'blocked',
+    title: 'Blocked',
+    updated: 0,
+  };
+  try {
+    assert.deepEqual(loadRecentTranscript(thread), []);
+    assert.deepEqual(loadRecentTranscript(thread), []);
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
+
 void test('switching threads shows recent entries immediately and persists them after the switch', async () => {
   const values = new Map<string, string>();
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
