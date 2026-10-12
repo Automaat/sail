@@ -80,20 +80,29 @@ void test('unfinished transcript writes survive restart and overlapping native a
     setTranscriptSetting('repeated transcript');
     setTranscriptSetting('intermediate transcript');
     setTranscriptSetting('repeated transcript');
-    assert.equal(storage.getItem(pendingKey), '1');
+    const latestToken = storage.getItem(pendingKey);
+    assert.ok(latestToken);
     await new Promise(setImmediate);
     assert.equal(saves[1]?.value, 'repeated transcript');
     saves[1].resolve();
     await new Promise(setImmediate);
-    assert.equal(storage.getItem(pendingKey), '1');
+    assert.equal(storage.getItem(pendingKey), latestToken);
     assert.equal(saves[2]?.value, 'intermediate transcript');
     saves[2].resolve();
     await new Promise(setImmediate);
-    assert.equal(storage.getItem(pendingKey), '1');
+    assert.equal(storage.getItem(pendingKey), latestToken);
     assert.equal(saves[3]?.value, 'repeated transcript');
     saves[3].resolve();
     await new Promise(setImmediate);
     assert.equal(storage.getItem(pendingKey), null);
+
+    setTranscriptSetting('other window is active');
+    storage.setItem(pendingKey, 'newer-window-token');
+    await new Promise(setImmediate);
+    assert.equal(saves[4]?.value, 'other window is active');
+    saves[4].resolve();
+    await new Promise(setImmediate);
+    assert.equal(storage.getItem(pendingKey), 'newer-window-token');
     await quiesceSettingsWrites();
   } finally {
     for (const save of saves) save.resolve();

@@ -26,7 +26,6 @@ let ready = false;
 let e2eSettingsDisabled = false;
 let values: Record<string, string> = {};
 let writes = Promise.resolve();
-let transcriptWriteGeneration = 0;
 const pendingLoads = new Set<Promise<unknown>>();
 const pendingMutations = new Set<Promise<unknown>>();
 let e2eQuiesced = false;
@@ -68,10 +67,8 @@ export async function initializeSettings(): Promise<void> {
     pendingLoads.add(loading);
     const saved = await loading.finally(() => pendingLoads.delete(loading));
     if (e2eQuiesced) return;
-    const pendingTranscript =
-      localStorage.getItem(transcriptPendingKey) === '1'
-        ? localStorage.getItem(transcriptKey)
-        : null;
+    const pendingToken = localStorage.getItem(transcriptPendingKey);
+    const pendingTranscript = pendingToken === null ? null : localStorage.getItem(transcriptKey);
     values = Object.fromEntries(
       Object.entries(saved).filter(
         (entry): entry is [string, string] => isSetting(entry[0]) && typeof entry[1] === 'string',
@@ -82,9 +79,9 @@ export async function initializeSettings(): Promise<void> {
     for (const [key, value] of Object.entries(values)) localStorage.setItem(key, value);
     localStorage.setItem(migrationKey, '1');
     ready = true;
-    if (pendingTranscript !== null) {
+    if (pendingTranscript !== null && pendingToken !== null) {
       persist(transcriptKey, pendingTranscript);
-      clearTranscriptPendingAfterWrite(++transcriptWriteGeneration);
+      clearTranscriptPendingAfterWrite(pendingToken);
     }
   } catch (cause) {
     settingsError.set(`Could not load Sail settings: ${String(cause)}`);
@@ -99,11 +96,12 @@ function persist(key: string, value: string | null): void {
   );
 }
 
-function clearTranscriptPendingAfterWrite(generation: number): void {
+function clearTranscriptPendingAfterWrite(token: string): void {
   const write = writes;
   void write
     .then(() => {
-      if (transcriptWriteGeneration === generation) localStorage.removeItem(transcriptPendingKey);
+      if (localStorage.getItem(transcriptPendingKey) === token)
+        localStorage.removeItem(transcriptPendingKey);
       return undefined;
     })
     .catch(() => undefined);
@@ -128,9 +126,9 @@ export function setSetting(key: string, value: string): void {
 export function setTranscriptSetting(value: string): void {
   if (e2eQuiesced) return;
   setSetting(transcriptKey, value);
-  localStorage.setItem(transcriptPendingKey, '1');
-  const generation = ++transcriptWriteGeneration;
-  if (ready) clearTranscriptPendingAfterWrite(generation);
+  const token = crypto.randomUUID();
+  localStorage.setItem(transcriptPendingKey, token);
+  if (ready) clearTranscriptPendingAfterWrite(token);
 }
 
 export async function setSettingDurable(key: string, value: string): Promise<void> {
