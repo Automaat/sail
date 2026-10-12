@@ -1615,7 +1615,7 @@
     try {
       const revision = await invoke<string>('working_tree_revision', { path });
       if (generation !== diffRefresh || path !== directory) return;
-      if (quiet && diffRevisionPath === path && diffRevision === revision) return;
+      if (quiet && !diffError && diffRevisionPath === path && diffRevision === revision) return;
       diffLoading = true;
       const next = await invoke<WorkingDiffInfo[]>('working_tree_diff', { path });
       if (generation !== diffRefresh || path !== directory) return;
@@ -12328,7 +12328,7 @@
   function focusWorkspace() {
     if (detectShippingClockResume()) void tickShippingRuns();
     for (const pane of leaves(paneLayout)) if (pane.thread) markThreadRead(pane.thread);
-    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
+    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff(true);
   }
 
   function describe(cause: unknown): string {
