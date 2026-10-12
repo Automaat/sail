@@ -3468,31 +3468,37 @@ pub fn run() {
 }
 
 #[tauri::command]
-fn worktree_storage_cleanup_status(
+async fn worktree_storage_cleanup_status(
     app: tauri::AppHandle,
 ) -> Result<Vec<worktree_storage::CleanupPending>, String> {
     let cache = app
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
-    Ok(worktree_storage::cleanup_status(&cache))
+    tauri::async_runtime::spawn_blocking(move || worktree_storage::cleanup_status(&cache))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn retry_worktree_storage_cleanup(
+async fn retry_worktree_storage_cleanup(
     app: tauri::AppHandle,
 ) -> Result<Vec<worktree_storage::CleanupPending>, String> {
-    app.state::<acp::AgentManager>()
-        .retry_turn_temp_cleanup(&app);
     let cache = app
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
-    Ok(worktree_storage::retry_cleanup(&cache))
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<acp::AgentManager>()
+            .retry_turn_temp_cleanup(&app);
+        worktree_storage::retry_cleanup(&cache)
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn clean_pending_worktree_temp(
+async fn clean_pending_worktree_temp(
     app: tauri::AppHandle,
     token: String,
     confirmed_unused: bool,
@@ -3504,7 +3510,11 @@ fn clean_pending_worktree_temp(
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
-    worktree_storage::clean_pending_temp(&cache, &token)
+    tauri::async_runtime::spawn_blocking(move || {
+        worktree_storage::clean_pending_temp(&cache, &token)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[cfg(test)]

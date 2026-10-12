@@ -380,33 +380,87 @@ function transcriptId(agent: AgentId, directory: string, sessionId: string): str
 }
 
 type SavedTranscript = { id: string; entries: AgentEntry[] };
+type PendingTranscript = {
+  thread: AgentThread;
+  entries: AgentEntry[];
+  frame?: number;
+  timer: ReturnType<typeof setTimeout>;
+};
+let transcriptCache: SavedTranscript[] | null = null;
+let transcriptCacheStorage: Storage | null = null;
+const pendingTranscripts = new Map<string, PendingTranscript>();
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (event) => {
+    if (event.key === null || event.key === transcriptKey) transcriptCache = null;
+  });
+  window.addEventListener('pagehide', () => {
+    for (const pending of pendingTranscripts.values())
+      saveRecentTranscript(pending.thread, pending.entries);
+  });
+}
 
 function savedTranscripts(): SavedTranscript[] {
+  if (transcriptCache && transcriptCacheStorage === globalThis.localStorage) return transcriptCache;
   try {
     const value: unknown = JSON.parse(getSetting(transcriptKey) ?? '[]');
-    if (!Array.isArray(value)) return [];
-    return value.filter(
+    transcriptCacheStorage = globalThis.localStorage;
+    if (!Array.isArray(value)) return (transcriptCache = []);
+    return (transcriptCache = value.filter(
       (item): item is SavedTranscript =>
         item &&
         typeof item === 'object' &&
         typeof item.id === 'string' &&
         Array.isArray(item.entries),
-    );
+    ));
   } catch {
-    return [];
+    return (transcriptCache = []);
   }
 }
 
+function cancelPendingTranscript(id: string): void {
+  const pending = pendingTranscripts.get(id);
+  if (!pending) return;
+  if (pending.frame !== undefined) globalThis.cancelAnimationFrame?.(pending.frame);
+  clearTimeout(pending.timer);
+  pendingTranscripts.delete(id);
+}
+
 export function loadRecentTranscript(thread: AgentThread): AgentEntry[] {
+  const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  const pending = pendingTranscripts.get(id);
+  if (pending) return pending.entries.slice();
   return (
-    savedTranscripts().find(
-      (item) => item.id === transcriptId(thread.agent, thread.directory, thread.sessionId),
-    )?.entries ?? []
+    savedTranscripts()
+      .find((item) => item.id === id)
+      ?.entries.slice() ?? []
   );
+}
+
+export function saveRecentTranscriptAfterPaint(thread: AgentThread, entries: AgentEntry[]): void {
+  const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  cancelPendingTranscript(id);
+  const pending: PendingTranscript = {
+    thread,
+    entries: entries.slice(-transcriptLimit),
+    timer: setTimeout(() => persist(), 100),
+  };
+  const persist = () => {
+    if (pendingTranscripts.get(id) !== pending) return;
+    cancelPendingTranscript(id);
+    saveRecentTranscript(pending.thread, pending.entries);
+  };
+  pendingTranscripts.set(id, pending);
+  pending.frame = globalThis.requestAnimationFrame?.(() => {
+    pending.frame = undefined;
+    clearTimeout(pending.timer);
+    pending.timer = setTimeout(persist, 0);
+  });
 }
 
 export function saveRecentTranscript(thread: AgentThread, entries: AgentEntry[]): void {
   const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  cancelPendingTranscript(id);
   const recent: AgentEntry[] = [];
   const encoder = new TextEncoder();
   let remaining = 128 * 1024 - encoder.encode(JSON.stringify({ id, entries: [] })).length;
@@ -436,12 +490,15 @@ export function saveRecentTranscript(thread: AgentThread, entries: AgentEntry[])
   recent.reverse();
   const saved = savedTranscripts().filter((item) => item.id !== id);
   saved.push({ id, entries: recent });
-  setSetting(transcriptKey, JSON.stringify(saved.slice(-threadLimit)));
+  transcriptCache = saved.slice(-threadLimit);
+  setSetting(transcriptKey, JSON.stringify(transcriptCache));
 }
 
 export function forgetRecentTranscript(thread: AgentThread): void {
   const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
-  setSetting(transcriptKey, JSON.stringify(savedTranscripts().filter((item) => item.id !== id)));
+  cancelPendingTranscript(id);
+  transcriptCache = savedTranscripts().filter((item) => item.id !== id);
+  setSetting(transcriptKey, JSON.stringify(transcriptCache));
 }
 
 export function loadAgentThreads(): AgentThread[] {

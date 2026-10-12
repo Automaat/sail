@@ -92,6 +92,7 @@
     loadRecentTranscript,
     restoreEntryTimes,
     saveRecentTranscript,
+    saveRecentTranscriptAfterPaint,
     sessionState,
     takeLiveTranscript,
     trackLiveTranscript,
@@ -1050,19 +1051,18 @@
     if (!updateTimer) updateTimer = setTimeout(flushUpdates, 50);
   }
 
-  function rememberTranscript() {
+  function rememberTranscript(afterPaint = false) {
     if (!activeSessionId || ephemeral) return;
     flushUpdates();
-    saveRecentTranscript(
-      {
-        agent,
-        directory,
-        sessionId: activeSessionId,
-        title: thread?.title ?? '',
-        updated: Date.now(),
-      },
-      entries,
-    );
+    const snapshot = {
+      agent,
+      directory,
+      sessionId: activeSessionId,
+      title: thread?.title ?? '',
+      updated: Date.now(),
+    };
+    if (afterPaint) saveRecentTranscriptAfterPaint(snapshot, entries);
+    else saveRecentTranscript(snapshot, entries);
   }
 
   async function showEarlier() {
@@ -1304,7 +1304,7 @@
   async function activate(id: string | null) {
     connectAbort?.abort();
     connectAbort = null;
-    rememberTranscript();
+    rememberTranscript(true);
     const previousSessionId = activeSessionId;
     // Opening a native child leaves the parent running too, so its transcript keeps updating.
     if (previousSessionId && previousSessionId !== id && !ephemeral && !showingNativeChild)

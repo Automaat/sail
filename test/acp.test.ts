@@ -19,6 +19,7 @@ import {
   recoverMissingCodexSession,
   restoreEntryTimes,
   saveRecentTranscript,
+  saveRecentTranscriptAfterPaint,
   sessionState,
   takeLiveTranscript,
   trackLiveTranscript,
@@ -552,6 +553,54 @@ void test('recent transcript cache keeps the latest entries within a size budget
     forgetRecentTranscript(thread);
     assert.deepEqual(loadRecentTranscript(thread), []);
   } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
+
+void test('switching threads shows recent entries immediately and persists them after the switch', async () => {
+  const values = new Map<string, string>();
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => void values.set(key, value),
+    },
+  });
+  const thread: AgentThread = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'deferred',
+    title: 'Deferred',
+    updated: 0,
+  };
+  try {
+    saveRecentTranscriptAfterPaint(thread, [{ id: 'first', type: 'assistant', text: 'First' }]);
+
+    assert.deepEqual(
+      loadRecentTranscript(thread).map((entry) => entry.id),
+      ['first'],
+    );
+    assert.equal(values.get('sai-agent-transcript-cache')?.includes('first') ?? false, false);
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(values.get('sai-agent-transcript-cache')?.includes('first'), true);
+
+    saveRecentTranscriptAfterPaint(thread, [{ id: 'stale', type: 'assistant', text: 'Stale' }]);
+    saveRecentTranscript(thread, [{ id: 'latest', type: 'assistant', text: 'Latest' }]);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(
+      loadRecentTranscript(thread).map((entry) => entry.id),
+      ['latest'],
+    );
+
+    saveRecentTranscriptAfterPaint(thread, [{ id: 'deleted', type: 'assistant', text: 'Deleted' }]);
+    forgetRecentTranscript(thread);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(loadRecentTranscript(thread), []);
+  } finally {
+    forgetRecentTranscript(thread);
     if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
     else Reflect.deleteProperty(globalThis, 'localStorage');
   }

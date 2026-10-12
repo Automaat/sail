@@ -236,6 +236,7 @@
   }
 
   async function refreshWorktreeStorage(retry = false) {
+    if (worktreeStorageLoading) return;
     worktreeStorageLoading = true;
     worktreeStorageError = '';
     try {
@@ -979,7 +980,6 @@
         const stop = await listen<SettingsSnapshot>(settingsState, (event) => {
           snapshot = event.payload;
           if (selectedSection === 'agents') {
-            void refreshWorktreeStorage();
             if (snapshot.directory !== hookDirectory) void inspectHooks(snapshot.directory);
             if (snapshot.directory !== integrationDirectory)
               void inspectIntegration(snapshot.directory);
