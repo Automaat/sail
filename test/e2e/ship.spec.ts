@@ -795,14 +795,16 @@ describe('native Ship run history', () => {
     await browser.waitUntil(async () => (await composer.getValue()).trimEnd() === quoted);
     await expect(composer).toBeFocused();
     await composer.setValue('Delayed approval');
-    await $('.agent-actions button').click();
+    await $('.agent-actions button:last-child').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await openShip();
     await openIssue('batch-0');
     await $('.ship-issue-detail .ship-actions').$('button=Reply to worker').click();
     await browser.waitUntil(async () => (await composer.getValue()).trimEnd() === quoted);
-    await expect($('.agent-actions button')).toHaveText(expect.stringContaining('Queue'));
-    await $('.agent-actions button').click();
+    await expect($('.agent-actions button:last-child')).toHaveText(
+      expect.stringContaining('Queue'),
+    );
+    await $('.agent-actions button:last-child').click();
     await expect($('.agent-conversation .queued-messages')).toHaveText(
       expect.stringContaining('Which token?'),
     );
