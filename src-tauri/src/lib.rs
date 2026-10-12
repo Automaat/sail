@@ -232,6 +232,13 @@ mod opencode_config;
 mod owned_processes;
 mod post_turn_checks;
 mod project_knowledge;
+#[cfg(unix)]
+mod scratch_cleanup;
+
+#[cfg(unix)]
+pub fn exec_with_scratch_owner() -> ! {
+    scratch_cleanup::exec_with_scratch_owner()
+}
 mod settings;
 mod shell_command;
 mod ship_actions;
@@ -3229,10 +3236,15 @@ pub fn run() {
             if let Err(error) = diagnostics::init(_app.handle()) {
                 eprintln!("Sail diagnostics unavailable: {error}");
             }
-            if let Ok(cache_directory) = _app.path().app_cache_dir() {
-                worktree_storage::reconcile(&cache_directory);
-                git_overlay::initialize(&cache_directory);
+            let cache_directory = _app.path().app_cache_dir().ok();
+            if let Some(cache_directory) = cache_directory.as_ref() {
+                worktree_storage::reconcile(cache_directory);
+                git_overlay::initialize(cache_directory);
             }
+            #[cfg(unix)]
+            std::thread::spawn(move || {
+                scratch_cleanup::sweep_on_startup(cache_directory.as_deref())
+            });
             let process_directory = _app.path().app_config_dir()?.join("owned-processes");
             owned_processes::init(process_directory).map_err(std::io::Error::other)?;
             browser_agent::start_bridge(_app.handle())?;
@@ -3370,6 +3382,7 @@ pub fn run() {
             acp_terminal::acp_terminal_inspect_wait,
             acp::acp_agents,
             acp::acp_connect,
+            acp::acp_release_owner,
             acp::acp_new_session,
             acp::acp_reset_test_runtimes,
             acp::acp_forget_session,

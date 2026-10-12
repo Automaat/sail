@@ -115,6 +115,13 @@ pub(crate) fn terminal_environment(
     ]
 }
 
+fn owned_build_environment(build_directory: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        ("CARGO_TARGET_DIR", build_directory.join("cargo-target")),
+        ("GOCACHE", build_directory.join("go-cache")),
+    ]
+}
+
 #[cfg(windows)]
 pub(crate) struct WindowsTerminalJob(OwnedHandle);
 
@@ -793,6 +800,12 @@ fn exited_without_reaping(child: &std::process::Child) -> Result<bool, String> {
     Ok(unsafe { status.si_pid() } == child.id() as i32)
 }
 
+pub struct TerminalContext<'a> {
+    pub directory: Option<PathBuf>,
+    pub scratch_owner: Option<&'a str>,
+    pub build_directory: Option<&'a Path>,
+}
+
 pub fn handle(
     app: &AppHandle,
     manager: &AcpTerminalManager,
@@ -800,7 +813,7 @@ pub fn handle(
     profile: CapabilityProfile,
     method: &str,
     params: Value,
-    session_directory: Option<PathBuf>,
+    context: TerminalContext<'_>,
 ) -> Result<Value, String> {
     if method == "terminal/create" {
         let params: CreateParams =
@@ -820,7 +833,8 @@ pub fn handle(
         {
             return Err("Command arguments or environment are invalid.".to_string());
         }
-        let fallback = session_directory
+        let fallback = context
+            .directory
             .ok_or("Unknown agent session.")?
             .canonicalize()
             .map_err(|error| error.to_string())?;
@@ -867,8 +881,22 @@ pub fn handle(
             for variable in params.env {
                 command.env(variable.name, variable.value);
             }
+            #[cfg(unix)]
+            if let Some(owner) = context.scratch_owner {
+                command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
+            } else {
+                command.env_remove("SAIL_SCRATCH_OWNER_IDENTITY");
+            }
+            #[cfg(not(unix))]
+            let _ = context.scratch_owner;
             for (name, value) in terminal_environment(&data_directory, temp_directory) {
                 command.env(name, value);
+            }
+            if let Some(build_directory) = context.build_directory {
+                std::fs::create_dir_all(build_directory).map_err(|error| error.to_string())?;
+                for (name, value) in owned_build_environment(build_directory) {
+                    command.env(name, value);
+                }
             }
             if let Some(overlay) = crate::git_overlay::GitOverlay::ensure(
                 &app.path()
@@ -1820,6 +1848,17 @@ mod tests {
                 "HOME" | "XDG_CONFIG_HOME" | "NPM_CONFIG_CACHE" | "CARGO_HOME"
             )
         }));
+    }
+
+    #[test]
+    fn owned_terminal_build_environment_uses_run_root() {
+        let build = Path::new("/sail-339-worker/build");
+        let environment = owned_build_environment(build);
+        assert_eq!(
+            environment[0],
+            ("CARGO_TARGET_DIR", build.join("cargo-target"))
+        );
+        assert_eq!(environment[1], ("GOCACHE", build.join("go-cache")));
     }
 
     #[cfg(windows)]
