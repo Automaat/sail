@@ -8857,7 +8857,10 @@
   }
 
   function hasActiveAgentSessions(message: string) {
-    return message.startsWith('Worktree has active agent sessions');
+    return (
+      message.startsWith('Worktree has active agent sessions') ||
+      message === 'An agent session is starting in this worktree.'
+    );
   }
 
   async function deleteProjectWorktreeOnce(
@@ -8980,8 +8983,8 @@
     }
     if (retryStop) {
       const stopConfirmed = await confirmInApp(
-        'Agent is running',
-        `An agent is still running in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
+        'Agent is running or starting',
+        `An agent is running or starting in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
         'Stop agent and delete',
         { destructive: true },
       );
