@@ -51,6 +51,7 @@ describe('large diff interaction', () => {
   });
 
   it('keeps the diff usable at large and narrow sizes', async () => {
+    await browser.execute(() => history.replaceState(null, '', '?diff-scale-fixture'));
     await browser.refresh();
     const audit = process.env.SAIL_VISUAL_AUDIT_DIR;
     if (audit) mkdirSync(audit, { recursive: true });
