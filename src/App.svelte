@@ -1277,6 +1277,7 @@
   let inboxError = $state('');
   let inboxDialog: HTMLDialogElement;
   let inboxRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingStatusRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let inboxGeneration = 0;
   // Requests resolved since a refresh started; that refresh's stale list must not bring them back.
   const resolvedDuringRefresh = new SvelteMap<string, number>();
@@ -1671,6 +1672,11 @@
     goToSubagentTarget(direction < 0 ? subagentNav?.previous : subagentNav?.next);
   }
   let answeredPermissions = $state<AnsweredPermission[]>([]);
+  const permissionStatusRevisions = new SvelteMap<string, number>();
+  const pendingStatusRetries = new SvelteMap<
+    string,
+    { agent: AgentId; directory: string; sessionId: string }
+  >();
   // Inbox items can go before their resolution event arrives, so their titles are kept here.
   const permissionTitles = new SvelteMap<string, string>();
   $effect(() => {
@@ -1711,6 +1717,57 @@
         outcome: permissionResolution(params),
       },
     ].slice(-50);
+  }
+  function reconcilePendingSessionStatus(
+    agent: AgentId,
+    worktreeDirectory: string,
+    sessionId: string,
+    pendingSnapshot?: Awaited<ReturnType<typeof acp.pendingInbox>>,
+  ) {
+    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
+    const revision = permissionStatusRevisions.get(key);
+    void (pendingSnapshot ? Promise.resolve(pendingSnapshot) : acp.pendingInbox())
+      .then((pending) => {
+        if (permissionStatusRevisions.get(key) === revision) pendingStatusRetries.delete(key);
+        if (
+          pending.some(
+            (item) =>
+              item.agent === agent &&
+              item.directory === worktreeDirectory &&
+              item.message.params?.sessionId === sessionId,
+          ) ||
+          permissionStatusRevisions.get(key) !== revision
+        )
+          return undefined;
+        nativeSubagents = setNativeSubagentWaiting(
+          nativeSubagents,
+          agent,
+          worktreeDirectory,
+          sessionId,
+          false,
+        );
+        for (const thread of agentThreads.filter(
+          (item) =>
+            item.agent === agent &&
+            item.sessionId === sessionId &&
+            item.directory === worktreeDirectory &&
+            threadAttention[threadKey(item)]?.status === 'waiting',
+        ))
+          updateAgentThreadStatus(thread, 'working');
+        for (const receipt of spawnReceipts.filter(
+          (item) =>
+            item.targetId === `acp:${agent}:${sessionId}` &&
+            item.targetDirectory === worktreeDirectory &&
+            item.state === 'waiting',
+        ))
+          updateSpawnReceipt(receipt.receiptId, { state: 'working' });
+        return undefined;
+      })
+      .catch(() => {
+        if (permissionStatusRevisions.get(key) !== revision) return;
+        pendingStatusRetries.set(key, { agent, directory: worktreeDirectory, sessionId });
+        scheduleInboxRefresh();
+      });
   }
   const shipOwnedThreads = $derived.by(() => {
     const owned = new SvelteSet<string>();
@@ -2415,6 +2472,7 @@
       for (const timer of shipClaimLeaseFenceTimers.values()) clearTimeout(timer);
       shipClaimLeaseFenceTimers.clear();
       clearTimeout(inboxRefreshTimer);
+      clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
       clearInterval(sidebarRefreshTimer);
@@ -8064,7 +8122,17 @@
           )
         : new Map();
     if (generation !== inboxGeneration || disposed) return;
+    clearTimeout(pendingStatusRetryTimer);
+    if (acpResult.status === 'rejected' && pendingStatusRetries.size)
+      pendingStatusRetryTimer = setTimeout(() => scheduleInboxRefresh(), 1000);
     if (acpResult.status === 'fulfilled') {
+      for (const retry of pendingStatusRetries.values())
+        reconcilePendingSessionStatus(
+          retry.agent,
+          retry.directory,
+          retry.sessionId,
+          acpResult.value,
+        );
       for (const pending of acpResult.value) {
         const sessionId = pending.message.params?.sessionId;
         const requestId = pending.message.id;
@@ -11239,6 +11307,22 @@
     const eventDirectory = event.directory ?? event.worktree;
     if (!eventDirectory) return;
     const eventSessionId = event.message.params?.sessionId;
+    const permissionStatusKey =
+      typeof eventSessionId === 'string'
+        ? JSON.stringify([event.agent, eventDirectory, eventSessionId])
+        : null;
+    if (
+      permissionStatusKey &&
+      (event.message.method === 'session/request_permission' ||
+        event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved' ||
+        event.message.method === 'elicitation/create' ||
+        event.message.method === '$/cancel_request')
+    )
+      permissionStatusRevisions.set(
+        permissionStatusKey,
+        (permissionStatusRevisions.get(permissionStatusKey) ?? 0) + 1,
+      );
     const eventThread =
       typeof eventSessionId === 'string'
         ? [...agentThreads, ...nativeChildThreads].find(
@@ -11286,14 +11370,13 @@
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       recordAnsweredPermission(event.agent, eventDirectory, eventSessionId, event.message.params);
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
-      nativeSubagents = setNativeSubagentWaiting(
-        nativeSubagents,
-        event.agent,
-        eventDirectory,
-        eventSessionId,
-        false,
-      );
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved' ||
+        event.message.method === '$/cancel_request') &&
+      typeof eventSessionId === 'string'
+    )
+      reconcilePendingSessionStatus(event.agent, eventDirectory, eventSessionId);
     if (event.message.method === 'session/update') {
       const params = event.message.params;
       const sessionId = params?.sessionId;
@@ -11432,9 +11515,14 @@
         }
       }
     }
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved') &&
+      typeof eventSessionId === 'string'
+    ) {
       // The scheduled refresh lags; the thread header already shows the request answered.
-      const resolvedKey = `acp:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
+      const prefix = event.message.method === 'sail/permission_resolved' ? 'acp' : 'elicitation';
+      const resolvedKey = `${prefix}:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
       resolvedDuringRefresh.set(resolvedKey, inboxGeneration);
       if (inboxItems.some((item) => item.key === resolvedKey))
         inboxItems = inboxItems.filter((item) => item.key !== resolvedKey);
@@ -11444,6 +11532,7 @@
       event.message.method === 'elicitation/create' ||
       event.message.method === '$/cancel_request' ||
       event.message.method === 'sail/permission_resolved' ||
+      event.message.method === 'sail/elicitation_resolved' ||
       event.message.method === 'sail/disconnected'
     )
       scheduleInboxRefresh();
