@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { getSetting, setSetting } from './settings.ts';
+import { getSetting, setSetting, setTranscriptSetting } from './settings.ts';
 import { resourceQueues } from './resource-limits.ts';
 import { acpPlans } from './acp-plans.ts';
 import { forgetPlanningState } from './planning-state.ts';
@@ -493,14 +493,14 @@ export function saveRecentTranscript(thread: AgentThread, entries: AgentEntry[])
   const saved = savedTranscripts().filter((item) => item.id !== id);
   saved.push({ id, entries: recent });
   transcriptCache = saved.slice(-threadLimit);
-  setSetting(transcriptKey, JSON.stringify(transcriptCache));
+  setTranscriptSetting(JSON.stringify(transcriptCache));
 }
 
 export function forgetRecentTranscript(thread: AgentThread): void {
   const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
   cancelPendingTranscript(id);
   transcriptCache = savedTranscripts().filter((item) => item.id !== id);
-  setSetting(transcriptKey, JSON.stringify(transcriptCache));
+  setTranscriptSetting(JSON.stringify(transcriptCache));
 }
 
 export function loadAgentThreads(): AgentThread[] {

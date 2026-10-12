@@ -131,6 +131,43 @@ describe('disk-backed settings', () => {
     );
   });
 
+  it('recovers a transcript that closed before its native write completed', async () => {
+    const key = 'sai-agent-transcript-cache';
+    const pending = 'sail-transcript-cache-pending-v1';
+    const recent = JSON.stringify([{ id: 'recent', entries: [] }]);
+    await browser.tauri.execute(
+      async ({ core }, setting) =>
+        core.invoke('save_setting', { key: setting, value: 'older transcript' }),
+      key,
+    );
+    await browser.execute(
+      (setting, marker, value) => {
+        sessionStorage.setItem('sail-e2e-settings', 'enabled');
+        localStorage.setItem('sail-settings-migrated-v1', '1');
+        localStorage.setItem(setting, value);
+        localStorage.setItem(marker, '1');
+      },
+      key,
+      pending,
+      recent,
+    );
+
+    await browser.refresh();
+    await browser.waitUntil(async () => (await read())[key] === recent, {
+      timeoutMsg: 'The pending transcript was not restored to native settings',
+    });
+    expect(await browser.execute((setting) => localStorage.getItem(setting), key)).toBe(recent);
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute((marker) => localStorage.getItem(marker), pending)) === null,
+      { timeoutMsg: 'The transcript recovery marker was not cleared after the native write' },
+    );
+    await browser.tauri.execute(
+      async ({ core }, setting) => core.invoke('save_setting', { key: setting, value: null }),
+      key,
+    );
+  });
+
   it('migrates existing repositories and restores new preferences after reload', async () => {
     const path = realpathSync(repository);
     await browser.execute((selected) => {
