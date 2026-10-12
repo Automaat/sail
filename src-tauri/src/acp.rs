@@ -461,11 +461,19 @@ struct Connection {
     agent: String,
     profile: CapabilityProfile,
     worktree: PathBuf,
+    owner: Option<String>,
+    #[cfg(unix)]
+    shared_build_directory: Option<PathBuf>,
     _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(unix)]
+    scratch_owner: Option<String>,
+    #[cfg(unix)]
+    runtime_scratch: Mutex<Option<crate::scratch_cleanup::OwnedRuntimeScratch>>,
+    #[cfg(unix)]
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
     stopped: AtomicBool,
+    released_owner: AtomicBool,
     input: Mutex<ChildStdin>,
     pending: Mutex<HashMap<u64, mpsc::Sender<PendingResponse>>>,
     reader_progress: ReaderProgress,
@@ -1403,15 +1411,11 @@ impl Connection {
             .lock()
             .map_err(|error| error.to_string())?;
         if let Ok(mut child) = self.child.lock() {
-            if self.stopped.swap(true, Ordering::AcqRel) {
-                return self
-                    ._storage_lease
-                    .as_ref()
-                    .map_or(Ok(()), |lease| lease.release_clean());
-            }
-            if let Err(error) = stop_process(&mut child) {
-                self.stopped.store(false, Ordering::Release);
-                return Err(error);
+            if !self.stopped.swap(true, Ordering::AcqRel) {
+                if let Err(error) = stop_process(&mut child) {
+                    self.stopped.store(false, Ordering::Release);
+                    return Err(error);
+                }
             }
         } else {
             return Err("Cannot lock agent process for shutdown.".into());
@@ -1421,6 +1425,18 @@ impl Connection {
             .lock()
             .map_err(|_| "Cannot lock agent process watchdog for shutdown.")?
             .stop();
+        #[cfg(unix)]
+        {
+            let mut scratch = self
+                .runtime_scratch
+                .lock()
+                .map_err(|_| "Cannot lock agent runtime scratch for shutdown.")?;
+            if let Some(root) = scratch.as_mut() {
+                root.cleanup_now()
+                    .map_err(|error| format!("Agent runtime scratch cleanup failed: {error}"))?;
+            }
+            scratch.take();
+        }
         if let Some(lease) = &self._storage_lease {
             lease.release_clean()?;
         }
@@ -1428,15 +1444,19 @@ impl Connection {
     }
 
     fn terminate(&self) -> Result<(), String> {
-        self.stop_child()?;
+        let result = self.stop_child();
         self.alive.store(false, Ordering::Release);
         self.ready.notify_all();
-        Ok(())
+        result
     }
 
     fn write(&self, message: &Value) -> Result<(), String> {
         let mut input = self.input.lock().map_err(|error| error.to_string())?;
-        serde_json::to_writer(&mut *input, message).map_err(|error| error.to_string())?;
+        let mut message = message.clone();
+        if let Some(owner) = &self.owner {
+            translate_session_ids(&mut message, owner, true);
+        }
+        serde_json::to_writer(&mut *input, &message).map_err(|error| error.to_string())?;
         input.write_all(b"\n").map_err(|error| error.to_string())?;
         input.flush().map_err(|error| error.to_string())
     }
@@ -1635,6 +1655,52 @@ struct ConnectionKey {
     worktree: PathBuf,
     agent: String,
     profile: CapabilityProfile,
+    owner: Option<String>,
+}
+
+const OWNED_SESSION_PREFIX: &str = "sail-owned:";
+
+fn owned_session_id(owner: &str, wire_id: &str) -> String {
+    format!("{OWNED_SESSION_PREFIX}{owner}:{wire_id}")
+}
+
+fn session_owner(session_id: &str) -> Option<&str> {
+    let rest = session_id.strip_prefix(OWNED_SESSION_PREFIX)?;
+    let (owner, _) = rest.split_once(':')?;
+    Uuid::parse_str(owner).ok()?;
+    Some(owner)
+}
+
+fn translate_session_ids(value: &mut Value, owner: &str, to_wire: bool) {
+    match value {
+        Value::Object(fields) => {
+            for (key, entry) in fields {
+                if matches!(
+                    key.as_str(),
+                    "sessionId" | "subagentSessionId" | "parentSessionId"
+                ) {
+                    if let Some(id) = entry.as_str() {
+                        let prefix = format!("{OWNED_SESSION_PREFIX}{owner}:");
+                        if to_wire {
+                            if let Some(wire_id) = id.strip_prefix(&prefix) {
+                                *entry = Value::String(wire_id.to_string());
+                            }
+                        } else if !id.starts_with(&prefix) {
+                            *entry = Value::String(owned_session_id(owner, id));
+                        }
+                    }
+                } else {
+                    translate_session_ids(entry, owner, to_wire);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                translate_session_ids(item, owner, to_wire);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn worktree_identity(directory: &Path) -> PathBuf {
@@ -1642,10 +1708,20 @@ fn worktree_identity(directory: &Path) -> PathBuf {
 }
 
 fn connection_key(agent: &str, profile: CapabilityProfile, directory: &Path) -> ConnectionKey {
+    connection_key_for_owner(agent, profile, directory, None)
+}
+
+fn connection_key_for_owner(
+    agent: &str,
+    profile: CapabilityProfile,
+    directory: &Path,
+    owner: Option<&str>,
+) -> ConnectionKey {
     ConnectionKey {
         worktree: worktree_identity(directory),
         agent: agent.to_string(),
         profile,
+        owner: owner.map(str::to_string),
     }
 }
 
@@ -1661,6 +1737,8 @@ fn session_directory(runtime: &Connection, session_id: &str) -> Option<String> {
 fn runtime_environment(
     data_directory: &Path,
     temp_directory: &Path,
+    runtime_scratch: Option<&Path>,
+    shared_build_directory: Option<&Path>,
 ) -> Vec<(&'static str, PathBuf)> {
     let mut environment = crate::acp_terminal::terminal_environment(data_directory, temp_directory);
     let shared_download_cache = data_directory
@@ -1668,7 +1746,9 @@ fn runtime_environment(
         .and_then(Path::parent)
         .unwrap_or(data_directory)
         .join("terminal-package-downloads");
-    let build_directory = data_directory.join("build");
+    let build_directory = shared_build_directory
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| runtime_scratch.unwrap_or(data_directory).join("build"));
     environment.extend([
         ("CARGO_TARGET_DIR", build_directory.join("cargo-target")),
         ("GOCACHE", build_directory.join("go-cache")),
@@ -1678,6 +1758,26 @@ fn runtime_environment(
         ("COREPACK_HOME", shared_download_cache.join("corepack")),
     ]);
     environment
+}
+
+#[cfg(unix)]
+fn gate_build_directory(
+    root: &Path,
+    revision: &str,
+    gate_owner: &str,
+    shared_busy: bool,
+) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let revision_key = Sha256::digest(revision.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let shared = root.join("build").join(format!("target-{revision_key}"));
+    if shared_busy {
+        shared.join(format!("concurrent-{gate_owner}"))
+    } else {
+        shared
+    }
 }
 
 fn prepare_runtime_directories(data_directory: &Path, temp_directory: &Path) -> Result<(), String> {
@@ -1992,6 +2092,79 @@ impl AgentManager {
         Ok(())
     }
 
+    fn stop_owner(&self, worktree: &Path, owner: &str) -> Result<(), String> {
+        Uuid::parse_str(owner).map_err(|_| "Invalid agent run owner ID.")?;
+        let worktree = worktree_identity(worktree);
+        let runtimes = self
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .filter(|(key, _)| key.worktree == worktree && key.owner.as_deref() == Some(owner))
+            .map(|(key, runtime)| (key.clone(), Arc::clone(runtime)))
+            .collect::<Vec<_>>();
+        for (key, runtime) in runtimes {
+            if !runtime
+                .prompt_state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .active
+                .is_empty()
+            {
+                return Err("Agent run still has an active turn.".into());
+            }
+            if !runtime
+                .native_subagents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .active_in(&worktree)
+                .is_empty()
+            {
+                return Err("Agent run still has an active native subagent.".into());
+            }
+            #[cfg(unix)]
+            if let Some(root) = runtime
+                .runtime_scratch
+                .lock()
+                .map_err(|error| error.to_string())?
+                .as_ref()
+                .map(|scratch| scratch.path().to_path_buf())
+            {
+                let dependent_gate = self
+                    .0
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .values()
+                    .any(|other| {
+                        !Arc::ptr_eq(other, &runtime)
+                            && other.alive.load(Ordering::Acquire)
+                            && other
+                                .shared_build_directory
+                                .as_ref()
+                                .is_some_and(|directory| directory.starts_with(&root))
+                    });
+                if dependent_gate {
+                    return Err("Agent run still has an active validation gate.".into());
+                }
+            }
+            runtime.released_owner.store(true, Ordering::Release);
+            if let Err(error) = runtime.terminate() {
+                if !runtime.stopped.load(Ordering::Acquire) {
+                    runtime.released_owner.store(false, Ordering::Release);
+                }
+                return Err(error);
+            }
+            let mut agents = self.0.lock().map_err(|error| error.to_string())?;
+            if agents
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &runtime))
+            {
+                agents.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
     pub fn worktree_roots_in(&self, worktree: &Path) -> Result<Vec<PathBuf>, String> {
         let worktree = worktree_identity(worktree);
         let agents = self.0.lock().map_err(|error| error.to_string())?;
@@ -2022,6 +2195,18 @@ impl AgentManager {
             })
             .unwrap_or_default()
     }
+}
+
+#[tauri::command]
+pub async fn acp_release_owner(
+    manager: State<'_, AgentManager>,
+    directory: String,
+    owner: String,
+) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.stop_owner(Path::new(&directory), &owner))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -3654,9 +3839,19 @@ fn connection_for_profile(
     profile: CapabilityProfile,
     directory: &Path,
 ) -> Result<Arc<Connection>, String> {
+    connection_for_owner(manager, id, profile, directory, None)
+}
+
+fn connection_for_owner(
+    manager: &AgentManager,
+    id: &str,
+    profile: CapabilityProfile,
+    directory: &Path,
+    owner: Option<&str>,
+) -> Result<Arc<Connection>, String> {
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     agents
-        .get(&connection_key(id, profile, directory))
+        .get(&connection_key_for_owner(id, profile, directory, owner))
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".into())
@@ -3669,7 +3864,10 @@ fn connection_for_elicitation(
     directory: &Path,
     session_id: &str,
 ) -> Result<Arc<Connection>, String> {
-    let runtime = connection_for_profile(manager, agent, profile, directory)?;
+    let runtime = connection_for_session(manager, agent, session_id, directory)?;
+    if runtime.profile != profile {
+        return Err("Agent session is not connected in this profile and worktree.".into());
+    }
     let sessions = runtime
         .session_profiles
         .lock()
@@ -3724,20 +3922,13 @@ fn connection_for_session(
 ) -> Result<Arc<Connection>, String> {
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     let key = connection_key(id, CapabilityProfile::Build, directory);
-    let runtime = agents.values().find(|runtime| {
-        runtime.agent == id
-            && runtime.worktree == key.worktree
-            && runtime.alive.load(Ordering::Acquire)
-            && runtime
-                .session_profiles
-                .lock()
-                .is_ok_and(|profiles| profiles.contains_key(session_id))
-    });
+    let owner = session_owner(session_id);
     let matches = agents
         .values()
         .filter(|runtime| {
             runtime.agent == id
                 && runtime.worktree == key.worktree
+                && runtime.owner.as_deref() == owner
                 && runtime.alive.load(Ordering::Acquire)
                 && runtime
                     .session_profiles
@@ -3746,8 +3937,9 @@ fn connection_for_session(
         })
         .collect::<Vec<_>>();
     unique_session_owner(matches.iter().map(|runtime| runtime.profile))?;
-    runtime
-        .cloned()
+    matches
+        .first()
+        .map(|runtime| Arc::clone(runtime))
         .ok_or_else(|| "Agent session is not connected in this worktree.".to_string())
 }
 
@@ -3758,12 +3950,14 @@ fn register_session(
     session_id: &str,
     directory: PathBuf,
 ) -> Result<Arc<Connection>, String> {
-    let key = connection_key(agent, profile, &directory);
+    let owner = session_owner(session_id);
+    let key = connection_key_for_owner(agent, profile, &directory, owner);
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     let mut owners = Vec::new();
     for runtime in agents.values().filter(|runtime| {
         runtime.agent == agent
             && runtime.worktree == key.worktree
+            && runtime.owner.as_deref() == owner
             && runtime.alive.load(Ordering::Acquire)
     }) {
         if runtime
@@ -3901,6 +4095,13 @@ fn agent_availability(
         .collect()
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpBuildLease {
+    owner: String,
+    revision: String,
+}
+
 #[tauri::command]
 pub async fn acp_connect(
     app: AppHandle,
@@ -3908,11 +4109,23 @@ pub async fn acp_connect(
     agent: String,
     directory: String,
     profile: Option<String>,
+    owner: Option<String>,
+    build_lease: Option<AcpBuildLease>,
 ) -> Result<Value, String> {
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        connect_blocking(app, &manager, agent, profile, Path::new(&directory))
+        connect_blocking_with_build_lease(
+            app,
+            &manager,
+            agent,
+            profile,
+            Path::new(&directory),
+            owner.as_deref(),
+            build_lease
+                .as_ref()
+                .map(|lease| (lease.owner.as_str(), lease.revision.as_str())),
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -3962,13 +4175,52 @@ fn connect_blocking(
     profile: CapabilityProfile,
     directory: &Path,
 ) -> Result<Value, String> {
+    connect_blocking_owned(app, manager, agent, profile, directory, None)
+}
+
+fn connect_blocking_owned(
+    app: AppHandle,
+    manager: &AgentManager,
+    agent: String,
+    profile: CapabilityProfile,
+    directory: &Path,
+    owner: Option<&str>,
+) -> Result<Value, String> {
+    connect_blocking_with_build_lease(app, manager, agent, profile, directory, owner, None)
+}
+
+fn connect_blocking_with_build_lease(
+    app: AppHandle,
+    manager: &AgentManager,
+    agent: String,
+    profile: CapabilityProfile,
+    directory: &Path,
+    owner: Option<&str>,
+    build_lease: Option<(&str, &str)>,
+) -> Result<Value, String> {
+    if owner.is_some_and(|owner| Uuid::parse_str(owner).is_err()) {
+        return Err("Invalid agent run owner ID.".into());
+    }
+    if build_lease.is_some_and(|(build_owner, revision)| {
+        owner.is_none() || Uuid::parse_str(build_owner).is_err() || revision.is_empty()
+    }) {
+        return Err("Invalid shared build target lease.".into());
+    }
     let worktree = worktree_identity(directory);
     if !worktree.is_dir() {
         return Err("Repository directory does not exist.".into());
     }
     let fence = app.state::<AgentWorktreeFence>().inner().clone();
     fence.begin_session(&worktree, None)?;
-    let result = connect_blocking_inner(app.clone(), manager, agent, profile, &worktree);
+    let result = connect_blocking_inner(
+        app.clone(),
+        manager,
+        agent,
+        profile,
+        &worktree,
+        owner,
+        build_lease,
+    );
     let finish = fence.finish_session(&worktree, None);
     if finish.is_err() {
         manager.stop_worktree(&worktree)?;
@@ -3999,9 +4251,13 @@ fn connect_blocking_inner(
     agent: String,
     profile: CapabilityProfile,
     worktree: &Path,
+    owner: Option<&str>,
+    build_lease: Option<(&str, &str)>,
 ) -> Result<Value, String> {
+    #[cfg(not(unix))]
+    let _ = build_lease;
     let definition = definition(&agent)?;
-    let key = connection_key(&agent, profile, worktree);
+    let key = connection_key_for_owner(&agent, profile, worktree, owner);
     let live = manager
         .0
         .lock()
@@ -4046,6 +4302,34 @@ fn connect_blocking_inner(
         Some(availability) => availability,
         None => agent_availability_for(&app, &agent)?,
     };
+    #[cfg(unix)]
+    let shared_build_directory = build_lease.and_then(|(build_owner, revision)| {
+        let parent = agents.values().find(|runtime| {
+            runtime.worktree == worktree
+                && runtime.owner.as_deref() == Some(build_owner)
+                && runtime.alive.load(Ordering::Acquire)
+        })?;
+        let root = parent
+            .runtime_scratch
+            .lock()
+            .ok()?
+            .as_ref()?
+            .path()
+            .to_path_buf();
+        let base = gate_build_directory(&root, revision, owner.unwrap_or_default(), false);
+        let busy = agents.values().any(|runtime| {
+            runtime.alive.load(Ordering::Acquire)
+                && runtime.shared_build_directory.as_deref() == Some(base.as_path())
+        });
+        Some(gate_build_directory(
+            &root,
+            revision,
+            owner.unwrap_or_default(),
+            busy,
+        ))
+    });
+    #[cfg(not(unix))]
+    let shared_build_directory: Option<PathBuf> = None;
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     #[cfg(feature = "e2e")]
     let test_agent = std::env::var_os("SAIL_ACP_TEST_AGENT");
@@ -4122,6 +4406,11 @@ fn connect_blocking_inner(
     let overlay = crate::git_overlay::GitOverlay::ensure(&cache_directory, worktree)?;
     let (data_directory, storage_lease) =
         crate::register_worktree_storage(&cache_directory, worktree)?;
+    #[cfg(unix)]
+    let mut runtime_scratch = Some(
+        crate::scratch_cleanup::OwnedRuntimeScratch::create()
+            .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
+    );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
     if let Some(temp) = owned_temp.as_ref() {
         if let Some(overlay) = overlay.as_ref() {
@@ -4142,17 +4431,32 @@ fn connect_blocking_inner(
             );
         }
     }
-    for (name, value) in runtime_environment(&data_directory, storage_lease.temp_directory()) {
+    #[cfg(unix)]
+    let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
+    #[cfg(not(unix))]
+    let scratch_path = None;
+    for (name, value) in runtime_environment(
+        &data_directory,
+        storage_lease.temp_directory(),
+        scratch_path,
+        shared_build_directory.as_deref(),
+    ) {
         command.env(name, value);
     }
     if let Some(overlay) = overlay.as_ref() {
         overlay.apply(&mut command);
     }
     command.current_dir(worktree);
+    let retry = crate::background_priority::normal_priority_copy(&command);
     #[cfg(unix)]
-    isolate_agent_process(&mut command);
+    let mut wrapped = crate::scratch_cleanup::wrap_command(&command)
+        .map_err(|error| format!("Could not prepare agent owner: {error}"))?;
+    #[cfg(unix)]
+    isolate_agent_process(&mut wrapped);
+    #[cfg(not(unix))]
+    let mut wrapped = command;
     storage_lease.prepare_process_start()?;
-    let spawn = command
+    let spawn = wrapped
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4165,7 +4469,10 @@ fn connect_blocking_inner(
             "Background priority launch failed for {}: {error}; retrying at normal priority",
             definition.name
         );
-        let mut retry = crate::background_priority::normal_priority_copy(&command);
+        #[cfg(unix)]
+        let mut retry = crate::scratch_cleanup::wrap_command(&retry)?;
+        #[cfg(not(unix))]
+        let mut retry = retry;
         #[cfg(unix)]
         isolate_agent_process(&mut retry);
         retry
@@ -4182,6 +4489,15 @@ fn connect_blocking_inner(
         }
     };
     storage_lease.mark_started();
+    #[cfg(unix)]
+    if let Some(scratch) = runtime_scratch.as_mut() {
+        if let Err(error) = scratch.mark_owner(child.id()) {
+            let _ = stop_process(&mut child);
+            return Err(format!("Could not record runtime scratch owner: {error}"));
+        }
+    }
+    #[cfg(unix)]
+    let scratch_owner = crate::scratch_cleanup::owner_identity_for_pid(child.id());
     if !is_test_agent {
         observe_agent_with_reef(&agent, child.id());
     }
@@ -4212,11 +4528,19 @@ fn connect_blocking_inner(
         agent: agent.clone(),
         profile,
         worktree: worktree.to_path_buf(),
+        owner: owner.map(str::to_string),
+        #[cfg(unix)]
+        shared_build_directory,
         _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
         #[cfg(unix)]
+        scratch_owner,
+        #[cfg(unix)]
+        runtime_scratch: Mutex::new(runtime_scratch),
+        #[cfg(unix)]
         watchdog: Mutex::new(watchdog),
         stopped: AtomicBool::new(false),
+        released_owner: AtomicBool::new(false),
         input: Mutex::new(input),
         pending: Mutex::new(HashMap::new()),
         reader_progress: ReaderProgress::default(),
@@ -4263,6 +4587,9 @@ fn connect_blocking_inner(
                     continue;
                 };
                 message = translated;
+            }
+            if let Some(owner) = &reader.owner {
+                translate_session_ids(&mut message, owner, false);
             }
             if message
                 .get("method")
@@ -4407,6 +4734,22 @@ fn connect_blocking_inner(
                                     .or_else(|| runtime.pending_directory.lock().ok()?.clone());
                                 let manager =
                                     app.state::<crate::acp_terminal::AcpTerminalManager>();
+                                #[cfg(unix)]
+                                let scratch_owner = runtime.scratch_owner.as_deref();
+                                #[cfg(not(unix))]
+                                let scratch_owner = None;
+                                #[cfg(unix)]
+                                let build_directory =
+                                    runtime.shared_build_directory.clone().or_else(|| {
+                                        runtime
+                                            .runtime_scratch
+                                            .lock()
+                                            .ok()?
+                                            .as_ref()
+                                            .map(|scratch| scratch.path().join("build"))
+                                    });
+                                #[cfg(not(unix))]
+                                let build_directory = None::<PathBuf>;
                                 let session_id = params
                                     .get("sessionId")
                                     .and_then(Value::as_str)
@@ -4419,7 +4762,11 @@ fn connect_blocking_inner(
                                         runtime.profile,
                                         &method,
                                         params,
-                                        directory,
+                                        crate::acp_terminal::TerminalContext {
+                                            directory,
+                                            scratch_owner,
+                                            build_directory: build_directory.as_deref(),
+                                        },
                                     )
                                 };
                                 let result = if method == "terminal/create" {
@@ -4618,7 +4965,8 @@ fn connect_blocking_inner(
                 worktree: Some(reader.worktree.to_string_lossy().into_owned()),
                 message: json!({"method":"sail/disconnected","params":{
                     "profile":profile.as_str(),"sessionIds":session_ids,
-                    "sessionDirectories":session_directories
+                    "sessionDirectories":session_directories,
+                    "releasedOwner":reader.released_owner.load(Ordering::Acquire)
                 }}),
             },
         );
@@ -4642,12 +4990,48 @@ fn connect_blocking_inner(
         let _ = runtime.terminate();
         return Err("Agent does not support ACP v1.".into());
     }
+    if let Err(error) = require_owned_restore(&result, owner, definition.name) {
+        let _ = runtime.terminate();
+        return Err(error);
+    }
     *runtime
         .capabilities
         .lock()
         .map_err(|error| error.to_string())? = result.clone();
     runtime.ready.notify_all();
     Ok(result)
+}
+
+fn provider_can_restore_session(capabilities: &Value) -> bool {
+    capabilities.pointer("/agentCapabilities/loadSession") == Some(&Value::Bool(true))
+        || capabilities
+            .pointer("/agentCapabilities/sessionCapabilities/resume")
+            .is_some_and(Value::is_object)
+}
+
+fn require_owned_restore(
+    capabilities: &Value,
+    owner: Option<&str>,
+    provider: &str,
+) -> Result<(), String> {
+    if owner.is_some() && !provider_can_restore_session(capabilities) {
+        return Err(format!(
+            "{provider} does not advertise session restore. Its Ship run was not started; use a provider with session/load or session/resume."
+        ));
+    }
+    Ok(())
+}
+
+fn provider_supports_restore_method(capabilities: &Value, method: &str) -> bool {
+    match method {
+        "session/load" => {
+            capabilities.pointer("/agentCapabilities/loadSession") == Some(&Value::Bool(true))
+        }
+        "session/resume" => capabilities
+            .pointer("/agentCapabilities/sessionCapabilities/resume")
+            .is_some_and(Value::is_object),
+        _ => false,
+    }
 }
 
 #[tauri::command]
@@ -4772,6 +5156,7 @@ pub struct AcpNewSessionParams {
     cwd: String,
     native_generation: Option<u64>,
     profile: Option<String>,
+    owner: Option<String>,
 }
 
 #[tauri::command]
@@ -4787,6 +5172,7 @@ pub async fn acp_new_session(
         cwd,
         native_generation,
         profile,
+        owner,
     } = params;
     if !PathBuf::from(&cwd).is_dir() {
         return Err("Repository directory does not exist.".into());
@@ -4796,14 +5182,16 @@ pub async fn acp_new_session(
     let browser = browser.inner().clone();
     let fence = fence.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        connect_blocking(
+        connect_blocking_owned(
             app.clone(),
             &manager,
             agent.clone(),
             profile,
             Path::new(&cwd),
+            owner.as_deref(),
         )?;
-        let runtime = connection_for_profile(&manager, &agent, profile, Path::new(&cwd))?;
+        let runtime =
+            connection_for_owner(&manager, &agent, profile, Path::new(&cwd), owner.as_deref())?;
         let config = browser.config_for_profile(
             &cwd,
             None,
@@ -5052,8 +5440,13 @@ pub async fn acp_forget_session(
         CapabilityProfile::Build,
         CapabilityProfile::Release,
     ] {
-        let Ok(runtime) = connection_for_profile(&manager, &agent, profile, Path::new(&directory))
-        else {
+        let Ok(runtime) = connection_for_owner(
+            &manager,
+            &agent,
+            profile,
+            Path::new(&directory),
+            session_owner(&session_id),
+        ) else {
             continue;
         };
         let waiting = Arc::clone(&runtime);
@@ -5159,7 +5552,14 @@ pub async fn acp_begin_session_restore(
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        connect_blocking(app, &manager, agent.clone(), profile, Path::new(&cwd))?;
+        connect_blocking_owned(
+            app,
+            &manager,
+            agent.clone(),
+            profile,
+            Path::new(&cwd),
+            session_owner(&session_id),
+        )?;
         let runtime = manager.with_current_forget_generation(
             &agent,
             &cwd,
@@ -5318,13 +5718,19 @@ async fn restore_session(
     let manager = manager.inner().clone();
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        connect_blocking(
+        let capabilities = connect_blocking_owned(
             app.clone(),
             &manager,
             agent.clone(),
             profile,
             Path::new(&cwd),
+            session_owner(&session_id),
         )?;
+        if !provider_supports_restore_method(&capabilities, method) {
+            return Err(format!(
+                "The provider no longer supports {method}. The saved conversation remains available; install a compatible provider version or start a new thread."
+            ));
+        }
         let runtime = manager.with_current_forget_generation(
             &agent,
             &cwd,
@@ -6936,7 +7342,13 @@ time.sleep(10)
         lease.mark_started();
         let artifact = lease.temp_directory().join("artifact");
         std::fs::write(&artifact, "retain").unwrap();
-        let mut runtime = test_runtime("claude", CapabilityProfile::Build, &worktree, "session");
+        let mut runtime = test_runtime(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            None,
+        );
         Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
 
         runtime.record_process_cleanup("session", false).unwrap();
@@ -7055,12 +7467,27 @@ time.sleep(10)
         profile: CapabilityProfile,
         worktree: &Path,
         session_id: &str,
+        owner: Option<&str>,
     ) -> Arc<Connection> {
-        test_runtime_with_child(
+        test_runtime_with_build(agent, profile, worktree, session_id, owner, None)
+    }
+
+    #[cfg(unix)]
+    fn test_runtime_with_build(
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_id: &str,
+        owner: Option<&str>,
+        build_directory: Option<PathBuf>,
+    ) -> Arc<Connection> {
+        test_runtime_with_child_and_build(
             agent,
             profile,
             worktree,
             session_id,
+            owner,
+            build_directory,
             super::spawn_test_session_process(),
         )
     }
@@ -7071,6 +7498,19 @@ time.sleep(10)
         profile: CapabilityProfile,
         worktree: &Path,
         session_id: &str,
+        child: Child,
+    ) -> Arc<Connection> {
+        test_runtime_with_child_and_build(agent, profile, worktree, session_id, None, None, child)
+    }
+
+    #[cfg(unix)]
+    fn test_runtime_with_child_and_build(
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_id: &str,
+        owner: Option<&str>,
+        build_directory: Option<PathBuf>,
         mut child: Child,
     ) -> Arc<Connection> {
         let input = child.stdin.take().expect("test runtime stdin");
@@ -7079,11 +7519,19 @@ time.sleep(10)
         Arc::new(Connection {
             agent: agent.to_owned(),
             profile,
-            worktree: worktree.to_path_buf(),
+            // Production connect stores the canonical worktree identity. macOS temp paths
+            // often pass through /var -> /private/var, so the test runtime must match it.
+            worktree: super::worktree_identity(worktree),
+            owner: owner.map(str::to_string),
+            #[cfg(unix)]
+            shared_build_directory: build_directory,
             _storage_lease: None,
             child: Mutex::new(child),
+            scratch_owner: None,
+            runtime_scratch: Mutex::new(None),
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
+            released_owner: AtomicBool::new(false),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
@@ -7129,6 +7577,7 @@ time.sleep(10)
             CapabilityProfile::Build,
             Path::new("/worktree"),
             "session",
+            None,
         );
         let token = runtime.begin_restore("session").unwrap()["restoreToken"]
             .as_str()
@@ -7188,6 +7637,7 @@ time.sleep(10)
             CapabilityProfile::Build,
             Path::new("/worktree"),
             "session",
+            None,
         );
         let token = runtime.begin_restore("session").unwrap()["restoreToken"]
             .as_str()
@@ -7236,7 +7686,13 @@ time.sleep(10)
     #[test]
     fn restore_finalizer_releases_claim_after_failed_load_forgets_session() {
         let directory = Path::new("/worktree");
-        let runtime = test_runtime("claude", CapabilityProfile::Build, directory, "session");
+        let runtime = test_runtime(
+            "claude",
+            CapabilityProfile::Build,
+            directory,
+            "session",
+            None,
+        );
         let manager = AgentManager::default();
         manager.0.lock().unwrap().insert(
             connection_key("claude", CapabilityProfile::Build, directory),
@@ -7273,12 +7729,16 @@ time.sleep(10)
         let cache = scratch.join("app-cache");
         let first_data = crate::acp_terminal::worktree_data_directory(&cache, &first);
         let second_data = crate::acp_terminal::worktree_data_directory(&cache, &second);
+        let first_scratch = scratch.join("first-runtime");
+        let second_scratch = scratch.join("second-runtime");
         let first_temp = first_data.join("turn-temp/run-one");
         let second_temp = second_data.join("turn-temp/run-two");
         prepare_runtime_directories(&first_data, &first_temp).unwrap();
         prepare_runtime_directories(&second_data, &second_temp).unwrap();
-        let first_environment = runtime_environment(&first_data, &first_temp);
-        let second_environment = runtime_environment(&second_data, &second_temp);
+        let first_environment =
+            runtime_environment(&first_data, &first_temp, Some(&first_scratch), None);
+        let second_environment =
+            runtime_environment(&second_data, &second_temp, Some(&second_scratch), None);
         let path = |environment: &[(&str, PathBuf)], name| {
             environment
                 .iter()
@@ -7299,6 +7759,11 @@ time.sleep(10)
                 path(&second_environment, name)
             );
         }
+        assert_eq!(
+            path(&first_environment, "CARGO_TARGET_DIR"),
+            first_scratch.join("build/cargo-target")
+        );
+        assert_eq!(path(&first_environment, "TMPDIR"), first_temp);
         for directory in [
             first_temp.clone(),
             first_data.join("cache"),
@@ -7340,12 +7805,14 @@ time.sleep(10)
             CapabilityProfile::Build,
             &worktree,
             "build-session",
+            None,
         );
         let review = test_runtime(
             "codex",
             CapabilityProfile::Review,
             &worktree,
             "review-session",
+            None,
         );
         let manager = AgentManager::default();
         manager.0.lock().unwrap().insert(
@@ -7435,10 +7902,16 @@ time.sleep(10)
                 agent: "codex".into(),
                 profile: CapabilityProfile::Build,
                 worktree: worktree.to_path_buf(),
+                owner: None,
+                #[cfg(unix)]
+                shared_build_directory: None,
                 _storage_lease: None,
                 child: Mutex::new(child),
+                scratch_owner: None,
+                runtime_scratch: Mutex::new(None),
                 watchdog: Mutex::new(watchdog),
                 stopped: AtomicBool::new(false),
+                released_owner: AtomicBool::new(false),
                 input: Mutex::new(input),
                 pending: Mutex::new(HashMap::new()),
                 reader_progress: ReaderProgress::default(),
@@ -7508,6 +7981,271 @@ time.sleep(10)
         ));
         std::fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn provider_local_session_ids_remain_distinct_across_runs() {
+        let first = "0d66d3a1-5c47-45d1-8c3d-4a789f129001";
+        let second = "0d66d3a1-5c47-45d1-8c3d-4a789f129002";
+        let mut first_event =
+            json!({"params":{"sessionId":"session-1","update":{"subagentSessionId":"child-1"}}});
+        let mut second_event = first_event.clone();
+
+        translate_session_ids(&mut first_event, first, false);
+        translate_session_ids(&mut second_event, second, false);
+
+        assert_eq!(
+            first_event["params"]["sessionId"],
+            "sail-owned:0d66d3a1-5c47-45d1-8c3d-4a789f129001:session-1"
+        );
+        assert_eq!(
+            second_event["params"]["sessionId"],
+            "sail-owned:0d66d3a1-5c47-45d1-8c3d-4a789f129002:session-1"
+        );
+        assert_eq!(
+            first_event["params"]["update"]["subagentSessionId"],
+            "sail-owned:0d66d3a1-5c47-45d1-8c3d-4a789f129001:child-1"
+        );
+        translate_session_ids(&mut first_event, first, true);
+        assert_eq!(first_event["params"]["sessionId"], "session-1");
+        assert_eq!(
+            first_event["params"]["update"]["subagentSessionId"],
+            "child-1"
+        );
+    }
+
+    #[test]
+    fn run_launch_requires_a_restorable_provider_without_changing_normal_chat() {
+        let unsupported = json!({"agentCapabilities":{}});
+        let load = json!({"agentCapabilities":{"loadSession":true}});
+        let resume = json!({"agentCapabilities":{"sessionCapabilities":{"resume":{}}}});
+        let owner = "0d66d3a1-5c47-45d1-8c3d-4a789f129001";
+
+        assert!(require_owned_restore(&unsupported, None, "Test agent").is_ok());
+        assert!(require_owned_restore(&load, Some(owner), "Test agent").is_ok());
+        assert!(require_owned_restore(&resume, Some(owner), "Test agent").is_ok());
+        assert_eq!(
+            require_owned_restore(&unsupported, Some(owner), "Test agent").unwrap_err(),
+            "Test agent does not advertise session restore. Its Ship run was not started; use a provider with session/load or session/resume."
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sequential_gates_reuse_a_revision_target_and_concurrent_gates_do_not() {
+        let root = scratch("shared-gate-target");
+        let first = gate_build_directory(&root, "revision-a", "gate-1", false);
+        let repeated = gate_build_directory(&root, "revision-a", "gate-2", false);
+        let concurrent = gate_build_directory(&root, "revision-a", "gate-3", true);
+        let changed = gate_build_directory(&root, "revision-b", "gate-4", false);
+        assert_eq!(first, repeated);
+        assert_ne!(first, concurrent);
+        assert_ne!(first, changed);
+        assert!(concurrent.starts_with(&first));
+        let environment = runtime_environment(
+            &root,
+            &root.join("turn-temp"),
+            Some(&root.join("gate")),
+            Some(&first),
+        );
+        assert!(environment.contains(&("CARGO_TARGET_DIR", first.join("cargo-target"))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_run_keeps_shared_target_until_its_gate_finishes() {
+        let worktree_root = scratch("shared-gate-owner");
+        let worktree = worktree_root.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let worker_owner = "0d66d3a1-5c47-45d1-8c3d-4a789f129001";
+        let gate_owner = "0d66d3a1-5c47-45d1-8c3d-4a789f129002";
+        let worker = test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &worktree,
+            &owned_session_id(worker_owner, "worker"),
+            Some(worker_owner),
+        );
+        let scratch = crate::scratch_cleanup::OwnedRuntimeScratch::create().unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        *worker.runtime_scratch.lock().unwrap() = Some(scratch);
+        let build = gate_build_directory(&scratch_path, "revision-a", gate_owner, false);
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("artifact"), "reused build output").unwrap();
+        let gate = test_runtime_with_build(
+            "codex",
+            CapabilityProfile::Review,
+            &worktree,
+            &owned_session_id(gate_owner, "gate"),
+            Some(gate_owner),
+            Some(build),
+        );
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key_for_owner(
+                "codex",
+                CapabilityProfile::Build,
+                &worktree,
+                Some(worker_owner),
+            ),
+            Arc::clone(&worker),
+        );
+        manager.0.lock().unwrap().insert(
+            connection_key_for_owner(
+                "codex",
+                CapabilityProfile::Review,
+                &worktree,
+                Some(gate_owner),
+            ),
+            Arc::clone(&gate),
+        );
+        assert_eq!(
+            manager.stop_owner(&worktree, worker_owner).unwrap_err(),
+            "Agent run still has an active validation gate."
+        );
+        assert!(scratch_path.exists());
+        manager.stop_owner(&worktree, gate_owner).unwrap();
+        manager.stop_owner(&worktree, worker_owner).unwrap();
+        assert!(!scratch_path.exists());
+        std::fs::remove_dir_all(worktree_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_owner_release_waits_for_turns_and_native_children() {
+        let root = scratch("run-owner-release");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let owner = "0d66d3a1-5c47-45d1-8c3d-4a789f129001";
+        let session = owned_session_id(owner, "session-1");
+        let child = owned_session_id(owner, "child-1");
+        let runtime = test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &worktree,
+            &session,
+            Some(owner),
+        );
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key_for_owner("codex", CapabilityProfile::Build, &worktree, Some(owner)),
+            Arc::clone(&runtime),
+        );
+        runtime.prompt_state.lock().unwrap().active.insert(
+            session.clone(),
+            ActivePrompt {
+                turn_id: "turn-1".into(),
+                text: "first request".into(),
+                memory_capture: crate::memory_capture::TurnCapture::default(),
+                last_agent_message: String::new(),
+                agent_message_open: false,
+                agent_message_overflow: false,
+                known_tool_calls: HashSet::new(),
+            },
+        );
+
+        assert_eq!(
+            manager.stop_owner(&worktree, owner).unwrap_err(),
+            "Agent run still has an active turn."
+        );
+        assert!(runtime.alive.load(Ordering::Acquire));
+        runtime.prompt_state.lock().unwrap().active.remove(&session);
+        runtime.prompt_state.lock().unwrap().active.insert(
+            session.clone(),
+            ActivePrompt {
+                turn_id: "turn-2".into(),
+                text: "follow-up request".into(),
+                memory_capture: crate::memory_capture::TurnCapture::default(),
+                last_agent_message: String::new(),
+                agent_message_open: false,
+                agent_message_overflow: false,
+                known_tool_calls: HashSet::new(),
+            },
+        );
+        runtime
+            .cancelled_prompts
+            .lock()
+            .unwrap()
+            .insert("turn-2".into());
+        assert_eq!(
+            manager.stop_owner(&worktree, owner).unwrap_err(),
+            "Agent run still has an active turn."
+        );
+        runtime.prompt_state.lock().unwrap().active.remove(&session);
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .spawn(&session, &child, worktree.clone());
+        assert_eq!(
+            manager.stop_owner(&worktree, owner).unwrap_err(),
+            "Agent run still has an active native subagent."
+        );
+        assert!(runtime.alive.load(Ordering::Acquire));
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .update(&child, "completed");
+
+        manager.stop_owner(&worktree, owner).unwrap();
+
+        assert!(!runtime.alive.load(Ordering::Acquire));
+        assert!(manager.0.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_provider_wire_id_routes_to_its_own_run() {
+        let root = scratch("run-session-route");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let first = "0d66d3a1-5c47-45d1-8c3d-4a789f129001";
+        let second = "0d66d3a1-5c47-45d1-8c3d-4a789f129002";
+        let first_id = owned_session_id(first, "session-1");
+        let second_id = owned_session_id(second, "session-1");
+        let first_runtime = test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &worktree,
+            &first_id,
+            Some(first),
+        );
+        let second_runtime = test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &worktree,
+            &second_id,
+            Some(second),
+        );
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key_for_owner("codex", CapabilityProfile::Build, &worktree, Some(first)),
+            Arc::clone(&first_runtime),
+        );
+        manager.0.lock().unwrap().insert(
+            connection_key_for_owner("codex", CapabilityProfile::Build, &worktree, Some(second)),
+            Arc::clone(&second_runtime),
+        );
+
+        assert!(Arc::ptr_eq(
+            &connection_for_session(&manager, "codex", &first_id, &worktree).unwrap(),
+            &first_runtime
+        ));
+        assert!(Arc::ptr_eq(
+            &connection_for_session(&manager, "codex", &second_id, &worktree).unwrap(),
+            &second_runtime
+        ));
+        manager.stop_owner(&worktree, first).unwrap();
+        assert!(second_runtime.alive.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(
+            &connection_for_session(&manager, "codex", &second_id, &worktree).unwrap(),
+            &second_runtime
+        ));
+        manager.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8074,10 +8812,16 @@ mod native_subagent_fence_tests {
             agent: "opencode".into(),
             profile: CapabilityProfile::Build,
             worktree: PathBuf::from("/worktree"),
+            owner: None,
+            #[cfg(unix)]
+            shared_build_directory: None,
             _storage_lease: None,
             child: Mutex::new(child),
+            scratch_owner: None,
+            runtime_scratch: Mutex::new(None),
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
+            released_owner: AtomicBool::new(false),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
