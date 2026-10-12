@@ -78,6 +78,7 @@
     onselectdefault: (path: string) => void;
     onselectthread: (key: string) => void;
     onremovethread: (thread: AgentThread) => void;
+    oncopied: () => void;
     onaddrepository: (groupID: string | null) => void;
     onaddgroup: (name: string) => void;
     onrenamegroup: (id: string, name: string) => void;
@@ -139,6 +140,7 @@
     onselectdefault,
     onselectthread,
     onremovethread,
+    oncopied,
     onaddrepository,
     onaddgroup,
     onrenamegroup,
@@ -158,6 +160,7 @@
   let addGroupButton: HTMLButtonElement;
   let groupNameInput = $state<HTMLInputElement>();
   let menu = $state<MenuTarget | null>(null);
+  let copyError = $state(false);
   let menuElement = $state<HTMLDivElement>();
   let menuX = $state(0);
   let menuY = $state(0);
@@ -456,6 +459,7 @@
 
   function closeMenu(restoreFocus = false) {
     menu = null;
+    copyError = false;
     if (restoreFocus) menuTrigger?.focus();
     menuTrigger = null;
   }
@@ -475,6 +479,7 @@
       return;
     }
     menu = target;
+    copyError = false;
     menuTrigger =
       trigger ??
       (event.target instanceof Element ? event.target.closest<HTMLElement>('button') : null);
@@ -503,6 +508,16 @@
             ? (index + 1) % items.length
             : (index - 1 + items.length) % items.length;
     items[next].focus();
+  }
+
+  async function copySessionId(thread: AgentThread) {
+    try {
+      await navigator.clipboard.writeText(thread.sessionId);
+      closeMenu();
+      oncopied();
+    } catch {
+      copyError = true;
+    }
   }
 
   function repositoryName(path: string) {
@@ -1471,6 +1486,11 @@
       >
     {:else if target.kind === 'agent'}
       <div class="project-menu-title" title={target.thread.title}>{target.thread.title}</div>
+      <button role="menuitem" onclick={() => void copySessionId(target.thread)}
+        >Copy session ID</button
+      >
+      {#if copyError}<div role="alert">Could not copy session ID</div>{/if}
+      <div class="project-menu-divider"></div>
       <button
         role="menuitem"
         class="danger"
