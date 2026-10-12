@@ -3258,6 +3258,7 @@ pub fn run() {
             diagnostics::diagnostic_event,
             worktree_storage_cleanup_status,
             retry_worktree_storage_cleanup,
+            clean_pending_worktree_temp,
             settings::reset_test_settings,
             settings::load_settings,
             settings::migrate_settings,
@@ -3481,11 +3482,29 @@ fn worktree_storage_cleanup_status(
 fn retry_worktree_storage_cleanup(
     app: tauri::AppHandle,
 ) -> Result<Vec<worktree_storage::CleanupPending>, String> {
+    app.state::<acp::AgentManager>()
+        .retry_turn_temp_cleanup(&app);
     let cache = app
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
     Ok(worktree_storage::retry_cleanup(&cache))
+}
+
+#[tauri::command]
+fn clean_pending_worktree_temp(
+    app: tauri::AppHandle,
+    token: String,
+    confirmed_unused: bool,
+) -> Result<Vec<worktree_storage::CleanupPending>, String> {
+    if !confirmed_unused {
+        return Err("Confirm that no process is using this temporary data.".into());
+    }
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    worktree_storage::clean_pending_temp(&cache, &token)
 }
 
 #[cfg(test)]
