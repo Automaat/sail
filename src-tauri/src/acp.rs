@@ -91,6 +91,8 @@ pub struct NativeSubagentSnapshot {
     parent_session_id: String,
     directory: String,
     outcome: String,
+    task_identity: String,
+    task_turn_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -105,6 +107,8 @@ struct NativeSubagentState {
     parent_session_id: String,
     directory: PathBuf,
     outcome: String,
+    task_verified: bool,
+    task_turn_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -122,7 +126,21 @@ impl NativeSubagentRegistry {
                 parent_session_id: parent_session_id.to_string(),
                 directory,
                 outcome: "working".into(),
+                task_verified: false,
+                task_turn_id: None,
             });
+    }
+
+    fn task_scope(&mut self, session_id: &str, verified: bool, live: bool) {
+        if let Some(entry) = self.0.get_mut(session_id) {
+            entry.task_verified = verified;
+            if verified && live && entry.outcome == "working" && entry.task_turn_id.is_none() {
+                entry.task_turn_id = Some(Uuid::new_v4().to_string());
+            }
+            if !verified || !live {
+                entry.task_turn_id = None;
+            }
+        }
     }
 
     fn update(&mut self, session_id: &str, outcome: &str) {
@@ -135,6 +153,9 @@ impl NativeSubagentRegistry {
             _ => "unknown",
         }
         .into();
+        if entry.outcome != "working" {
+            entry.task_turn_id = None;
+        }
     }
 
     fn active_in(&self, directory: &Path) -> Vec<String> {
@@ -167,6 +188,13 @@ impl NativeSubagentRegistry {
                 parent_session_id: entry.parent_session_id.clone(),
                 directory: entry.directory.to_string_lossy().into_owned(),
                 outcome: entry.outcome.clone(),
+                task_identity: if entry.task_verified {
+                    "verified"
+                } else {
+                    "observed"
+                }
+                .into(),
+                task_turn_id: entry.task_turn_id.clone(),
             })
             .collect()
     }
@@ -2002,13 +2030,31 @@ impl AgentManager {
         let agents = self.0.lock().map_err(|error| error.to_string())?;
         let mut snapshots = Vec::new();
         for (key, runtime) in agents.iter() {
-            snapshots.extend(
-                runtime
-                    .native_subagents
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .snapshots(&key.agent, key.profile, directory),
-            );
+            let prompts = runtime
+                .prompt_state
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let children = runtime
+                .native_subagents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .snapshots(&key.agent, key.profile, directory);
+            for mut child in children {
+                if !runtime.alive.load(Ordering::Acquire) {
+                    child.task_turn_id = None;
+                    if !matches!(
+                        child.outcome.as_str(),
+                        "completed" | "failed" | "interrupted"
+                    ) {
+                        child.outcome = "unknown".into();
+                    }
+                } else if child.task_identity == "verified" {
+                    if let Some(prompt) = prompts.active.get(&child.session_id) {
+                        child.task_turn_id = Some(prompt.turn_id.clone());
+                    }
+                }
+                snapshots.push(child);
+            }
         }
         snapshots.sort_by(|left, right| {
             (&left.agent, &left.session_id).cmp(&(&right.agent, &right.session_id))
@@ -3487,6 +3533,22 @@ pub async fn acp_activity(
                 &directories,
                 &permission_state.pending,
             );
+            if runtime.alive.load(Ordering::Acquire) {
+                let native = runtime
+                    .native_subagents
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                if let Some(item) = activity.get_mut(&runtime.agent) {
+                    for (session, child) in &native.0 {
+                        if let Some(turn) = &child.task_turn_id {
+                            item.active_turns
+                                .entry(session.clone())
+                                .or_insert_with(|| turn.clone());
+                            item.active.push(session.clone());
+                        }
+                    }
+                }
+            }
         }
         Ok(activity)
     })
@@ -4669,10 +4731,42 @@ fn connect_blocking_inner(
                                     directory.clone(),
                                 ) {
                                     Ok(owner) => {
+                                        let parent_live =
+                                            reader.prompt_state.lock().ok().is_some_and(
+                                                |prompts| prompts.active.contains_key(parent_id),
+                                            );
                                         if let (Ok(mut fence), Ok(mut native)) =
                                             (worktree_fence.0.lock(), owner.native_subagents.lock())
                                         {
+                                            let live = parent_live
+                                                || native.0.get(parent_id).is_some_and(|parent| {
+                                                    parent.task_turn_id.is_some()
+                                                });
                                             native.spawn(parent_id, child_id, directory.clone());
+                                            native.task_scope(
+                                                child_id,
+                                                agent_id == "opencode",
+                                                live,
+                                            );
+                                            let provider_id = (agent_id == "opencode").then(|| {
+                                                reader
+                                                    .owner
+                                                    .as_ref()
+                                                    .and_then(|owner| {
+                                                        child_id.strip_prefix(&format!(
+                                                            "{OWNED_SESSION_PREFIX}{owner}:"
+                                                        ))
+                                                    })
+                                                    .unwrap_or(child_id)
+                                            });
+                                            app.state::<crate::browser_agent::BrowserManager>()
+                                                .register_native_child(
+                                                    &agent_id,
+                                                    &directory,
+                                                    parent_id,
+                                                    child_id,
+                                                    provider_id,
+                                                );
                                             let generation =
                                                 fence.generations.entry(directory).or_default();
                                             *generation = generation.saturating_add(1);
@@ -4704,10 +4798,28 @@ fn connect_blocking_inner(
                                 .lock()
                                 .ok()
                                 .and_then(|directories| directories.get(child_id).cloned());
+                            let live_sessions = reader
+                                .prompt_state
+                                .lock()
+                                .ok()
+                                .map(|prompts| {
+                                    prompts.active.keys().cloned().collect::<HashSet<_>>()
+                                })
+                                .unwrap_or_default();
                             if let (Some(directory), Ok(mut native)) =
                                 (directory, reader.native_subagents.lock())
                             {
                                 native.update(child_id, outcome);
+                                if outcome == "working" {
+                                    let live = native.0.get(child_id).is_some_and(|child| {
+                                        live_sessions.contains(&child.parent_session_id)
+                                            || native
+                                                .0
+                                                .get(&child.parent_session_id)
+                                                .is_some_and(|parent| parent.task_turn_id.is_some())
+                                    });
+                                    native.task_scope(child_id, agent_id == "opencode", live);
+                                }
                                 let generation = fence.generations.entry(directory).or_default();
                                 *generation = generation.saturating_add(1);
                             }
@@ -5324,6 +5436,32 @@ pub async fn acp_new_session(
             .remove(id);
         runtime.remember_session_ui(id, &result)?;
         browser.identify(&config.token, id);
+        let children = runtime
+            .native_subagents
+            .lock()
+            .map_err(|error| error.to_string())?
+            .0
+            .clone();
+        for _ in 0..children.len() {
+            for (child_id, child) in &children {
+                let provider_id = (agent == "opencode").then(|| {
+                    runtime
+                        .owner
+                        .as_ref()
+                        .and_then(|owner| {
+                            child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:"))
+                        })
+                        .unwrap_or(child_id)
+                });
+                browser.register_native_child(
+                    &agent,
+                    &child.directory,
+                    &child.parent_session_id,
+                    child_id,
+                    provider_id,
+                );
+            }
+        }
         Ok(result)
     })
     .await
@@ -8790,6 +8928,34 @@ time.sleep(10)
 #[cfg(test)]
 mod native_subagent_fence_tests {
     use super::*;
+
+    #[test]
+    fn native_task_turn_is_own_live_scope_and_settles_before_reopening() {
+        let mut registry = NativeSubagentRegistry::default();
+        registry.spawn("parent", "child", PathBuf::from("/repo"));
+        registry.task_scope("child", true, false);
+        assert!(registry.0["child"].task_turn_id.is_none());
+        registry.task_scope("child", true, true);
+        let turn = registry.0["child"].task_turn_id.clone().unwrap();
+        registry.task_scope("child", true, true);
+        assert_eq!(
+            registry.0["child"].task_turn_id.as_deref(),
+            Some(turn.as_str())
+        );
+        registry.update("child", "completed");
+        assert!(registry.0["child"].task_turn_id.is_none());
+        registry.update("child", "working");
+        registry.task_scope("child", true, true);
+        assert_ne!(
+            registry.0["child"].task_turn_id.as_deref(),
+            Some(turn.as_str())
+        );
+        registry.update("child", "cancelled");
+        assert!(registry.0["child"].task_turn_id.is_none());
+        registry.spawn("parent", "observed", PathBuf::from("/repo"));
+        registry.task_scope("observed", false, true);
+        assert!(registry.0["observed"].task_turn_id.is_none());
+    }
 
     #[test]
     fn nested_native_sessions_are_active_for_outer_worktree_cleanup() {

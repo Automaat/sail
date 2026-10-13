@@ -29,6 +29,7 @@
   import PlanPanel from './PlanPanel.svelte';
   import TasksPanel from './TasksPanel.svelte';
   import { sessionTasks, TASK_TOOLS } from './lib/session-tasks';
+  import { createNativeTaskReconciler } from './lib/native-session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
   import { updateReplayingAgentSessions } from './lib/agent-replay';
@@ -2063,6 +2064,7 @@
     setSidebarWidth(width);
   }
 
+  const reconcileNativeTasks = createNativeTaskReconciler(sessionTasks());
   let tasksTick = $state(0);
   let taskSnapshot = $derived.by(() => {
     void tasksTick;
@@ -3206,6 +3208,7 @@
   async function reconcileProviderNativeSubagents(issue: ShipIssue): Promise<number> {
     if (!issue.path) return 0;
     const nativeSnapshot = await acp.nativeSubagents(issue.path);
+    await reconcileNativeTasks(issue.path, nativeSnapshot);
     const previous = nativeSubagents;
     nativeSubagents = reconcileNativeSubagents(nativeSubagents, nativeSnapshot.subagents);
     if (nativeSubagents !== previous) nativeSubagentGeneration += 1;
@@ -6092,7 +6095,7 @@
 
   async function coordinationSource(request: CoordinationRequest): Promise<CoordinationSource> {
     if (!request.sourceAgent) throw new Error('The source agent session is unavailable.');
-    const matches = agentThreads.filter(
+    const matches = [...agentThreads, ...nativeChildThreads].filter(
       (item) =>
         item.directory === request.directory &&
         item.sessionId === request.sessionId &&
@@ -6101,6 +6104,10 @@
     if (matches.length > 1) throw new Error('The source agent session is ambiguous.');
     const thread = matches[0];
     if (!thread) throw new Error('The source agent session is unavailable.');
+    const child =
+      nativeSubagents[nativeSubagentId(thread.agent, thread.directory, thread.sessionId)];
+    if (child && child.taskIdentity !== 'verified')
+      throw new Error('Observed native child activity has no verified task identity.');
     const runtime = (await acp.activity(thread.directory))[thread.agent];
     if (!runtime?.alive || !runtime.sessions.includes(thread.sessionId))
       throw new Error('The source agent session is unavailable.');
@@ -6445,6 +6452,11 @@
   async function performCoordination(request: CoordinationRequest): Promise<unknown> {
     const project = coordinationProject(request.directory);
     if (!project) throw new Error('This worktree is not in the Sail project catalog.');
+    if (request.name === TASK_TOOLS.read || request.name === TASK_TOOLS.report) {
+      const snapshot = await acp.nativeSubagents(request.directory);
+      await reconcileNativeTasks(request.directory, snapshot);
+      nativeSubagents = reconcileNativeSubagents(nativeSubagents, snapshot.subagents);
+    }
     const source = await coordinationSource(request);
     const sourceId = `acp:${source.agent}:${request.sessionId}`;
     const effectiveProfile = effectiveCapabilityProfileForAcpSession(
@@ -11802,6 +11814,23 @@
       eventProfile,
     );
     if (nativeSubagents !== previousNativeSubagents) nativeSubagentGeneration += 1;
+    const childUpdate = event.message.params?.update as { sessionUpdate?: string } | undefined;
+    if (
+      event.message.method === 'session/update' &&
+      (childUpdate?.sessionUpdate === 'subagent_spawned' ||
+        childUpdate?.sessionUpdate === 'subagent_state_update')
+    ) {
+      void acp
+        .nativeSubagents(eventDirectory)
+        .then(async (snapshot) => {
+          if (await reconcileNativeTasks(eventDirectory, snapshot))
+            nativeSubagents = reconcileNativeSubagents(nativeSubagents, snapshot.subagents);
+          return undefined;
+        })
+        .catch((cause) => {
+          error = `Could not save native child tasks: ${describe(cause)}`;
+        });
+    }
     const nativeUpdate = event.message.params?.update;
     if (
       event.message.method === 'session/update' &&
@@ -12115,6 +12144,12 @@
         eventDirectory,
         disconnectedSessionIds,
       );
+      void acp
+        .nativeSubagents(eventDirectory)
+        .then((snapshot) => reconcileNativeTasks(eventDirectory, snapshot))
+        .catch((cause) => {
+          error = `Could not save disconnected child tasks: ${describe(cause)}`;
+        });
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
@@ -12703,6 +12738,19 @@
                 )}
                 onopensubagent={openSpawnTarget}
                 {subagentControl}
+                observedTaskActivity={acpThread
+                  ? (() => {
+                      const child =
+                        nativeSubagents[
+                          nativeSubagentId(
+                            acpThread.agent,
+                            acpThread.directory,
+                            acpThread.sessionId,
+                          )
+                        ];
+                      return child && child.taskIdentity !== 'verified' ? child.activity : null;
+                    })()
+                  : null}
                 childPrompts={acpThread
                   ? nativeSubagentAcceptsPrompts(
                       nativeSubagents[
@@ -13043,7 +13091,18 @@
       </div>
       <div class="side-panel-body">
         {#if acpAgent}<div class:inactive={activeSideTab !== 'tasks'} class="side-view">
-            <TasksPanel snapshot={taskSnapshot} />
+            <TasksPanel
+              snapshot={taskSnapshot}
+              observedActivity={acpThread
+                ? (() => {
+                    const child =
+                      nativeSubagents[
+                        nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                      ];
+                    return child && child.taskIdentity !== 'verified' ? child.activity : null;
+                  })()
+                : null}
+            />
           </div>{/if}
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
             {#if acpAgent && (acpSnapshot.plan || acpSnapshot.questions)}<PlanPanel

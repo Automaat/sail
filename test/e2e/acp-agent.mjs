@@ -145,7 +145,7 @@ function callWorktreeList(server, callback) {
   request(2, 'tools/call', { name: 'worktree_list', arguments: {} });
 }
 
-function reportSessionTasks(server, callback) {
+function reportSessionTasks(server, callback, identity) {
   const child = spawn(server.command, server.args ?? [], {
     env: {
       ...process.env,
@@ -156,7 +156,7 @@ function reportSessionTasks(server, callback) {
   const lines = createInterface({ input: child.stdout });
   const request = (id, name, args) =>
     child.stdin.write(
-      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } })}\n`,
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args, ...(identity ? { _meta: { 'ai.opencode/sessionID': identity } } : {}) } })}\n`,
     );
   let snapshot;
   let finished = false;
@@ -553,6 +553,45 @@ for await (const line of createInterface({ input: process.stdin })) {
         });
         send({ id: message.id, result: { stopReason: 'end_turn' } });
       });
+      continue;
+    }
+    if (text === 'Native child task reports') {
+      const server = sessions
+        .get(sessionId)
+        .mcpServers.find((item) => item.name === 'sail-browser');
+      const childId = `${sessionId}:task-child`;
+      sessions.set(childId, {
+        ...sessions.get(sessionId),
+        history: [],
+        nativeControlParent: sessionId,
+      });
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'subagent_spawned',
+        subagentSessionId: childId,
+        name: 'Task child',
+        task: 'Report isolated child tasks',
+        capabilities: {},
+      });
+      reportSessionTasks(
+        server,
+        (result) => {
+          recordUpdate(sessionId, childId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'subagent_state_update',
+            subagentSessionId: childId,
+            state: 'completed',
+          });
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `Child result: ${result}` },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        },
+        agent === 'opencode' ? childId : undefined,
+      );
       continue;
     }
     if (text === 'Long owned history') {

@@ -239,6 +239,7 @@
       requireClaim?: boolean,
     ) => Promise<DirectShipAuthorization | undefined>;
     nativeEntries?: AgentEntry[];
+    observedTaskActivity?: string | null;
     /** The child's adapter advertised a prompt capability, so its composer is enabled. */
     childPrompts?: boolean;
     childStops?: boolean;
@@ -284,6 +285,7 @@
     onworkspaceactivity,
     onshipit,
     nativeEntries,
+    observedTaskActivity = null,
     childPrompts = false,
     childStops = false,
     subagentControl,
@@ -2877,9 +2879,12 @@
             >{/if}
         {/snippet}
         {#snippet tail()}
-          {#if taskSnapshot?.tasks.length}<details class="session-tasks">
+          {#if taskSnapshot && (taskSnapshot.tasks.length || nativeEntries)}<details
+              class="session-tasks"
+            >
               <summary>Tasks ({taskSnapshot.tasks.length})</summary><TasksPanel
                 snapshot={taskSnapshot}
+                observedActivity={observedTaskActivity}
               />
             </details>{/if}
           {#if nativePlan}<section class="native-plan" aria-label="Native plan">

@@ -1,11 +1,18 @@
 <script lang="ts">
   import type { TaskSnapshot } from './lib/session-tasks';
-  let { snapshot }: { snapshot: TaskSnapshot } = $props();
+  let {
+    snapshot,
+    observedActivity = null,
+  }: { snapshot: TaskSnapshot; observedActivity?: string | null } = $props();
 </script>
 
 <section class="tasks-panel" aria-label="Session tasks">
   <h2>Tasks</h2>
-  {#if !snapshot.tasks.length}<p>No tasks reported in this session.</p>{:else}<ul>
+  {#if observedActivity !== null}<p>Observed activity: {observedActivity}</p>
+    <p>
+      This provider does not verify child task calls. Tasks and focus cannot be reported from this
+      child.
+    </p>{:else if !snapshot.tasks.length}<p>No tasks reported in this session.</p>{:else}<ul>
       {#each snapshot.tasks as task (task.id)}<li class:focused={snapshot.focus === task.id}>
           <span class="task-title">{task.title}</span>
           <span class="task-status">{task.status.replaceAll('_', ' ')}</span>
