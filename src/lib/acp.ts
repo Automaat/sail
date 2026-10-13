@@ -1173,7 +1173,12 @@ async function taskPrompt(
   const prior = sessionTasks().snapshot(scope);
   if (prior.turnId && prior.turnId !== turnId) {
     const runtime = (await acp.activity(directory))[agent];
-    await sessionTasks().reconcile(scope, runtime?.activeTurns[sessionId] ?? null, prior.revision);
+    await sessionTasks().reconcile(
+      scope,
+      runtime?.activeTurns[sessionId] ?? null,
+      prior.revision,
+      runtime?.finished[sessionId],
+    );
   }
   await sessionTasks().start(scope, turnId);
   let completion: 'done' | 'interrupted' | 'failed' = 'failed';

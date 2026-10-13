@@ -13,7 +13,12 @@
   {:else if snapshot.reporting?.state === 'correcting'}
     <p role="status">Task report missing. Requesting one update from the agent…</p>
   {:else if snapshot.reporting?.state === 'failed' || snapshot.reporting?.state === 'interrupted'}
-    <p>Task report unavailable — turn {snapshot.reporting.state}. No corrective request sent.</p>
+    <p>
+      Task report unavailable — turn {snapshot.reporting.state}.
+      {#if snapshot.reporting.correctionRequested}
+        One corrective request was attempted.
+      {:else}No corrective request sent.{/if}
+    </p>
   {/if}
   {#if !snapshot.tasks.length}<p>No tasks reported in this session.</p>{:else}<ul>
       {#each snapshot.tasks as task (task.id)}<li class:focused={snapshot.focus === task.id}>

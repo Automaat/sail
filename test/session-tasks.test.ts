@@ -322,3 +322,47 @@ await test('restarting the same logical turn cannot repeat its corrective reques
   await store.start(scope, 'turn');
   assert.equal(await store.requestCorrection(scope, 'turn'), false);
 });
+
+await test('restoration retains missing status after a correction completed off screen', async () => {
+  const { store, storage } = fixture();
+  await store.start(scope, 'turn');
+  await store.requestCorrection(scope, 'turn');
+  const restored = createTaskStore(storage);
+  await restored.reconcile(scope, null, store.snapshot(scope).revision, {
+    turnId: 'turn',
+    status: 'done',
+  });
+  assert.equal(restored.snapshot(scope).turnId, null);
+  assert.equal(restored.snapshot(scope).reporting?.state, 'missing');
+  assert.equal(restored.snapshot(scope).reporting?.correctionRequested, true);
+  assert.equal(createTaskStore(storage).snapshot(scope).reporting?.state, 'missing');
+});
+
+await test('restoration uses only matching completed outcomes and preserves reported work', async () => {
+  const outcomes = ['done', 'failed', 'interrupted'] as const;
+  await Promise.all(
+    outcomes.map(async (status) => {
+      const { store, storage } = fixture();
+      await store.start(scope, 'turn');
+      const restored = createTaskStore(storage);
+      await restored.reconcile(scope, null, 1, { turnId: 'turn', status });
+      assert.equal(
+        restored.snapshot(scope).reporting?.state,
+        status === 'done' ? 'missing' : status,
+      );
+    }),
+  );
+  const { store, storage } = fixture();
+  await store.start(scope, 'turn');
+  const restored = createTaskStore(storage);
+  await restored.reconcile(scope, null, 1, { turnId: 'older', status: 'done' });
+  assert.equal(restored.snapshot(scope).reporting?.state, 'interrupted');
+  await restored.start(scope, 'next');
+  await restored.report(scope, report('next', restored.snapshot(scope).revision));
+  const reported = createTaskStore(storage);
+  await reported.reconcile(scope, null, restored.snapshot(scope).revision, {
+    turnId: 'next',
+    status: 'done',
+  });
+  assert.equal(reported.snapshot(scope).reporting?.state, 'reported');
+});

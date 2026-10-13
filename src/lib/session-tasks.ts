@@ -48,6 +48,22 @@ export interface TaskStorage {
 }
 const empty = (): TaskSnapshot => ({ turnId: null, revision: 0, tasks: [], focus: null });
 const storageKey = 'sai-session-tasks';
+type TurnOutcome = 'done' | 'interrupted' | 'failed';
+type FinishedTurn = { turnId: string; status: TurnOutcome };
+
+function settledReporting(snapshot: TaskSnapshot, outcome: TurnOutcome) {
+  return (
+    snapshot.reporting && {
+      ...snapshot.reporting,
+      state:
+        snapshot.reporting.state === 'reported'
+          ? ('reported' as const)
+          : snapshot.reporting.correctionRequested || outcome === 'done'
+            ? ('missing' as const)
+            : outcome,
+    }
+  );
+}
 
 export function createTaskStore(storage: TaskStorage, clock = Date.now) {
   let sessions = new Map<string, Saved>();
@@ -102,6 +118,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
       scope: TaskScope,
       activeTurnId: string | null,
       expectedRevision = snapshot(scope).revision,
+      finished?: FinishedTurn,
     ) {
       const observed = snapshot(scope);
       return serialize(async () => {
@@ -118,10 +135,10 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           turnId: null,
           focus: null,
           revision: before.revision + 1,
-          reporting: before.reporting && {
-            ...before.reporting,
-            state: before.reporting.state === 'reported' ? 'reported' : 'interrupted',
-          },
+          reporting: settledReporting(
+            before,
+            finished?.turnId === before.turnId ? finished.status : 'interrupted',
+          ),
         });
       });
     },
@@ -239,7 +256,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
         return true;
       });
     },
-    finish(scope: TaskScope, turnId: string, outcome: 'done' | 'interrupted' | 'failed' = 'done') {
+    finish(scope: TaskScope, turnId: string, outcome: TurnOutcome = 'done') {
       return serialize(async () => {
         const before = snapshot(scope);
         if (before.turnId !== turnId) return before;
@@ -249,15 +266,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           turnId: null,
           focus: null,
           revision: before.revision + 1,
-          reporting: before.reporting && {
-            ...before.reporting,
-            state:
-              before.reporting.state === 'reported'
-                ? 'reported'
-                : before.reporting.correctionRequested || outcome === 'done'
-                  ? 'missing'
-                  : outcome,
-          },
+          reporting: settledReporting(before, outcome),
         });
       });
     },

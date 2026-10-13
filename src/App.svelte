@@ -11466,11 +11466,13 @@
       if (disposed) return;
       await Promise.all(
         taskObservations.map(({ scope, revision: taskRevision }) => {
-          const active =
-            backendActivity[JSON.stringify([scope.directory, scope.agent])]?.activeTurns[
-              scope.sessionId
-            ];
-          return sessionTasks().reconcile(scope, active ?? null, taskRevision);
+          const runtime = backendActivity[JSON.stringify([scope.directory, scope.agent])];
+          return sessionTasks().reconcile(
+            scope,
+            runtime?.activeTurns[scope.sessionId] ?? null,
+            taskRevision,
+            runtime?.finished[scope.sessionId],
+          );
         }),
       );
       for (const receipt of spawnReceipts.filter(

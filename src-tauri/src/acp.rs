@@ -5488,7 +5488,7 @@ pub async fn acp_forget_session(
                 &waiting.prompt_dispatch,
                 &waiting_session,
                 || {
-                    cancel_session(
+                    cancel_session_after_dispatch(
                         &waiting_app,
                         &waiting,
                         &waiting_agent,
@@ -5964,6 +5964,70 @@ mod task_reporting_tests {
         ] {
             assert!(!task_report_correction_eligible(&response, false, false));
         }
+    }
+
+    #[test]
+    fn stop_cannot_overtake_a_corrective_prompt_write() {
+        let dispatch = Arc::new(Mutex::new(()));
+        let prompts = Arc::new(Mutex::new(PromptState::default()));
+        prompts.lock().unwrap().active.insert(
+            "session".into(),
+            ActivePrompt {
+                turn_id: "turn".into(),
+                text: "task".into(),
+                memory_capture: crate::memory_capture::TurnCapture::default(),
+                last_agent_message: String::new(),
+                agent_message_open: false,
+                agent_message_overflow: false,
+                known_tool_calls: HashSet::new(),
+            },
+        );
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = {
+            let dispatch = Arc::clone(&dispatch);
+            let prompts = Arc::clone(&prompts);
+            let writes = Arc::clone(&writes);
+            std::thread::spawn(move || {
+                dispatch_prompt_if_current(&dispatch, &prompts, "session", "turn", || {
+                    checked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    writes.lock().unwrap().push("prompt");
+                    Ok(())
+                })
+            })
+        };
+        checked_rx.recv().unwrap();
+        assert!(dispatch.try_lock().is_err());
+        let (cancel_started_tx, cancel_started_rx) = mpsc::channel();
+        let cancel = {
+            let dispatch = Arc::clone(&dispatch);
+            let prompts = Arc::clone(&prompts);
+            let writes = Arc::clone(&writes);
+            std::thread::spawn(move || {
+                cancel_started_tx.send(()).unwrap();
+                cancel_prompt_dispatch(&dispatch, || {
+                    prompts.lock().unwrap().finishing.insert("session".into());
+                    writes.lock().unwrap().push("cancel");
+                    Ok(())
+                })
+            })
+        };
+        cancel_started_rx.recv().unwrap();
+        assert!(writes.lock().unwrap().is_empty());
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        cancel.join().unwrap().unwrap();
+        assert_eq!(*writes.lock().unwrap(), ["prompt", "cancel"]);
+        assert!(dispatch_prompt_if_current(
+            &dispatch,
+            &prompts,
+            "session",
+            "turn",
+            || -> Result<(), String> { panic!("A correction must not dispatch after Stop") }
+        )
+        .is_err());
     }
 }
 
@@ -6874,6 +6938,26 @@ pub fn acp_cancel(
 }
 
 fn cancel_session(
+    app: &AppHandle,
+    runtime: &Connection,
+    agent: &str,
+    session_id: &str,
+    turn_id: Option<String>,
+) -> Result<(), String> {
+    cancel_prompt_dispatch(&runtime.prompt_dispatch, || {
+        cancel_session_after_dispatch(app, runtime, agent, session_id, turn_id)
+    })
+}
+
+fn cancel_prompt_dispatch<T>(
+    dispatch: &Mutex<()>,
+    cancel: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _dispatch = dispatch.lock().map_err(|error| error.to_string())?;
+    cancel()
+}
+
+fn cancel_session_after_dispatch(
     app: &AppHandle,
     runtime: &Connection,
     agent: &str,
