@@ -832,12 +832,13 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
         }
         seed_ref_batch(git_dir, &updates)?;
         // Case-distinct refs cannot share loose files or transaction locks on macOS.
-        // Explicit inclusion also packs refs hidden by the inherited configuration.
+        // Pack hidden refs too, without changing the inherited configuration or
+        // requiring newer Git versions' --include option.
         output(
             git_command()
                 .arg("--git-dir")
                 .arg(git_config_path(git_dir))
-                .args(["pack-refs", "--include", "*"]),
+                .args(["-c", "transfer.hideRefs=!", "pack-refs", "--all"]),
         )?;
         remaining = next;
     }
@@ -1648,7 +1649,7 @@ mod tests {
         let fixture = OverlayFixture::new();
         let initial = git(&fixture.main, &["rev-parse", "HEAD"]);
         git(&fixture.main, &["update-ref", "refs/heads/Hooks", &initial]);
-        git(&fixture.main, &["pack-refs", "--include", "*"]);
+        git(&fixture.main, &["pack-refs", "--all"]);
         git(
             &fixture.main,
             &[
@@ -1662,9 +1663,9 @@ mod tests {
         );
         let next = git(&fixture.main, &["rev-parse", "HEAD"]);
         git(&fixture.main, &["update-ref", "refs/heads/hooks", &next]);
-        git(&fixture.main, &["pack-refs", "--include", "*"]);
+        git(&fixture.main, &["pack-refs", "--all"]);
         git(&fixture.main, &["update-ref", "refs/heads/HOOKS", &initial]);
-        git(&fixture.main, &["pack-refs", "--include", "*"]);
+        git(&fixture.main, &["pack-refs", "--all"]);
         for reference in [
             "refs/heads/Topic/one",
             "refs/heads/topic/two",
@@ -1676,7 +1677,7 @@ mod tests {
             "refs/heads/K",
         ] {
             git(&fixture.main, &["update-ref", reference, &next]);
-            git(&fixture.main, &["pack-refs", "--include", "*"]);
+            git(&fixture.main, &["pack-refs", "--all"]);
         }
         git(
             &fixture.main,
@@ -1716,6 +1717,10 @@ mod tests {
             before
         );
         assert!(private_lock_files(&overlay.git_dir).unwrap().is_empty());
+        assert_eq!(
+            overlay_git(&overlay, &["config", "--get", "transfer.hideRefs"]),
+            "refs/heads/Hooks"
+        );
         assert_eq!(
             GitOverlay::ensure(&fixture.cache, &fixture.task)
                 .unwrap()
