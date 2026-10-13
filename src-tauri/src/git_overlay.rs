@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 const VERSION: u8 = 1;
@@ -746,6 +746,7 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
             .arg(&source.worktree)
             .args(["for-each-ref", "--format=%(refname) %(objectname)"]),
     )?;
+    let mut updates = String::new();
     for line in String::from_utf8(refs.stdout)
         .map_err(|error| error.to_string())?
         .lines()
@@ -753,12 +754,31 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
         let (reference, oid) = line
             .split_once(' ')
             .ok_or("Invalid source Git reference output.")?;
-        output(
-            git_command()
-                .arg("--git-dir")
-                .arg(git_config_path(git_dir))
-                .args(["update-ref", reference, oid]),
-        )?;
+        updates.push_str(&format!("update {reference} {oid}\n"));
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut child = git_command()
+        .arg("--git-dir")
+        .arg(git_config_path(git_dir))
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or("Git reference update input unavailable.")?
+        .write_all(updates.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let result = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    if !result.status.success() {
+        return Err(String::from_utf8_lossy(&result.stderr).trim().to_string());
     }
     Ok(())
 }
