@@ -1,7 +1,15 @@
 import type { NativeSubagentSnapshotSet } from './acp.ts';
-import type { TaskStore } from './session-tasks.ts';
+import type { TaskScope, TaskSnapshot, TaskStore } from './session-tasks.ts';
 
-export function createNativeTaskReconciler(store: TaskStore) {
+type NativeTaskStore = Pick<TaskStore, 'snapshot' | 'start'> & {
+  finish(
+    scope: TaskScope,
+    turnId: string,
+    outcome?: 'done' | 'interrupted' | 'failed',
+  ): Promise<TaskSnapshot>;
+};
+
+export function createNativeTaskReconciler(store: NativeTaskStore) {
   const generations = new Map<string, number>();
   let pending: Promise<unknown> = Promise.resolve();
   return (directory: string, observed: NativeSubagentSnapshotSet) => {
@@ -18,7 +26,16 @@ export function createNativeTaskReconciler(store: TaskStore) {
             };
             const before = store.snapshot(scope);
             const turn = child.taskIdentity === 'verified' ? (child.taskTurnId ?? null) : null;
-            if (before.turnId && before.turnId !== turn) await store.finish(scope, before.turnId);
+            if (before.turnId && before.turnId !== turn)
+              await store.finish(
+                scope,
+                before.turnId,
+                child.outcome === 'completed'
+                  ? 'done'
+                  : child.outcome === 'failed'
+                    ? 'failed'
+                    : 'interrupted',
+              );
             if (turn) await store.start(scope, turn);
           }),
         );

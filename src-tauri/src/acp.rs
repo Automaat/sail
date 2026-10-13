@@ -82,7 +82,7 @@ struct AgentEvent {
     message: Value,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSubagentSnapshot {
     agent: String,
@@ -203,8 +203,25 @@ impl NativeSubagentRegistry {
 #[derive(Default)]
 struct WorktreeFenceState {
     generations: HashMap<PathBuf, u64>,
+    native_task_snapshots: HashMap<PathBuf, Vec<NativeSubagentSnapshot>>,
     starting_sessions: HashMap<PathBuf, usize>,
     guarded_sessions: HashMap<(String, PathBuf, String), GuardedSession>,
+}
+
+impl WorktreeFenceState {
+    fn native_snapshot_generation(
+        &mut self,
+        directory: &Path,
+        children: &[NativeSubagentSnapshot],
+    ) -> u64 {
+        if self.native_task_snapshots.get(directory).map(Vec::as_slice) != Some(children) {
+            self.native_task_snapshots
+                .insert(directory.to_path_buf(), children.to_vec());
+            let generation = self.generations.entry(directory.to_path_buf()).or_default();
+            *generation = generation.saturating_add(1);
+        }
+        self.generations.get(directory).copied().unwrap_or_default()
+    }
 }
 
 struct GuardedSession {
@@ -224,6 +241,32 @@ impl AgentWorktreeFence {
             .entry(directory.to_path_buf())
             .or_default();
         *generation = generation.saturating_add(1);
+        Ok(())
+    }
+
+    fn native_disconnected(
+        &self,
+        alive: &AtomicBool,
+        registry: &Mutex<NativeSubagentRegistry>,
+    ) -> Result<(), String> {
+        let mut state = self.0.lock().map_err(|error| error.to_string())?;
+        let mut native = registry.lock().map_err(|error| error.to_string())?;
+        alive.store(false, Ordering::Release);
+        let mut directories = HashSet::new();
+        for child in native.0.values_mut() {
+            directories.insert(child.directory.clone());
+            child.task_turn_id = None;
+            if !matches!(
+                child.outcome.as_str(),
+                "completed" | "failed" | "interrupted"
+            ) {
+                child.outcome = "unknown".into();
+            }
+        }
+        for directory in directories {
+            let generation = state.generations.entry(directory).or_default();
+            *generation = generation.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -3563,13 +3606,9 @@ pub fn acp_native_subagents(
     directory: String,
 ) -> Result<NativeSubagentSnapshotSet, String> {
     let directory = PathBuf::from(directory);
-    let state = fence.0.lock().map_err(|error| error.to_string())?;
-    let generation = state
-        .generations
-        .get(&directory)
-        .copied()
-        .unwrap_or_default();
+    let mut state = fence.0.lock().map_err(|error| error.to_string())?;
     let subagents = manager.native_subagent_snapshots(&directory)?;
+    let generation = state.native_snapshot_generation(&directory, &subagents);
     Ok(NativeSubagentSnapshotSet {
         generation,
         subagents,
@@ -4008,6 +4047,39 @@ fn connection_for_session(
         .first()
         .map(|runtime| Arc::clone(runtime))
         .ok_or_else(|| "Agent session is not connected in this worktree.".to_string())
+}
+
+fn register_native_task_connections(
+    runtime: &Connection,
+    browser: &crate::browser_agent::BrowserManager,
+) -> Result<(), String> {
+    let children = runtime
+        .native_subagents
+        .lock()
+        .map_err(|error| error.to_string())?
+        .0
+        .clone();
+    for _ in 0..children.len() {
+        for (child_id, child) in &children {
+            let provider_id = (runtime.agent == "opencode").then(|| {
+                runtime
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| {
+                        child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:"))
+                    })
+                    .unwrap_or(child_id)
+            });
+            browser.register_native_child(
+                &runtime.agent,
+                &child.directory,
+                &child.parent_session_id,
+                child_id,
+                provider_id,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn register_session(
@@ -5041,7 +5113,15 @@ fn connect_blocking_inner(
                 }
             }
         }
-        reader.alive.store(false, Ordering::Release);
+        if let Err(error) =
+            worktree_fence.native_disconnected(&reader.alive, &reader.native_subagents)
+        {
+            reader.alive.store(false, Ordering::Release);
+            crate::diagnostics::record(
+                "acp_native_disconnect_failed",
+                json!({"agent":agent_id,"error":error}),
+            );
+        }
         if let Ok(mut configs) = reader.session_configs.lock() {
             let browser = app.state::<crate::browser_agent::BrowserManager>();
             for (_, config) in configs.drain() {
@@ -5436,32 +5516,7 @@ pub async fn acp_new_session(
             .remove(id);
         runtime.remember_session_ui(id, &result)?;
         browser.identify(&config.token, id);
-        let children = runtime
-            .native_subagents
-            .lock()
-            .map_err(|error| error.to_string())?
-            .0
-            .clone();
-        for _ in 0..children.len() {
-            for (child_id, child) in &children {
-                let provider_id = (agent == "opencode").then(|| {
-                    runtime
-                        .owner
-                        .as_ref()
-                        .and_then(|owner| {
-                            child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:"))
-                        })
-                        .unwrap_or(child_id)
-                });
-                browser.register_native_child(
-                    &agent,
-                    &child.directory,
-                    &child.parent_session_id,
-                    child_id,
-                    provider_id,
-                );
-            }
-        }
+        register_native_task_connections(&runtime, &browser)?;
         Ok(result)
     })
     .await
@@ -5961,6 +6016,7 @@ async fn restore_session(
                         Ok((forget_generation, params, minted_token))
                     },
                 )?;
+            register_native_task_connections(&runtime, &browser)?;
             let result = runtime.request(method, params, Duration::from_secs(60));
             if result.is_err() {
                 if let Some(token) = minted_token {
@@ -8928,6 +8984,53 @@ time.sleep(10)
 #[cfg(test)]
 mod native_subagent_fence_tests {
     use super::*;
+
+    #[test]
+    fn changed_task_snapshot_gets_new_generation_even_before_reader_disconnect() {
+        let directory = PathBuf::from("/repo");
+        let mut state = WorktreeFenceState::default();
+        let mut children = NativeSubagentRegistry::default();
+        children.spawn("parent", "child", directory.clone());
+        children.task_scope("child", true, true);
+        let live = children.snapshots("opencode", CapabilityProfile::Build, &directory);
+        let before = state.native_snapshot_generation(&directory, &live);
+        assert_eq!(state.native_snapshot_generation(&directory, &live), before);
+        let mut disconnected = live.clone();
+        disconnected[0].task_turn_id = None;
+        disconnected[0].outcome = "unknown".into();
+        let after = state.native_snapshot_generation(&directory, &disconnected);
+        assert!(after > before);
+        assert_eq!(
+            state.native_snapshot_generation(&directory, &disconnected),
+            after
+        );
+    }
+
+    #[test]
+    fn disconnect_changes_task_generation_atomically_and_clears_native_turns() {
+        let fence = AgentWorktreeFence::default();
+        let directory = PathBuf::from("/repo");
+        let mut children = NativeSubagentRegistry::default();
+        children.spawn("parent", "child", directory.clone());
+        children.task_scope("child", true, true);
+        let native = Mutex::new(children);
+        let alive = AtomicBool::new(true);
+        let before = fence
+            .0
+            .lock()
+            .unwrap()
+            .generations
+            .get(&directory)
+            .copied()
+            .unwrap_or(0);
+        fence.native_disconnected(&alive, &native).unwrap();
+        let after = fence.0.lock().unwrap().generations[&directory];
+        assert!(after > before);
+        assert!(!alive.load(Ordering::Acquire));
+        let children = native.lock().unwrap();
+        assert!(children.0["child"].task_turn_id.is_none());
+        assert_eq!(children.0["child"].outcome, "unknown");
+    }
 
     #[test]
     fn native_task_turn_is_own_live_scope_and_settles_before_reopening() {

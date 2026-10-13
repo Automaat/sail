@@ -114,3 +114,14 @@ await test('restoration retains durable child tasks, clears orphan focus and sta
   await reconcile('/repo', set(5, child({ taskTurnId: 'new-turn' })));
   assert.equal(restored.snapshot(scope).turnId, 'new-turn');
 });
+
+await test('late pre-disconnect snapshots cannot restore the old child turn or focus', async () => {
+  const tasks = store();
+  const reconcile = createNativeTaskReconciler(tasks);
+  const live = set(6, child());
+  await reconcile('/repo', live);
+  await reconcile('/repo', set(7, child({ outcome: 'unknown', taskTurnId: null })));
+  assert.equal(await reconcile('/repo', live), false);
+  assert.equal(tasks.snapshot(scope).turnId, null);
+  assert.equal(tasks.snapshot(scope).focus, null);
+});

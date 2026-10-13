@@ -463,6 +463,7 @@
   import { copyCompletedSelection, copyStatusHost } from './lib/auto-copy';
   import {
     coordinationKey,
+    coordinationSourceThread,
     coordinationPrompt,
     enqueueCoordinationMessage,
     loadCoordinationMessages,
@@ -6095,14 +6096,11 @@
 
   async function coordinationSource(request: CoordinationRequest): Promise<CoordinationSource> {
     if (!request.sourceAgent) throw new Error('The source agent session is unavailable.');
-    const matches = [...agentThreads, ...nativeChildThreads].filter(
-      (item) =>
-        item.directory === request.directory &&
-        item.sessionId === request.sessionId &&
-        item.agent === request.sourceAgent,
-    );
-    if (matches.length > 1) throw new Error('The source agent session is ambiguous.');
-    const thread = matches[0];
+    const thread = coordinationSourceThread([...agentThreads, ...nativeChildThreads], {
+      agent: request.sourceAgent,
+      directory: request.directory,
+      sessionId: request.sessionId,
+    });
     if (!thread) throw new Error('The source agent session is unavailable.');
     const child =
       nativeSubagents[nativeSubagentId(thread.agent, thread.directory, thread.sessionId)];
