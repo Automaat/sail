@@ -5928,6 +5928,45 @@ pub struct AcpPromptParams {
     image_paths: Vec<String>,
 }
 
+const TASK_REPORT_GUIDANCE: &str = "Sail Tasks: For this turn, read sail_tasks_read and report your work with sail_tasks_report before finishing. Use stable task IDs and honest pending/in_progress/done/blocked/skipped states; set focus to current in_progress work or null. Pass the read turnId and expectedRevision, and reread after stale errors. A report is accepted only when the tool succeeds. If there are no tasks, report tasks: [] and focus: null.";
+const TASK_REPORT_CORRECTION: &str = "Sail did not receive a successful task report for this turn. Read sail_tasks_read, then call sail_tasks_report once with the actual task state and focus (or tasks: [] and focus: null if there is no work). Do not perform more work or repeat the user request. This is the only corrective request.";
+
+fn task_report_correction_eligible(response: &Value, cancelled: bool, interrupted: bool) -> bool {
+    !cancelled
+        && !interrupted
+        && response.get("error").is_none()
+        && response
+            .pointer("/result/stopReason")
+            .and_then(Value::as_str)
+            == Some("end_turn")
+        && response
+            .pointer("/result/sailInterrupted")
+            .and_then(Value::as_bool)
+            != Some(true)
+}
+
+#[cfg(test)]
+mod task_reporting_tests {
+    use super::*;
+
+    #[test]
+    fn only_normal_completed_turns_request_missing_reports() {
+        let ended = json!({"result":{"stopReason":"end_turn"}});
+        assert!(task_report_correction_eligible(&ended, false, false));
+        assert!(!task_report_correction_eligible(&ended, true, false));
+        assert!(!task_report_correction_eligible(&ended, false, true));
+        for response in [
+            json!({"result":{"stopReason":"cancelled"}}),
+            json!({"result":{"stopReason":"max_tokens"}}),
+            json!({"result":{"stopReason":"end_turn","sailInterrupted":true}}),
+            json!({"error":{"message":"provider failed"}}),
+            json!({"result":null}),
+        ] {
+            assert!(!task_report_correction_eligible(&response, false, false));
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn acp_prompt(
     app: AppHandle,
@@ -5942,7 +5981,8 @@ pub async fn acp_prompt(
         turn_id,
         image_paths,
     } = params;
-    let content = prepare_prompt_content(&app, &text, image_paths).await?;
+    let mut content = prepare_prompt_content(&app, &text, image_paths).await?;
+    content.push(json!({"type":"text","text":TASK_REPORT_GUIDANCE}));
     let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
     let preflight_runtime = Arc::clone(&runtime);
     let preflight_session = session_id.clone();
@@ -6046,7 +6086,7 @@ pub async fn acp_prompt(
         let dispatch_turn = turn_id.clone();
         let dispatch_directory = PathBuf::from(directory.clone());
         let writer = Arc::clone(&runtime);
-        let response = runtime.request_response_around_write(
+        let mut response = runtime.request_response_around_write(
             "session/prompt",
             json!({
                 "sessionId":session_id,"prompt":content
@@ -6112,6 +6152,46 @@ pub async fn acp_prompt(
                 }
             },
         );
+        let cancelled = runtime
+            .cancelled_prompts
+            .lock()
+            .map(|cancelled| cancelled.contains(&turn_id))
+            .unwrap_or(true);
+        let interrupted = runtime
+            .prompt_state
+            .lock()
+            .ok()
+            .and_then(|prompts| prompts.active.get(&session_id).map(ActivePrompt::reports_interruption))
+            .unwrap_or(false);
+        if response.as_ref().is_ok_and(|response| {
+            task_report_correction_eligible(&response.message, cancelled, interrupted)
+        }) {
+            let correction = app.state::<crate::browser_agent::BrowserManager>().check_task_report(
+                &app, &agent, Path::new(&directory), &session_id, &turn_id,
+            );
+            match correction {
+                Ok(true) => {
+                    let writer = Arc::clone(&runtime);
+                    let correction_session = session_id.clone();
+                    let correction_turn = turn_id.clone();
+                    response = runtime.request_response_around_write(
+                        "session/prompt",
+                        json!({"sessionId":session_id,"prompt":[{"type":"text","text":TASK_REPORT_CORRECTION}]}),
+                        Duration::from_secs(60 * 60 * 3),
+                        move |message| dispatch_prompt_if_current(
+                            &writer.prompt_dispatch, &writer.prompt_state,
+                            &correction_session, &correction_turn, || writer.write(message),
+                        ),
+                        || {},
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => crate::diagnostics::record(
+                    "task_report_check_failed",
+                    json!({"agent":agent,"sessionId":session_id,"turnId":turn_id,"error":error}),
+                ),
+            }
+        }
         let settlement_generation = response.as_ref().ok().map(|response| response.generation);
         let mut result = response.and_then(|response| {
             if let Some(error) = response.message.get("error") {
@@ -6169,7 +6249,8 @@ pub async fn acp_prompt(
                         | "operation canceled"
                 )
             });
-        let interrupted = cancelled_result
+        let interrupted = explicitly_cancelled
+            || cancelled_result
             || reported_error_interruption
             || (reported_interruption && result.is_ok());
         if interrupted {

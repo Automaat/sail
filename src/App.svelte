@@ -826,6 +826,7 @@
       | 'task_evidence_record'
       | 'sail_tasks_read'
       | 'sail_tasks_report'
+      | 'sail_task_report_check'
       | 'sail_plan_propose'
       | 'sail_plan_ask'
       | 'sail_plan_step'
@@ -6453,15 +6454,21 @@
       request.sessionId,
     );
     const requestedTool =
-      request.name === 'capability_check' && typeof request.arguments.tool === 'string'
-        ? request.arguments.tool
-        : request.name;
+      request.name === 'sail_task_report_check'
+        ? TASK_TOOLS.read
+        : request.name === 'capability_check' && typeof request.arguments.tool === 'string'
+          ? request.arguments.tool
+          : request.name;
     if (!capabilityProfileEnablesTool(effectiveProfile, requestedTool))
       throw new Error(
         `${requestedTool} is unavailable under the ${effectiveProfile} capability profile.`,
       );
     if (request.name === 'capability_check') return { profile: effectiveProfile };
-    if (request.name === TASK_TOOLS.read || request.name === TASK_TOOLS.report) {
+    if (
+      request.name === TASK_TOOLS.read ||
+      request.name === TASK_TOOLS.report ||
+      request.name === 'sail_task_report_check'
+    ) {
       const scope = {
         agent: source.agent,
         directory: request.directory,
@@ -6471,6 +6478,12 @@
       const runtime = (await acp.activity(request.directory))[source.agent];
       if (runtime?.activeTurns[request.sessionId] !== request.arguments.turnId)
         throw new Error('Task report belongs to an inactive or different turn.');
+      if (request.name === 'sail_task_report_check') {
+        if (typeof request.arguments.turnId !== 'string') throw new Error('Missing task turn.');
+        return {
+          needsCorrection: await sessionTasks().requestCorrection(scope, request.arguments.turnId),
+        };
+      }
       return sessionTasks().report(scope, request.arguments);
     }
     if (isPlanTool(request.name)) {
@@ -12018,9 +12031,13 @@
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
-      if (typeof sessionId === 'string' && typeof turnId === 'string')
+      if (
+        typeof sessionId === 'string' &&
+        typeof turnId === 'string' &&
+        (status === 'done' || status === 'failed' || status === 'interrupted')
+      )
         void sessionTasks()
-          .finish({ agent: event.agent, directory: eventDirectory, sessionId }, turnId)
+          .finish({ agent: event.agent, directory: eventDirectory, sessionId }, turnId, status)
           .catch((cause) => {
             error = `Could not save task completion: ${describe(cause)}`;
           });
