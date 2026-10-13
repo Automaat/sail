@@ -3287,8 +3287,7 @@ mod tests {
         worker.wait().unwrap();
         lease.release_clean().unwrap();
         drop(lease);
-        retry_cleanup(&fixture.cache);
-        assert!(!directory.exists());
+        assert_storage_reclaimed_after_retry(&fixture.cache, &directory);
     }
 
     #[cfg(unix)]

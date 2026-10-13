@@ -504,9 +504,22 @@ fn resolve_binary(binary_path: Option<String>) -> Result<OsString, String> {
 }
 
 #[tauri::command]
-fn repository_path_available(path: String) -> bool {
-    let directory = Path::new(&path);
-    directory.is_dir() && directory.join(".git").exists()
+async fn repository_path_available(path: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory = Path::new(&path);
+        if !directory.is_dir() || !directory.join(".git").exists() {
+            return Ok(false);
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .map_err(|_| "Git is unavailable. Install Git to select a repository.".to_string())?;
+        Ok(output.status.success())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn validate_repository_path(path: String) -> Result<String, String> {
@@ -1523,7 +1536,16 @@ struct RegisteredWorktree {
 }
 
 #[tauri::command]
-fn registered_worktrees(
+async fn registered_worktrees(
+    repository: String,
+    paths: Vec<String>,
+) -> Result<Vec<RegisteredWorktree>, String> {
+    tauri::async_runtime::spawn_blocking(move || registered_worktrees_sync(repository, paths))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn registered_worktrees_sync(
     repository: String,
     paths: Vec<String>,
 ) -> Result<Vec<RegisteredWorktree>, String> {
@@ -1607,9 +1629,15 @@ fn parse_registered_worktrees(listed: &str) -> Vec<RegisteredWorktree> {
 }
 
 #[tauri::command]
-fn worktree_config(worktree: String) -> Result<Option<worktree_config::WorktreeConfig>, String> {
-    let root = validate_repository_path(worktree)?;
-    worktree_config::read(Path::new(&root))
+async fn worktree_config(
+    worktree: String,
+) -> Result<Option<worktree_config::WorktreeConfig>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = validate_repository_path(worktree)?;
+        worktree_config::read(Path::new(&root))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn git_reference(repository: &Path, args: &[&str]) -> Option<String> {
@@ -3859,8 +3887,8 @@ mod tests {
         discover_nested_worktree_terminal_roots, encode_manifest_path, existing_shipping_worktree,
         git_change_action, git_patch, git_reference, normalize_picker_path,
         parse_registered_worktrees, persist_worktree_data_manifest,
-        register_worktree_terminal_data, registered_worktrees, remove_remaining_worktree_files,
-        remove_worktree, remove_worktree_then_private_data_many,
+        register_worktree_terminal_data, registered_worktrees_sync,
+        remove_remaining_worktree_files, remove_worktree, remove_worktree_then_private_data_many,
         remove_worktree_then_terminal_data, remove_worktree_then_terminal_data_many,
         remove_worktree_with_hook, remove_worktree_with_hooks, replacement_worktree_at_checkpoint,
         repository_namespace, repository_worktrees, shipping_base_revision, shipping_changed_paths,
@@ -4350,7 +4378,8 @@ mod tests {
         );
 
         let alias = child.join(".").to_string_lossy().into_owned();
-        let matched = registered_worktrees(repository_path.into(), vec![alias.clone()]).unwrap();
+        let matched =
+            registered_worktrees_sync(repository_path.into(), vec![alias.clone()]).unwrap();
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].path, alias);
         assert_eq!(matched[0].branch.as_deref(), Some("child"));

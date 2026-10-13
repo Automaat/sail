@@ -30,6 +30,7 @@
             "wdio:default",
             "wdio-webdriver:default",
             "core:window:allow-set-theme",
+            "core:window:allow-is-visible",
             "allow-acp-reset-test-runtimes",
             "allow-reset-test-settings"
           ]

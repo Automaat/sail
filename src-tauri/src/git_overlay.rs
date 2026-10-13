@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -780,19 +781,63 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
             .arg(&source.worktree)
             .args(["for-each-ref", "--format=%(refname) %(objectname)"]),
     )?;
-    let mut updates = String::new();
-    for line in String::from_utf8(refs.stdout)
+    let mut remaining = Vec::new();
+    for line in String::from_utf8(refs.stdout.clone())
         .map_err(|error| error.to_string())?
         .lines()
     {
         let (reference, oid) = line
             .split_once(' ')
             .ok_or("Invalid source Git reference output.")?;
-        updates.push_str(&format!("update {reference} {oid}\n"));
+        remaining.push((reference.to_string(), oid.to_string()));
     }
-    if updates.is_empty() {
-        return Ok(());
+    while !remaining.is_empty() {
+        let mut names = HashMap::new();
+        let mut updates = String::new();
+        let mut next = Vec::new();
+        for (reference, oid) in remaining {
+            let prefixes = reference
+                .match_indices('/')
+                .map(|(end, _)| &reference[..end])
+                .chain(std::iter::once(reference.as_str()))
+                .collect::<Vec<_>>();
+            if prefixes.iter().any(|prefix| {
+                names
+                    .get(&prefix.to_lowercase())
+                    .is_some_and(|existing| existing != prefix)
+            }) {
+                next.push((reference, oid));
+            } else {
+                for prefix in prefixes {
+                    names.insert(prefix.to_lowercase(), prefix.to_string());
+                }
+                updates.push_str(&format!("update {reference} {oid}\n"));
+            }
+        }
+        seed_ref_batch(git_dir, &updates)?;
+        // Case-distinct refs cannot share loose files or transaction locks on macOS.
+        // Explicit inclusion also packs refs hidden by the inherited configuration.
+        output(
+            git_command()
+                .arg("--git-dir")
+                .arg(git_config_path(git_dir))
+                .args(["pack-refs", "--include", "*"]),
+        )?;
+        remaining = next;
     }
+    let seeded = output(
+        git_command()
+            .arg("--git-dir")
+            .arg(git_config_path(git_dir))
+            .args(["for-each-ref", "--format=%(refname) %(objectname)"]),
+    )?;
+    if seeded.stdout != refs.stdout {
+        return Err("Private Git reference names or targets changed during initialization.".into());
+    }
+    Ok(())
+}
+
+fn seed_ref_batch(git_dir: &Path, updates: &str) -> Result<(), String> {
     let mut child = git_command()
         .arg("--git-dir")
         .arg(git_config_path(git_dir))
@@ -1580,6 +1625,79 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.root).unwrap();
         }
+    }
+
+    #[test]
+    fn overlay_seeds_case_distinct_refs_without_losing_their_targets() {
+        let fixture = OverlayFixture::new();
+        let initial = git(&fixture.main, &["rev-parse", "HEAD"]);
+        git(&fixture.main, &["update-ref", "refs/heads/Hooks", &initial]);
+        git(&fixture.main, &["pack-refs", "--include", "*"]);
+        git(
+            &fixture.main,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "next",
+            ],
+        );
+        let next = git(&fixture.main, &["rev-parse", "HEAD"]);
+        git(&fixture.main, &["update-ref", "refs/heads/hooks", &next]);
+        git(&fixture.main, &["pack-refs", "--include", "*"]);
+        git(&fixture.main, &["update-ref", "refs/heads/HOOKS", &initial]);
+        git(&fixture.main, &["pack-refs", "--include", "*"]);
+        for reference in ["refs/heads/Topic/one", "refs/heads/topic/two"] {
+            git(&fixture.main, &["update-ref", reference, &next]);
+            git(&fixture.main, &["pack-refs", "--include", "*"]);
+        }
+        git(
+            &fixture.main,
+            &["config", "transfer.hideRefs", "refs/heads/Hooks"],
+        );
+        let before = git(
+            &fixture.main,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let after = overlay_git(
+            &overlay,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        assert_eq!(after, before);
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "refs/heads/Hooks"]),
+            initial
+        );
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "refs/heads/hooks"]),
+            next
+        );
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "refs/heads/HOOKS"]),
+            initial
+        );
+        assert_eq!(overlay_git(&overlay, &["rev-parse", "HEAD"]), initial);
+        assert_eq!(
+            git(
+                &fixture.main,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            ),
+            before
+        );
+        assert!(private_lock_files(&overlay.git_dir).unwrap().is_empty());
+        assert_eq!(
+            GitOverlay::ensure(&fixture.cache, &fixture.task)
+                .unwrap()
+                .unwrap()
+                .git_dir,
+            overlay.git_dir,
+        );
     }
 
     #[test]
