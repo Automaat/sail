@@ -85,9 +85,14 @@ for (const [provider, name] of providers) {
       );
       await browser.refresh();
       expect((await snapshot()).reporting).toEqual(completed.reporting);
+      await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
       await $('.agent-composer [data-pane-prompt]').setValue('Task reporting fixture: recover');
+      await expect($('.agent-actions button:last-child')).toBeEnabled();
       await $('.agent-actions button:last-child').click();
-      await browser.waitUntil(async () => (await snapshot())?.reporting?.state === 'reported');
+      await browser.waitUntil(async () => {
+        const reporting = (await snapshot())?.reporting;
+        return reporting?.turnId !== completed.reporting.turnId && reporting?.state === 'reported';
+      });
       expect((await snapshot()).reporting.correctionRequested).toBe(true);
       await expect($('.agent-conversation')).toHaveText(
         expect.stringContaining('Task reporting passed'),
