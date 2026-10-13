@@ -47,7 +47,9 @@ async function startNativeRequest(
 }
 
 async function nativeRequestResult(key = '__selectionPerformanceRequest'): Promise<PendingResult> {
-  return browser.execute((name) => Reflect.get(window, name), key);
+  // The embedded driver treats a top-level error field as a transport failure.
+  const result = await browser.execute((name) => ({ request: Reflect.get(window, name) }), key);
+  return result.request;
 }
 
 async function assertNativeWindowResponds() {

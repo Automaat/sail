@@ -795,7 +795,23 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
         let mut names = HashMap::new();
         let mut updates = String::new();
         let mut next = Vec::new();
+        let mut isolated = false;
         for (reference, oid) in remaining {
+            // Filesystems use Unicode folding and normalization rules that differ
+            // from Rust lowercasing. Isolate non-ASCII names from every other ref.
+            if !reference.is_ascii() {
+                if updates.is_empty() {
+                    updates.push_str(&format!("update {reference} {oid}\n"));
+                    isolated = true;
+                } else {
+                    next.push((reference, oid));
+                }
+                continue;
+            }
+            if isolated {
+                next.push((reference, oid));
+                continue;
+            }
             let prefixes = reference
                 .match_indices('/')
                 .map(|(end, _)| &reference[..end])
@@ -803,13 +819,13 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
                 .collect::<Vec<_>>();
             if prefixes.iter().any(|prefix| {
                 names
-                    .get(&prefix.to_lowercase())
+                    .get(&prefix.to_ascii_lowercase())
                     .is_some_and(|existing| existing != prefix)
             }) {
                 next.push((reference, oid));
             } else {
                 for prefix in prefixes {
-                    names.insert(prefix.to_lowercase(), prefix.to_string());
+                    names.insert(prefix.to_ascii_lowercase(), prefix.to_string());
                 }
                 updates.push_str(&format!("update {reference} {oid}\n"));
             }
@@ -1649,7 +1665,16 @@ mod tests {
         git(&fixture.main, &["pack-refs", "--include", "*"]);
         git(&fixture.main, &["update-ref", "refs/heads/HOOKS", &initial]);
         git(&fixture.main, &["pack-refs", "--include", "*"]);
-        for reference in ["refs/heads/Topic/one", "refs/heads/topic/two"] {
+        for reference in [
+            "refs/heads/Topic/one",
+            "refs/heads/topic/two",
+            "refs/heads/Σ",
+            "refs/heads/ς",
+            "refs/heads/café",
+            "refs/heads/cafe\u{301}",
+            "refs/heads/K",
+            "refs/heads/K",
+        ] {
             git(&fixture.main, &["update-ref", reference, &next]);
             git(&fixture.main, &["pack-refs", "--include", "*"]);
         }
