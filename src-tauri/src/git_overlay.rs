@@ -966,6 +966,55 @@ fn overlay_has_live_processes(worktree: &Path, git_dir: &Path) -> bool {
 }
 
 fn process_uses_overlay(process: &sysinfo::Process, worktree: &Path, git_dir: &Path) -> bool {
+    if !process_context_uses_overlay(
+        process.cwd(),
+        process.name(),
+        process.cmd(),
+        process.environ(),
+        worktree,
+        git_dir,
+    ) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        windows_process_is_alive(process.pid().as_u32())
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // A Windows process snapshot can retain a Git process that exited while
+    // its cwd was being read. Verify it is still alive before treating missing
+    // process information as an unknown writer. Access failures stay busy.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+    }
+    let mut exit_code = 0;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+    unsafe { CloseHandle(handle) };
+    !queried || exit_code == STILL_ACTIVE as u32
+}
+
+fn process_context_uses_overlay(
+    process_cwd: Option<&Path>,
+    name: &std::ffi::OsStr,
+    arguments: &[OsString],
+    environment: &[OsString],
+    worktree: &Path,
+    git_dir: &Path,
+) -> bool {
     let canonical_worktree =
         dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
     let canonical_git_dir = dunce::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
@@ -982,27 +1031,24 @@ fn process_uses_overlay(process: &sysinfo::Process, worktree: &Path, git_dir: &P
         let path = dunce::canonicalize(&path).unwrap_or(path);
         path.starts_with(worktree) || path.starts_with(git_dir)
     };
-    if process
-        .cwd()
-        .is_some_and(|cwd| points_into_overlay(cwd, None))
-    {
+    if process_cwd.is_some_and(|cwd| points_into_overlay(cwd, None)) {
         return true;
     }
-    for variable in process.environ() {
+    for variable in environment {
         let variable = variable.to_string_lossy();
         if let Some((name, value)) = variable.split_once('=') {
             if matches!(
                 name,
                 "GIT_DIR" | "GIT_COMMON_DIR" | "GIT_WORK_TREE" | "GIT_INDEX_FILE"
-            ) && points_into_overlay(Path::new(value), process.cwd())
+            ) && points_into_overlay(Path::new(value), process_cwd)
             {
                 return true;
             }
         }
     }
-    let mut cwd = process.cwd().map(Path::to_path_buf);
+    let mut cwd = process_cwd.map(Path::to_path_buf);
     let mut change_directory = false;
-    for argument in process.cmd() {
+    for argument in arguments {
         let argument = argument.to_string_lossy();
         if argument == "-C" {
             change_directory = true;
@@ -1019,7 +1065,9 @@ fn process_uses_overlay(process: &sysinfo::Process, worktree: &Path, git_dir: &P
             change_directory = false;
         }
     }
-    process.cwd().is_none() && process.name().to_string_lossy().starts_with("git")
+    // Command-line directories cannot prove the actual cwd of an unreadable
+    // process: symlinks and directories can move while its writer stays live.
+    process_cwd.is_none() && name.to_string_lossy().starts_with("git")
 }
 
 fn recover_unregistered_overlay(
@@ -1682,6 +1730,96 @@ mod tests {
         fs::remove_dir(&removed).unwrap();
 
         assert!(ref_lock_files(&removed).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unreadable_live_git_remains_protected_with_an_unrelated_change_directory() {
+        let fixture = OverlayFixture::new();
+        let (private, _, _) = paths(&fixture.cache, &fixture.task);
+        let arguments = vec![
+            OsString::from("git"),
+            OsString::from("-C"),
+            fixture.main.as_os_str().to_os_string(),
+            OsString::from("update-ref"),
+            OsString::from("--stdin"),
+        ];
+        assert!(process_context_uses_overlay(
+            None,
+            std::ffi::OsStr::new("git"),
+            &arguments,
+            &[],
+            &fixture.task,
+            &private,
+        ));
+        assert!(process_context_uses_overlay(
+            None,
+            std::ffi::OsStr::new("git"),
+            &[OsString::from("git"), OsString::from("update-ref")],
+            &[],
+            &fixture.task,
+            &private,
+        ));
+    }
+
+    #[test]
+    fn unreadable_git_remains_protected_with_relative_targets() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let relative = overlay.git_dir.strip_prefix(&fixture.root).unwrap();
+        let change_directory = fixture.root.as_os_str().to_os_string();
+        let cases = [
+            (
+                vec![
+                    OsString::from("git"),
+                    OsString::from("-C"),
+                    change_directory.clone(),
+                    OsString::from("update-ref"),
+                ],
+                vec![OsString::from(format!("GIT_DIR={}", relative.display()))],
+            ),
+            (
+                vec![
+                    OsString::from("git"),
+                    OsString::from(format!("--git-dir={}", relative.display())),
+                    OsString::from("-C"),
+                    change_directory,
+                    OsString::from("update-ref"),
+                ],
+                Vec::new(),
+            ),
+        ];
+        for (arguments, environment) in cases {
+            assert!(
+                process_context_uses_overlay(
+                    None,
+                    std::ffi::OsStr::new("git"),
+                    &arguments,
+                    &environment,
+                    &fixture.task,
+                    &overlay.git_dir,
+                ),
+                "Relative Git target must retain its writer: {arguments:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exited_windows_git_process_does_not_block_overlay_recovery() {
+        let fixture = OverlayFixture::new();
+        let mut child = git_command().args(["--version"]).spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!windows_process_is_alive(pid));
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        fs::remove_file(&overlay.manifest_path).unwrap();
+        assert!(GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .is_some());
     }
 
     #[cfg(windows)]

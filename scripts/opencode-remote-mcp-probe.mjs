@@ -40,8 +40,8 @@ function findBinary() {
   return undefined;
 }
 
-async function versionOf(binary) {
-  const result = await run(binary, ['--version'], { timeout: 15_000 });
+async function versionOf(binary, environment) {
+  const result = await run(binary, ['--version'], { timeout: 15_000, environment });
   const match = /v?(\d+\.\d+\.\d+)/.exec(result.stdout);
   return match ? match[1] : undefined;
 }
@@ -162,6 +162,8 @@ async function settleList(binary, project, environment, expectedNames, attempts 
 }
 
 async function probe(binary) {
+  let server;
+  let serviceIsolated = false;
   const scratch = mkdtempSync(join(tmpdir(), 'sail-300-mcp-probe-'));
   const project = join(scratch, 'project');
   mkdirSync(project, { recursive: true });
@@ -171,21 +173,28 @@ async function probe(binary) {
     XDG_CONFIG_HOME: join(scratch, 'xdg-config'),
     XDG_DATA_HOME: join(scratch, 'xdg-data'),
     XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
+    XDG_STATE_HOME: join(scratch, 'xdg-state'),
+    OPENCODE_CONFIG_DIR: join(scratch, 'opencode-config'),
+    OPENCODE_CONFIG: undefined,
+    OPENCODE_CONFIG_CONTENT: undefined,
     APPDATA: join(scratch, 'appdata'),
     LOCALAPPDATA: join(scratch, 'appdata-local'),
   };
   try {
+    mkdirSync(environment.HOME, { recursive: true });
+    mkdirSync(environment.OPENCODE_CONFIG_DIR, { recursive: true });
     writeFileSync(join(project, 'opencode.json'), '{}\n');
-    const { server, port, requests } = await startMcpServer();
+    const fixture = await startMcpServer();
+    server = fixture.server;
+    const { port, requests } = fixture;
     const servicePort = await freePort();
     const serviceIsolation = await run(binary, ['service', 'set', 'port', String(servicePort)], {
       cwd: project,
       environment,
     });
     if (serviceIsolation.status !== 0) {
-      server.close();
       return {
-        version: await versionOf(binary),
+        version: await versionOf(binary, environment),
         pinnedVersion: PINNED_VERSION,
         url: `http://127.0.0.1:${port}/mcp`,
         findings: [
@@ -202,9 +211,10 @@ async function probe(binary) {
         ],
       };
     }
+    serviceIsolated = true;
     const url = `http://127.0.0.1:${port}/mcp`;
     const findings = [];
-    const version = await versionOf(binary);
+    const version = await versionOf(binary, environment);
 
     const addFirst = await run(
       binary,
@@ -292,7 +302,6 @@ async function probe(binary) {
     });
     const afterAdds = readProjectConfig(project);
     if (!afterAdds?.mcp?.servers?.authed || !afterAdds?.mcp?.servers?.anonymous) {
-      server.close();
       return {
         version,
         pinnedVersion: PINNED_VERSION,
@@ -394,9 +403,13 @@ async function probe(binary) {
       ),
     );
 
-    server.close();
     return { version, pinnedVersion: PINNED_VERSION, url, findings };
   } finally {
+    if (serviceIsolated) {
+      await run(binary, ['service', 'stop'], { cwd: project, environment, timeout: 10_000 });
+    }
+    server?.closeAllConnections();
+    if (server) await new Promise((resolveClose) => server.close(resolveClose));
     if (!keepScratch) rmSync(scratch, { recursive: true, force: true });
   }
 }

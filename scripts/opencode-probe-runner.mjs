@@ -6,6 +6,7 @@ export async function run(binary, cliArguments, options = {}) {
     const child = spawn(binary, cliArguments, {
       cwd: options.cwd,
       timeout: options.timeout ?? 30_000,
+      killSignal: 'SIGKILL',
       env: { ...process.env, ...options.environment },
     });
     let stdout = '';
