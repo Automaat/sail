@@ -3053,7 +3053,7 @@ fn git_remove_worktree(
     repository: &Path,
     worktree: &Path,
     force: bool,
-    original_directory: Option<&std::fs::Metadata>,
+    original_directory: Option<&WorktreeDirectoryIdentity>,
     mut check_identity: impl FnMut(bool) -> Result<(), String>,
 ) -> Result<(), String> {
     let attempts = if force { 6 } else { 1 };
@@ -3128,7 +3128,7 @@ fn git_remove_worktree(
 
 fn remove_remaining_worktree_files(
     worktree: &Path,
-    original: &std::fs::Metadata,
+    original: &WorktreeDirectoryIdentity,
 ) -> Result<(), String> {
     let quarantine = worktree
         .parent()
@@ -3140,7 +3140,8 @@ fn remove_remaining_worktree_files(
         Err(error) => return Err(format!("Cannot isolate remaining worktree files: {error}")),
     }
     let result = (|| {
-        let current = std::fs::symlink_metadata(&quarantine).map_err(|error| error.to_string())?;
+        let current =
+            worktree_directory_identity(&quarantine).map_err(|error| error.to_string())?;
         if !same_worktree_directory(original, &current) {
             return Err(
                 "Worktree identity changed during deletion. Refresh before continuing.".into(),
@@ -3187,18 +3188,37 @@ fn make_worktree_files_removable(path: &Path) -> std::io::Result<()> {
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
-    let mut permissions = metadata.permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let mut permissions = metadata.permissions();
         if metadata.is_dir() {
             permissions.set_mode(permissions.mode() | 0o700);
         }
+        if permissions != metadata.permissions() {
+            std::fs::set_permissions(path, permissions)?;
+        }
     }
-    #[cfg(not(unix))]
-    permissions.set_readonly(false);
-    if permissions != metadata.permissions() {
-        std::fs::set_permissions(path, permissions)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
+        };
+        let attributes = metadata.file_attributes();
+        if attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            let path = extended_windows_path(path)
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            if unsafe { SetFileAttributesW(path.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY) }
+                == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
     }
     if metadata.is_dir() {
         for entry in std::fs::read_dir(path)? {
@@ -3208,23 +3228,70 @@ fn make_worktree_files_removable(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn same_worktree_directory(original: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
-    if !current.file_type().is_dir() {
-        return false;
+#[derive(Eq, PartialEq)]
+struct WorktreeDirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume: u64,
+    #[cfg(windows)]
+    file: [u8; 16],
+}
+
+fn worktree_directory_identity(path: &Path) -> std::io::Result<WorktreeDirectoryIdentity> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Worktree path is not a directory.",
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        original.dev() == current.dev() && original.ino() == current.ino()
+        Ok(WorktreeDirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        original
-            .created()
-            .ok()
-            .zip(current.created().ok())
-            .is_some_and(|(original, current)| original == current)
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+        };
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(extended_windows_path(path))?;
+        let mut info = FILE_ID_INFO::default();
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(WorktreeDirectoryIdentity {
+            volume: info.VolumeSerialNumber,
+            file: info.FileId.Identifier,
+        })
     }
+}
+
+fn same_worktree_directory(
+    original: &WorktreeDirectoryIdentity,
+    current: &WorktreeDirectoryIdentity,
+) -> bool {
+    original == current
 }
 
 fn remove_worktree_with_hook<F>(
@@ -3402,7 +3469,7 @@ where
     git_overlay::require_shared_current(&worktree)?;
     let pointer = std::fs::read(worktree.join(".git"))
         .map_err(|error| format!("Cannot capture worktree identity before deletion: {error}"))?;
-    let directory_identity = std::fs::symlink_metadata(&worktree)
+    let directory_identity = worktree_directory_identity(&worktree)
         .map_err(|error| format!("Cannot capture worktree directory before deletion: {error}"))?;
     let mut first_attempt = true;
     git_remove_worktree(
@@ -3411,21 +3478,30 @@ where
         force,
         Some(&directory_identity),
         |registered| {
-            if let Ok(current) = std::fs::symlink_metadata(&worktree) {
-                let current_pointer = std::fs::read(worktree.join(".git"));
-                if !same_worktree_directory(&directory_identity, &current)
-                    || (registered && current_pointer.as_deref().ok() != Some(pointer.as_slice()))
-                    || current_pointer.is_ok_and(|current| current != pointer)
-                {
-                    return Err(
-                        "Worktree identity changed during deletion. Refresh before continuing."
-                            .into(),
-                    );
+            match worktree_directory_identity(&worktree) {
+                Ok(current) => {
+                    let current_pointer = std::fs::read(worktree.join(".git"));
+                    if !same_worktree_directory(&directory_identity, &current)
+                        || (registered
+                            && current_pointer.as_deref().ok() != Some(pointer.as_slice()))
+                        || current_pointer.is_ok_and(|current| current != pointer)
+                    {
+                        return Err(
+                            "Worktree identity changed during deletion. Refresh before continuing."
+                                .into(),
+                        );
+                    }
+                    if !first_attempt && registered {
+                        ensure_expected_revision()?;
+                        ensure_expected_branch()?;
+                        git_overlay::require_shared_current(&worktree)?;
+                    }
                 }
-                if !first_attempt && registered {
-                    ensure_expected_revision()?;
-                    ensure_expected_branch()?;
-                    git_overlay::require_shared_current(&worktree)?;
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot verify worktree directory before deletion: {error}"
+                    ))
                 }
             }
             first_attempt = false;
@@ -4738,7 +4814,7 @@ mod tests {
         let original_path = root.join("original");
         fs::create_dir_all(&worktree).unwrap();
         fs::write(worktree.join("original.txt"), "original").unwrap();
-        let original = fs::symlink_metadata(&worktree).unwrap();
+        let original = super::worktree_directory_identity(&worktree).unwrap();
         fs::rename(&worktree, &original_path).unwrap();
         fs::create_dir(&worktree).unwrap();
         fs::write(worktree.join("replacement.txt"), "retain replacement").unwrap();
@@ -4752,6 +4828,97 @@ mod tests {
             fs::read_to_string(original_path.join("original.txt")).unwrap(),
             "original"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remaining_file_cleanup_clears_readonly_without_changing_other_windows_attributes() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
+        };
+        let root =
+            std::env::temp_dir().join(format!("sail-delete-readonly-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let file = root.join("file.txt");
+        fs::write(&file, "read-only content").unwrap();
+        let attributes = fs::metadata(&file).unwrap().file_attributes()
+            | FILE_ATTRIBUTE_READONLY
+            | FILE_ATTRIBUTE_HIDDEN;
+        let wide = super::extended_windows_path(&file)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        assert_ne!(unsafe { SetFileAttributesW(wide.as_ptr(), attributes) }, 0);
+        assert!(fs::metadata(&file).unwrap().permissions().readonly());
+
+        super::make_worktree_files_removable(&root).unwrap();
+
+        assert!(!fs::metadata(&file).unwrap().permissions().readonly());
+        assert_ne!(
+            fs::metadata(&file).unwrap().file_attributes() & FILE_ATTRIBUTE_HIDDEN,
+            0
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "read-only content");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remaining_file_cleanup_preserves_replacement_with_the_same_windows_creation_time() {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::Storage::FileSystem::{
+            SetFileTime, FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+        };
+        let root =
+            std::env::temp_dir().join(format!("sail-delete-tunneling-{}", uuid::Uuid::new_v4()));
+        let worktree = root.join("worktree");
+        let saved = root.join("original");
+        fs::create_dir_all(&worktree).unwrap();
+        let creation_time = fs::metadata(&worktree).unwrap().creation_time();
+        let original = super::worktree_directory_identity(&worktree).unwrap();
+        fs::rename(&worktree, &saved).unwrap();
+        fs::create_dir(&worktree).unwrap();
+        fs::write(worktree.join("replacement.txt"), "preserve replacement").unwrap();
+        let handle = fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&worktree)
+            .unwrap();
+        let creation = FILETIME {
+            dwLowDateTime: creation_time as u32,
+            dwHighDateTime: (creation_time >> 32) as u32,
+        };
+        assert_ne!(
+            unsafe {
+                SetFileTime(
+                    handle.as_raw_handle(),
+                    &creation,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        drop(handle);
+        assert_eq!(
+            fs::metadata(&worktree).unwrap().creation_time(),
+            creation_time
+        );
+
+        let error = remove_remaining_worktree_files(&worktree, &original).unwrap_err();
+
+        assert!(error.contains("identity changed"), "{error}");
+        assert_eq!(
+            fs::read_to_string(worktree.join("replacement.txt")).unwrap(),
+            "preserve replacement"
+        );
+        assert!(saved.is_dir());
         fs::remove_dir_all(root).unwrap();
     }
 

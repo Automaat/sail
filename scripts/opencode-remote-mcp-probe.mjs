@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
+import { run } from './opencode-probe-runner.mjs';
 
 const PINNED_VERSION = '2.0.24';
 const PROBE_TOKEN = 's3cret-probe-token';
@@ -37,35 +38,6 @@ function findBinary() {
   const located = spawnSync('which', ['opencode'], { encoding: 'utf8' });
   if (located.status === 0 && located.stdout.trim()) return located.stdout.trim();
   return undefined;
-}
-
-async function run(binary, cliArguments, options = {}) {
-  return new Promise((resolveRun) => {
-    const child = spawn(binary, cliArguments, {
-      cwd: options.cwd,
-      timeout: options.timeout ?? 30_000,
-      env: { ...process.env, ...options.environment },
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => (stdout += chunk));
-    child.stderr.on('data', (chunk) => (stderr += chunk));
-    child.on('error', (error) => (stderr += error.message));
-    child.stdin.on('error', (error) => {
-      if (error.code !== 'EPIPE') stderr += error.message;
-    });
-    child.stdin.end(options.input ?? '');
-    child.on('close', (status, signal) =>
-      resolveRun({
-        status,
-        timedOut: signal === 'SIGTERM' || signal === 'SIGKILL',
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-      }),
-    );
-  });
 }
 
 async function versionOf(binary) {

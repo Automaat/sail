@@ -842,9 +842,16 @@ fn configure_ref_lock_timeout(git_dir: &Path) -> Result<(), String> {
 
 fn private_lock_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
     let mut locks = Vec::new();
-    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let kind = entry.file_type().map_err(|error| error.to_string())?;
+    let Some(entries) = skip_missing(fs::read_dir(directory))? else {
+        return Ok(locks);
+    };
+    for entry in entries {
+        let Some(entry) = skip_missing(entry)? else {
+            continue;
+        };
+        let Some(kind) = skip_missing(entry.file_type())? else {
+            continue;
+        };
         if kind.is_dir() && entry.file_name() == "refs" {
             locks.extend(ref_lock_files(&entry.path())?);
         } else if kind.is_file()
@@ -861,9 +868,16 @@ fn private_lock_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
 
 fn ref_lock_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
     let mut locks = Vec::new();
-    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let kind = entry.file_type().map_err(|error| error.to_string())?;
+    let Some(entries) = skip_missing(fs::read_dir(directory))? else {
+        return Ok(locks);
+    };
+    for entry in entries {
+        let Some(entry) = skip_missing(entry)? else {
+            continue;
+        };
+        let Some(kind) = skip_missing(entry.file_type())? else {
+            continue;
+        };
         if kind.is_dir() {
             locks.extend(ref_lock_files(&entry.path())?);
         } else if kind.is_file()
@@ -878,12 +892,29 @@ fn ref_lock_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(locks)
 }
 
+fn skip_missing<T>(result: std::io::Result<T>) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn recover_stale_private_locks(
     cache: &Path,
     worktree: &Path,
     git_dir: &Path,
 ) -> Result<(), String> {
     let locks = private_lock_files(git_dir)?;
+    recover_stale_private_locks_from_snapshot(cache, worktree, git_dir, locks)
+}
+
+fn recover_stale_private_locks_from_snapshot(
+    cache: &Path,
+    worktree: &Path,
+    git_dir: &Path,
+    locks: Vec<PathBuf>,
+) -> Result<(), String> {
     if locks.is_empty() {
         return Ok(());
     }
@@ -892,7 +923,9 @@ fn recover_stale_private_locks(
             return Ok(());
         }
         for path in locks {
-            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            let Some(metadata) = skip_missing(fs::symlink_metadata(&path))? else {
+                continue;
+            };
             if !metadata.file_type().is_file()
                 || !metadata
                     .modified()
@@ -905,7 +938,9 @@ fn recover_stale_private_locks(
             let retained_root = git_dir.join("sail-stale-locks");
             fs::create_dir_all(&retained_root).map_err(|error| error.to_string())?;
             let retained = retained_root.join(uuid::Uuid::new_v4().to_string());
-            fs::rename(&path, &retained).map_err(|error| error.to_string())?;
+            if skip_missing(fs::rename(&path, &retained))?.is_none() {
+                continue;
+            }
             crate::diagnostics::record(
                 "git_overlay_stale_lock_recovered",
                 serde_json::json!({
@@ -1592,6 +1627,51 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn finished_writer_missing_from_lock_snapshot_does_not_block_other_recovery() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let finished = overlay.git_dir.join("refs/heads/finished.lock");
+        let stale = overlay.git_dir.join("refs/heads/stale.lock");
+        fs::write(&finished, "finished writer").unwrap();
+        fs::write(&stale, "stale writer").unwrap();
+        File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+                ),
+            )
+            .unwrap();
+        let snapshot = vec![finished.clone(), stale.clone()];
+        fs::remove_file(finished).unwrap();
+
+        recover_stale_private_locks_from_snapshot(
+            &fixture.cache,
+            &fixture.task,
+            &overlay.git_dir,
+            snapshot,
+        )
+        .unwrap();
+
+        assert!(!stale.exists());
+        overlay_git(&overlay, &["update-ref", "refs/heads/stale", "HEAD"]);
+    }
+
+    #[test]
+    fn removed_ref_directory_does_not_block_lock_scan() {
+        let fixture = OverlayFixture::new();
+        let removed = fixture.root.join("removed-refs");
+        fs::create_dir(&removed).unwrap();
+        fs::remove_dir(&removed).unwrap();
+
+        assert!(ref_lock_files(&removed).unwrap().is_empty());
     }
 
     #[test]
