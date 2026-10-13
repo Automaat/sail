@@ -435,9 +435,22 @@ describe('worktree selection performance', () => {
     });
 
     it('cancels a runtime startup during cleanup and allows a fresh retry', async () => {
-      const gate = gitGate(slowGitDirectory, first, '--git-common-dir');
+      // Earlier runtimes can still be cleaning up after reset. A worktree absent
+      // from the sidebar makes this gate belong only to the startup under test.
+      const cancelled = join(fixtureDirectory, 'cancelled');
+      execFileSync('/usr/bin/git', [
+        '-C',
+        repository,
+        'worktree',
+        'add',
+        '-q',
+        '-b',
+        'cancelled',
+        cancelled,
+      ]);
+      const gate = gitGate(slowGitDirectory, cancelled, '--git-common-dir');
       const resetKey = '__selectionPerformanceConcurrentConnect';
-      const args = { agent: 'claude', directory: first, profile: 'build' };
+      const args = { agent: 'claude', directory: cancelled, profile: 'build' };
 
       try {
         await startNativeRequest('acp_connect', args);
@@ -457,7 +470,7 @@ describe('worktree selection performance', () => {
       expect((await nativeRequestResult()).error).toBe('Agent startup was cancelled.');
       const activity = await browser.tauri.execute(
         ({ core }, path) => core.invoke('acp_activity', { directory: path }),
-        first,
+        cancelled,
       );
       expect(activity).not.toEqual(
         expect.objectContaining({ claude: expect.objectContaining({ alive: true }) }),
