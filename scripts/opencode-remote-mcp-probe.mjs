@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -39,24 +39,37 @@ function findBinary() {
   return undefined;
 }
 
-function run(binary, cliArguments, options = {}) {
-  const result = spawnSync(binary, cliArguments, {
-    cwd: options.cwd,
-    encoding: 'utf8',
-    timeout: options.timeout ?? 30_000,
-    input: options.input ?? '',
-    env: { ...process.env, ...options.environment },
+async function run(binary, cliArguments, options = {}) {
+  return new Promise((resolveRun) => {
+    const child = spawn(binary, cliArguments, {
+      cwd: options.cwd,
+      timeout: options.timeout ?? 30_000,
+      env: { ...process.env, ...options.environment },
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => (stdout += chunk));
+    child.stderr.on('data', (chunk) => (stderr += chunk));
+    child.on('error', (error) => (stderr += error.message));
+    child.stdin.on('error', (error) => {
+      if (error.code !== 'EPIPE') stderr += error.message;
+    });
+    child.stdin.end(options.input ?? '');
+    child.on('close', (status, signal) =>
+      resolveRun({
+        status,
+        timedOut: signal === 'SIGTERM' || signal === 'SIGKILL',
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+      }),
+    );
   });
-  return {
-    status: result.status,
-    timedOut: result.signal === 'SIGTERM' || result.signal === 'SIGKILL',
-    stdout: (result.stdout ?? '').trim(),
-    stderr: (result.stderr ?? '').trim(),
-  };
 }
 
-function versionOf(binary) {
-  const result = run(binary, ['--version'], { timeout: 15_000 });
+async function versionOf(binary) {
+  const result = await run(binary, ['--version'], { timeout: 15_000 });
   const match = /v?(\d+\.\d+\.\d+)/.exec(result.stdout);
   return match ? match[1] : undefined;
 }
@@ -169,7 +182,7 @@ function delay(milliseconds) {
 }
 
 async function settleList(binary, project, environment, expectedNames, attempts = 10) {
-  const result = run(binary, ['mcp', 'list'], { cwd: project, environment, timeout: 20_000 });
+  const result = await run(binary, ['mcp', 'list'], { cwd: project, environment, timeout: 20_000 });
   if (expectedNames.every((name) => result.stdout.includes(name))) return result;
   if (attempts <= 1) return undefined;
   await delay(1000);
@@ -193,14 +206,14 @@ async function probe(binary) {
     writeFileSync(join(project, 'opencode.json'), '{}\n');
     const { server, port, requests } = await startMcpServer();
     const servicePort = await freePort();
-    const serviceIsolation = run(binary, ['service', 'set', 'port', String(servicePort)], {
+    const serviceIsolation = await run(binary, ['service', 'set', 'port', String(servicePort)], {
       cwd: project,
       environment,
     });
     if (serviceIsolation.status !== 0) {
       server.close();
       return {
-        version: versionOf(binary),
+        version: await versionOf(binary),
         pinnedVersion: PINNED_VERSION,
         url: `http://127.0.0.1:${port}/mcp`,
         findings: [
@@ -219,9 +232,9 @@ async function probe(binary) {
     }
     const url = `http://127.0.0.1:${port}/mcp`;
     const findings = [];
-    const version = versionOf(binary);
+    const version = await versionOf(binary);
 
-    const addFirst = run(
+    const addFirst = await run(
       binary,
       ['mcp', 'add', 'probe', '--url', url, '--header', `Authorization=Bearer ${PROBE_TOKEN}`],
       { cwd: project, environment },
@@ -250,7 +263,7 @@ async function probe(binary) {
     );
 
     const replacementUrl = `http://127.0.0.1:${port}/replaced`;
-    const addReplace = run(binary, ['mcp', 'add', 'probe', '--url', replacementUrl], {
+    const addReplace = await run(binary, ['mcp', 'add', 'probe', '--url', replacementUrl], {
       cwd: project,
       environment,
     });
@@ -268,7 +281,10 @@ async function probe(binary) {
       ),
     );
 
-    const removeAttempt = run(binary, ['mcp', 'remove', 'probe'], { cwd: project, environment });
+    const removeAttempt = await run(binary, ['mcp', 'remove', 'probe'], {
+      cwd: project,
+      environment,
+    });
     findings.push(
       finding(
         'remove-has-no-command',
@@ -282,7 +298,7 @@ async function probe(binary) {
       ),
     );
 
-    run(
+    await run(
       binary,
       [
         'mcp',
@@ -298,7 +314,7 @@ async function probe(binary) {
         environment,
       },
     );
-    run(binary, ['mcp', 'add', 'anonymous', '--url', `${url}anonymous`], {
+    await run(binary, ['mcp', 'add', 'anonymous', '--url', `${url}anonymous`], {
       cwd: project,
       environment,
     });
@@ -363,7 +379,7 @@ async function probe(binary) {
       ),
     );
 
-    const authHeadless = run(binary, ['mcp', 'auth', 'authed'], {
+    const authHeadless = await run(binary, ['mcp', 'auth', 'authed'], {
       cwd: project,
       environment,
       timeout: 20_000,
@@ -387,7 +403,7 @@ async function probe(binary) {
         !headlessAuthCompleted,
       ),
     );
-    const logout = run(binary, ['mcp', 'logout', 'authed'], {
+    const logout = await run(binary, ['mcp', 'logout', 'authed'], {
       cwd: project,
       environment,
       timeout: 20_000,
