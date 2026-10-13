@@ -403,6 +403,8 @@ fn git_command() -> Command {
         command.env_remove(key);
     }
     command.args(["-c", "core.filesRefLockTimeout=5000"]);
+    #[cfg(windows)]
+    command.args(["-c", "core.longpaths=true"]);
     command
 }
 
@@ -815,27 +817,27 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn configure_ref_lock_timeout(git_dir: &Path) -> Result<(), String> {
-    let value = git_command()
-        .arg("--git-dir")
-        .arg(git_config_path(git_dir))
-        .args(["config", "--local", "--get", "core.filesRefLockTimeout"])
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !value.status.success()
-        || String::from_utf8_lossy(&value.stdout).trim() != REF_LOCK_TIMEOUT_MS
-    {
-        output(
-            git_command()
-                .arg("--git-dir")
-                .arg(git_config_path(git_dir))
-                .args([
-                    "config",
-                    "--local",
-                    "core.filesRefLockTimeout",
-                    REF_LOCK_TIMEOUT_MS,
-                ]),
-        )?;
+fn configure_private_git(git_dir: &Path) -> Result<(), String> {
+    let settings = [
+        ("core.filesRefLockTimeout", REF_LOCK_TIMEOUT_MS),
+        #[cfg(windows)]
+        ("core.longpaths", "true"),
+    ];
+    for (key, expected) in settings {
+        let value = git_command()
+            .arg("--git-dir")
+            .arg(git_config_path(git_dir))
+            .args(["config", "--local", "--get", key])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !value.status.success() || String::from_utf8_lossy(&value.stdout).trim() != expected {
+            output(
+                git_command()
+                    .arg("--git-dir")
+                    .arg(git_config_path(git_dir))
+                    .args(["config", "--local", key, expected]),
+            )?;
+        }
     }
     Ok(())
 }
@@ -1061,7 +1063,7 @@ fn recover_unregistered_overlay(
         Ok(())
     })();
     if complete.is_ok() {
-        configure_ref_lock_timeout(git_dir)?;
+        configure_private_git(git_dir)?;
         write_manifest(
             manifest_path,
             &Manifest {
@@ -1153,7 +1155,7 @@ impl GitOverlay {
         lock.lock().map_err(|error| error.to_string())?;
         if let Some(existing) = Self::existing(cache, &current.worktree)? {
             recover_stale_private_locks(cache, &existing.worktree, &existing.git_dir)?;
-            configure_ref_lock_timeout(&existing.git_dir)?;
+            configure_private_git(&existing.git_dir)?;
             return Ok(Some(existing));
         }
         if fs::symlink_metadata(&git_dir).is_ok() {
@@ -1184,8 +1186,14 @@ impl GitOverlay {
         fs::create_dir_all(git_dir.parent().ok_or("Invalid overlay path.")?)
             .map_err(|error| error.to_string())?;
         let published_git_dir = git_dir;
+        // Git for Windows rejects GIT_DIR values above PATH_MAX - 40 even
+        // with core.longpaths enabled. Keep staging shorter than the final
+        // hash-named directory instead of appending a UUID to that hash.
         let build = OverlayBuild(
-            published_git_dir.with_extension(format!("building-{}", uuid::Uuid::new_v4())),
+            published_git_dir
+                .parent()
+                .ok_or("Invalid overlay path.")?
+                .join(format!("building-{}", uuid::Uuid::new_v4())),
         );
         let git_dir = build.0.clone();
         output(
@@ -1234,6 +1242,8 @@ impl GitOverlay {
         config_entries.push_str(&format!(
             "[core]\n\tbare = false\n\tsplitIndex = false\n\tfilesRefLockTimeout = {REF_LOCK_TIMEOUT_MS}\n"
         ));
+        #[cfg(windows)]
+        config_entries.push_str("\tlongpaths = true\n");
         OpenOptions::new()
             .append(true)
             .open(&config)
@@ -1672,6 +1682,35 @@ mod tests {
         fs::remove_dir(&removed).unwrap();
 
         assert!(ref_lock_files(&removed).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deep_cache_overlay_supports_long_refs_in_plain_git_commands() {
+        let fixture = OverlayFixture::new();
+        git(&fixture.main, &["config", "core.longpaths", "false"]);
+        let cache = fixture.cache.join("deep-cache-directory");
+        let overlay = GitOverlay::ensure(&cache, &fixture.task).unwrap().unwrap();
+        let reference = format!("refs/heads/{}", "long-ref-".repeat(20));
+        assert!(overlay.git_dir.join(&reference).to_string_lossy().len() > 260);
+        // Use a plain command so this also verifies the published config, not
+        // just the flags used by Sail's internal Git command helper.
+        let mut command = Command::new("git");
+        overlay.apply(&mut command);
+        output(
+            command
+                .arg("-C")
+                .arg(&fixture.task)
+                .args(["update-ref", &reference, "HEAD"]),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(overlay.git_dir.join(&reference))
+                .unwrap()
+                .trim(),
+            git(&fixture.task, &["rev-parse", "HEAD"])
+        );
+        assert!(!fixture.main.join(".git").join(reference).exists());
     }
 
     #[test]
