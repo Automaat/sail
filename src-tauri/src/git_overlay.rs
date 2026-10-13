@@ -1582,6 +1582,17 @@ impl GitOverlay {
                 "Assigned branch changed during promotion; recovery requires a decision.".into(),
             );
         }
+        if promotion.new_oid != promotion.expected_oid {
+            // A new loose ref can shadow another packed spelling on an
+            // insensitive filesystem. Repack exact names before publication
+            // completes, including when recovering an interrupted promotion.
+            output(
+                git_ref_command()
+                    .arg("--git-dir")
+                    .arg(git_config_path(&manifest.common_dir))
+                    .args(["-c", "transfer.hideRefs=!", "pack-refs", "--all"]),
+            )?;
+        }
         replace_index(
             &source_index,
             &private_index,
@@ -1792,6 +1803,10 @@ mod tests {
         let promoted = overlay_git(&overlay, &["rev-parse", "HEAD"]);
         overlay.promote_quiescent(|| Ok(())).unwrap();
         assert_eq!(git(&fixture.task, &["rev-parse", "HEAD"]), promoted);
+        assert_eq!(
+            git(&fixture.main, &["rev-parse", "refs/heads/café"]),
+            initial
+        );
         assert_eq!(
             git(&fixture.task, &["symbolic-ref", "HEAD"]),
             "refs/heads/cafe\u{301}"
