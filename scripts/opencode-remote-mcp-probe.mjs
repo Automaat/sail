@@ -1,13 +1,11 @@
 #!/usr/bin/env node
-import { execFile, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
-import { promisify } from 'node:util';
-
-const execFileAsync = promisify(execFile);
+import { run } from './opencode-probe-runner.mjs';
 
 const PINNED_VERSION = '2.0.24';
 const PROBE_TOKEN = 's3cret-probe-token';
@@ -40,33 +38,6 @@ function findBinary() {
   const located = spawnSync('which', ['opencode'], { encoding: 'utf8' });
   if (located.status === 0 && located.stdout.trim()) return located.stdout.trim();
   return undefined;
-}
-
-async function run(binary, cliArguments, options = {}) {
-  try {
-    const child = execFileAsync(binary, cliArguments, {
-      cwd: options.cwd,
-      encoding: 'utf8',
-      timeout: options.timeout ?? 30_000,
-      killSignal: 'SIGKILL',
-      env: { ...process.env, ...options.environment },
-    });
-    child.child.stdin.end();
-    const result = await child;
-    return {
-      status: 0,
-      timedOut: false,
-      stdout: result.stdout.trim(),
-      stderr: result.stderr.trim(),
-    };
-  } catch (error) {
-    return {
-      status: typeof error.code === 'number' ? error.code : null,
-      timedOut: error.signal === 'SIGTERM' || error.signal === 'SIGKILL',
-      stdout: (error.stdout ?? '').trim(),
-      stderr: (error.stderr ?? '').trim(),
-    };
-  }
 }
 
 async function versionOf(binary, environment) {
