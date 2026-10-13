@@ -31,6 +31,14 @@ for (const [provider, name] of providers) {
       const auth = $('.agent-auth');
       if (await auth.isExisting()) await auth.$('button').click();
       await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+      if (provider === 'codex')
+        await browser.tauri.execute(async ({ core }, directory) => {
+          await core.invoke('acp_authenticate', {
+            agent: 'codex',
+            directory,
+            methodId: 'chat-gpt',
+          });
+        }, realpathSync(repository));
     });
 
     async function send(mode: string) {
