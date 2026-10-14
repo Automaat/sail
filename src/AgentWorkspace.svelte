@@ -216,7 +216,7 @@
     ) => void;
     onterminal: (id: string) => void;
     onentrieschange?: (entries: AgentEntry[], sessionId: string | null, ready: boolean) => void;
-    onnativeplan?: (plan: NativePlan | null) => void;
+    onnativeplan?: (plan: NativePlan | null, live?: boolean) => void;
     planRevision?: { id: string; feedback: string };
     onplanrevisionresult?: (id: string, failure: string | null) => void;
     ondecision?: (thread: AgentThread, permission: AgentPermission, optionId: string) => void;
@@ -1055,7 +1055,7 @@
       saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
     if (activeSessionId && !replay.active)
       acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
-    onnativeplan?.(nativePlan);
+    onnativeplan?.(nativePlan, !replay.active);
     if (replay.active) {
       // ACP does not identify live updates interleaved with session/load replay (#342).
       // A mutable running flag cannot establish provenance for old failed tools.
@@ -1884,7 +1884,7 @@
           setSetting(failedDraftKey(), [pending, draft].filter(Boolean).join('\n\n'));
       }
       setReplaying(false);
-      rememberTranscript();
+      rememberTranscript(true);
       if (activeSessionId && !nativeEntries && !ephemeral)
         trackLiveTranscript(agent, directory, activeSessionId, entries, historyLoaded);
       generation++;
