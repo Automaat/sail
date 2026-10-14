@@ -1722,6 +1722,10 @@
   let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
+  const sidebarInventoryDelay = import.meta.env.MODE === 'e2e' ? 250 : 5_000;
+  const foregroundAgentLoading = $derived.by(() =>
+    leaves(paneLayout).some((pane) => pane.agent && agentEntrySnapshots[pane.id]?.ready !== true),
+  );
   let agentDetectionSettled = false;
   let projectLoadGeneration = 0;
 
@@ -5421,10 +5425,10 @@
             if (issue.error !== pendingNotice) await update({ error: pendingNotice });
             return;
           }
-          let preview: WorktreeRemovalPreview[] = [];
+          let preview: WorktreeCleanupSummary[] = [];
           let previewFailure: string | null = null;
           try {
-            preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+            preview = await invoke<WorktreeCleanupSummary[]>('worktree_cleanup_summary', {
               repository: run.repository,
               paths: targets.map((worktree) => worktree.path),
             });
@@ -5453,7 +5457,7 @@
               {
                 originalPath: worktree.path,
                 recoveryPath: worktree.path,
-                sizeBytes: state?.sizeBytes ?? null,
+                sizeBytes: null,
                 registeredWorktreesAtMark: registered.map(
                   ({ path: registeredPath, generation }) => ({
                     path: registeredPath,
@@ -5462,15 +5466,13 @@
                 ),
                 reason:
                   previewFailure ??
-                  (state.inspectionError
-                    ? `Cannot verify checkout contents: ${state.inspectionError}`
-                    : state.dirty
-                      ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
-                      : state.activeSessions.length
-                        ? 'Agent sessions are connected. Finish them before retrying cleanup.'
-                        : index === 0
-                          ? 'The merged ship worktree remains registered. Confirm it is unused before cleanup.'
-                          : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.'),
+                  (state.dirty
+                    ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+                    : state.activeSessions.length
+                      ? 'Agent sessions are connected. Finish them before retrying cleanup.'
+                      : index === 0
+                        ? 'The merged ship worktree remains registered. Confirm it is unused before cleanup.'
+                        : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.'),
               },
               worktree.generation,
             );
@@ -9114,6 +9116,11 @@
     inspectionError: string | null;
   };
 
+  type WorktreeCleanupSummary = Pick<
+    WorktreeRemovalPreview,
+    'path' | 'branch' | 'generation' | 'dirty' | 'activeSessions'
+  >;
+
   function pendingRecoveryFromError(cause: unknown): PendingWorktreeCleanup | null {
     const message = describe(cause);
     const prefix = 'SAIL_PENDING_RECOVERY:';
@@ -9194,6 +9201,7 @@
     }
     deletingWorktreeRepositories.add(repository);
     deletingWorktreeRequests.add(path);
+    worktreeDeletions = { ...worktreeDeletions, [path]: 'Inspecting worktree' };
     try {
       const canonicalCatalog = await canonicalizedProjectCatalog(repository);
       if (canonicalCatalog !== projectCatalog) saveProjectCatalog(canonicalCatalog);
@@ -9231,6 +9239,11 @@
     } finally {
       deletingWorktreeRequests.delete(path);
       deletingWorktreeRepositories.delete(repository);
+      if (worktreeDeletions[path] === 'Inspecting worktree') {
+        const remaining = { ...worktreeDeletions };
+        delete remaining[path];
+        worktreeDeletions = remaining;
+      }
     }
   }
 
@@ -9252,7 +9265,7 @@
       error = 'Another descendant deletion is in progress. Retry after it finishes.';
       return;
     }
-    const preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+    const preview = await invoke<WorktreeCleanupSummary[]>('worktree_cleanup_summary', {
       repository,
       paths: targets.map((worktree) => worktree.path),
     });
@@ -9273,11 +9286,10 @@
     const lines = targets.map((worktree, index) => {
       const state = preview[index];
       const warnings = [
-        state.inspectionError ? 'files cannot be fully inspected' : null,
         state.dirty ? 'uncommitted changes' : null,
         state.activeSessions.length ? `connected: ${state.activeSessions.join(', ')}` : null,
       ].filter(Boolean);
-      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}\n  Revision: ${state.revision}\n  Retained size: ${state.sizeBytes === null ? 'unknown' : `${state.sizeBytes} bytes`}`;
+      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}`;
     });
     const e2eAnswer =
       import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
@@ -9304,13 +9316,11 @@
       // original path and removal snapshot must survive marking its parent.
       if (worktree.pendingCleanup) continue;
       const state = preview[index];
-      const reason = state.inspectionError
-        ? `Cannot verify checkout contents: ${state.inspectionError}`
-        : state.dirty
-          ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
-          : state.activeSessions.length
-            ? 'Agent sessions are connected. Finish them before retrying cleanup.'
-            : 'Awaiting explicit confirmation that this worktree is unused.';
+      const reason = state.dirty
+        ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+        : state.activeSessions.length
+          ? 'Agent sessions are connected. Finish them before retrying cleanup.'
+          : 'Awaiting explicit confirmation that this worktree is unused.';
       pendingCatalog = markWorktreeCleanupPending(
         pendingCatalog,
         repository,
@@ -9318,7 +9328,7 @@
         {
           originalPath: worktree.path,
           recoveryPath: worktree.path,
-          sizeBytes: state.sizeBytes,
+          sizeBytes: null,
           registeredWorktreesAtMark: registered.map(({ path: registeredPath, generation }) => ({
             path: registeredPath,
             generation,
@@ -10792,7 +10802,7 @@
     sidebarInventoryFailure = failure ?? '';
   }
 
-  function scheduleSidebarInventoryRefresh() {
+  function scheduleSidebarInventoryRefresh(delay = sidebarInventoryDelay) {
     clearTimeout(sidebarInventoryTimer);
     sidebarInventoryReadyKey = '';
     const key = sidebarDirectoryKey;
@@ -10808,7 +10818,7 @@
         },
         (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
-    }, 250);
+    }, delay);
   }
 
   if (import.meta.env.MODE === 'e2e') {
@@ -10824,11 +10834,20 @@
   $effect(() => {
     const tracked = sidebarDirectoryKey;
     const available = agentAvailability.some((agent) => agent.id === 'opencode' && agent.available);
-    if (tracked && available) scheduleSidebarInventoryRefresh();
+    const loading = foregroundAgentLoading;
+    if (!tracked || !available) return;
+    if (loading) {
+      clearTimeout(sidebarInventoryTimer);
+      sidebarInventoryTimer = undefined;
+      sidebarInventoryReadyKey = '';
+      return;
+    }
+    scheduleSidebarInventoryRefresh();
   });
 
   function openAgent(agent: AgentId, thread: AgentThread | null = null, preserveCycle = false) {
     if (!directory) return;
+    if (sidebarInventoryTimer !== undefined) scheduleSidebarInventoryRefresh();
     sideChat = null;
     if (!preserveCycle) {
       recentCycleKeys = null;
@@ -12229,7 +12248,7 @@
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
       rememberRecentThread(thread);
-      scheduleSidebarInventoryRefresh();
+      scheduleSidebarInventoryRefresh(250);
       return;
     }
     saveAgentThread(thread);
