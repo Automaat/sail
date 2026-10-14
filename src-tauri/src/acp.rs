@@ -4667,7 +4667,10 @@ fn claude_adapter_subagent_signature(update: &Value) -> bool {
 fn native_activity_fence(update: &Value) -> Option<(&str, bool)> {
     let tool_id = update.get("toolCallId").and_then(Value::as_str)?;
     let status = update.get("status").and_then(Value::as_str);
-    if matches!(status, Some("completed" | "failed")) {
+    if matches!(
+        status,
+        Some("completed" | "failed" | "cancelled" | "interrupted")
+    ) {
         return Some((tool_id, false));
     }
     update
@@ -11388,14 +11391,20 @@ mod capability_profile_tests {
     }
 
     #[test]
-    fn generic_native_activity_fence_tracks_only_adapter_marked_live_tools() {
+    fn settled_native_activity_reopens_parent_task_access() {
         let live = json!({"toolCallId":"agent-tool","subagent":true,"status":"in_progress"});
         let ordinary = json!({"toolCallId":"shell","status":"in_progress"});
-        let done = json!({"toolCallId":"agent-tool","status":"completed"});
 
         assert_eq!(native_activity_fence(&live), Some(("agent-tool", true)));
         assert_eq!(native_activity_fence(&ordinary), None);
-        assert_eq!(native_activity_fence(&done), Some(("agent-tool", false)));
+        for status in ["completed", "failed", "cancelled", "interrupted"] {
+            let settled = json!({"toolCallId":"agent-tool","status":status});
+            assert_eq!(
+                native_activity_fence(&settled),
+                Some(("agent-tool", false)),
+                "{status} must release the parent task-attribution fence"
+            );
+        }
     }
 
     #[test]

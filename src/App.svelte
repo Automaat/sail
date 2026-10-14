@@ -27,7 +27,11 @@
   } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
   import PlanPanel from './PlanPanel.svelte';
-  import { agentFocusDisplay, type AgentFocusDisplay } from './lib/agent-focus';
+  import {
+    agentFocusDisplay,
+    restoredFocusActiveTurns,
+    type AgentFocusDisplay,
+  } from './lib/agent-focus';
   import TasksPanel from './TasksPanel.svelte';
   import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
   import { sessionTasks, TASK_TOOLS, taskScopeKey } from './lib/session-tasks';
@@ -12746,14 +12750,9 @@
         if (attempt < 2) await restoreAgentActivity(attempt + 1);
         return;
       }
-      focusActiveTurns = Object.fromEntries(
-        agentThreads.flatMap((thread) => {
-          const turn =
-            backendActivity[JSON.stringify([thread.directory, thread.agent])]?.activeTurns[
-              thread.sessionId
-            ];
-          return turn ? [[threadKey(thread), turn]] : [];
-        }),
+      focusActiveTurns = restoredFocusActiveTurns(
+        [...agentThreads, ...nativeChildThreads],
+        backendActivity,
       );
       const previousAttention = threadAttention;
       threadAttention = reconcileAttention(
