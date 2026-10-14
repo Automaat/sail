@@ -33,6 +33,7 @@ struct Client {
     agent: Option<String>,
     profile: CapabilityProfile,
     native_children: HashMap<String, Option<String>>,
+    unattributed_native_activity: HashSet<String>,
 }
 
 const RELEASED_TOKENS_KEPT: usize = 64;
@@ -122,6 +123,12 @@ fn resolve_task_session(client: &Client, provider_id: Option<&str>) -> Result<St
         .strip_prefix("sail-owned:")
         .and_then(|rest| rest.split_once(':'))
         .map_or(parent, |(_, id)| id);
+    if !client.unattributed_native_activity.is_empty() {
+        return Err(
+            "Task identity is unavailable while unattributed native child activity shares this connection."
+                .into(),
+        );
+    }
     if client.native_children.is_empty() {
         if provider_id.is_some_and(|identity| identity != wire_parent) {
             return Err("Task identity does not match this connection.".into());
@@ -205,6 +212,7 @@ impl BrowserManager {
                     agent: agent.map(str::to_string),
                     profile: CapabilityProfile::Build,
                     native_children: HashMap::new(),
+                    unattributed_native_activity: HashSet::new(),
                 },
             );
         let port = *self.0.port.lock().map_err(|error| error.to_string())?;
@@ -272,6 +280,7 @@ impl BrowserManager {
             clients.values().any(|client| {
                 client.agent.as_deref() == Some(agent)
                     && client.directory == directory
+                    && client.unattributed_native_activity.is_empty()
                     && ((client.session.as_deref() == Some(session)
                         && (client.native_children.is_empty() || agent == "opencode"))
                         || (agent == "opencode"
@@ -301,6 +310,32 @@ impl BrowserManager {
                 client
                     .native_children
                     .insert(child.to_string(), provider_id.map(str::to_string));
+            }
+        }
+    }
+
+    pub fn set_unattributed_native_activity(
+        &self,
+        agent: &str,
+        directory: &Path,
+        parent: &str,
+        activity: &str,
+        active: bool,
+    ) {
+        if let Ok(mut clients) = self.0.clients.lock() {
+            for client in clients.values_mut().filter(|client| {
+                client.agent.as_deref() == Some(agent)
+                    && client.directory == directory
+                    && (client.session.as_deref() == Some(parent)
+                        || client.native_children.contains_key(parent))
+            }) {
+                if active {
+                    client
+                        .unattributed_native_activity
+                        .insert(activity.to_string());
+                } else {
+                    client.unattributed_native_activity.remove(activity);
+                }
             }
         }
     }
@@ -2770,6 +2805,7 @@ mod native_task_identity_tests {
             agent: Some(agent.into()),
             profile: CapabilityProfile::Build,
             native_children: HashMap::new(),
+            unattributed_native_activity: HashSet::new(),
         }
     }
 
@@ -2811,6 +2847,67 @@ mod native_task_identity_tests {
                 assert!(resolve_task_session(&source, Some("parent")).is_err());
             }
         }
+    }
+
+    #[test]
+    fn unattributed_native_activity_fences_parent_and_child_task_writes() {
+        let mut source = client("claude");
+        source
+            .unattributed_native_activity
+            .insert("agent-tool".into());
+
+        assert!(resolve_task_session(&source, None).is_err());
+        assert!(resolve_task_session(&source, Some("parent")).is_err());
+
+        source.unattributed_native_activity.clear();
+        assert_eq!(resolve_task_session(&source, None).unwrap(), "parent");
+    }
+
+    #[test]
+    fn attribution_fence_stays_with_its_parent_agent_directory_and_token() {
+        let manager = BrowserManager::default();
+        let mut clients = manager.0.clients.lock().unwrap();
+        clients.insert("source".into(), client("claude"));
+        let mut unrelated = client("claude");
+        unrelated.session = Some("other".into());
+        clients.insert("other-parent".into(), unrelated);
+        clients.insert("other-agent".into(), client("codex"));
+        let mut elsewhere = client("claude");
+        elsewhere.directory = PathBuf::from("/elsewhere");
+        clients.insert("other-directory".into(), elsewhere);
+        drop(clients);
+
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "agent-tool",
+            true,
+        );
+
+        let clients = manager.0.clients.lock().unwrap();
+        assert!(resolve_task_session(&clients["source"], None).is_err());
+        for key in ["other-parent", "other-agent", "other-directory"] {
+            assert!(clients[key].unattributed_native_activity.is_empty());
+            assert_eq!(
+                resolve_task_session(&clients[key], None).unwrap(),
+                clients[key].session.as_deref().unwrap()
+            );
+        }
+
+        drop(clients);
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "agent-tool",
+            false,
+        );
+        let clients = manager.0.clients.lock().unwrap();
+        assert_eq!(
+            resolve_task_session(&clients["source"], None).unwrap(),
+            "parent"
+        );
     }
 
     #[test]
