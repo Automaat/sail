@@ -511,6 +511,7 @@ struct Connection {
     owner: Option<String>,
     #[cfg(unix)]
     shared_build_directory: Option<PathBuf>,
+    codex_workspace_access: Option<CodexWorkspaceAccess>,
     _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(unix)]
@@ -548,19 +549,23 @@ struct Connection {
     _owned_temp: Option<OwnedTempDir>,
 }
 
-struct OwnedTempDir(PathBuf);
+struct OwnedTempDir(PathBuf, crate::WorktreeDirectoryIdentity);
 
 impl OwnedTempDir {
     fn create() -> Result<Self, String> {
         let path = std::env::temp_dir().join(format!("sail-codex-{}", Uuid::new_v4()));
         std::fs::create_dir(&path).map_err(|error| error.to_string())?;
-        Ok(Self(path))
+        let identity =
+            crate::worktree_directory_identity(&path).map_err(|error| error.to_string())?;
+        Ok(Self(path, identity))
     }
 }
 
 impl Drop for OwnedTempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if crate::worktree_directory_identity(&self.0).is_ok_and(|identity| identity == self.1) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -607,6 +612,21 @@ struct SessionUiState {
 }
 
 impl Connection {
+    fn validate_codex_workspace(&self, cwd: Option<&str>) -> Result<(), String> {
+        let Some(access) = &self.codex_workspace_access else {
+            return Ok(());
+        };
+        if let Err(error) = access.validate(cwd) {
+            if let Err(stop_error) = self.terminate() {
+                return Err(format!(
+                    "{error} Agent shutdown requires recovery: {stop_error}"
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn remember_session_ui(&self, session_id: &str, source: &Value) -> Result<(), String> {
         let config_options = source.get("configOptions").filter(|value| value.is_array());
         let available_commands = source
@@ -759,40 +779,227 @@ fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]
     params
 }
 
-fn codex_overlay_profile_config(
-    scope: &Path,
-    overlay: &crate::git_overlay::GitOverlay,
-    temp: &Path,
-    extra_writable: &[PathBuf],
-) -> Result<String, String> {
-    let mut writable = vec![
-        scope.to_path_buf(),
-        overlay.git_dir.clone(),
-        temp.to_path_buf(),
-    ];
-    writable.extend_from_slice(extra_writable);
-    let mut rules = vec![
-        "\":tmpdir\"=\"read\"".to_string(),
-        "\":slash_tmp\"=\"read\"".to_string(),
-    ];
-    for path in writable {
-        let key =
-            serde_json::to_string(&path.to_string_lossy()).map_err(|error| error.to_string())?;
-        rules.push(format!("{key}=\"write\""));
-    }
-    serde_json::to_string(&json!({
-        "configOverrides": [
-            "default_permissions=\"sail-agent\"",
-            "permissions.sail-read-only={extends=\":read-only\"}",
-            format!("permissions.sail-agent={{extends=\":workspace\",filesystem={{{}}}}}", rules.join(","))
-        ],
-        "modeProfiles": {
-            "read-only": "sail-read-only",
-            "agent": "sail-agent",
-            "agent-full-access": "sail-agent"
+#[cfg(windows)]
+fn windows_directory_owned_by_current_user(path: &Path) -> Result<bool, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TokenOwner, TokenUser, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        READ_CONTROL,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct SecurityDescriptor(HLOCAL);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0);
+            }
         }
-    }))
-    .map_err(|error| error.to_string())
+    }
+
+    fn token_information(
+        token: HANDLE,
+        class: TOKEN_INFORMATION_CLASS,
+    ) -> Result<Vec<usize>, String> {
+        let mut length = 0;
+        unsafe {
+            GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut length);
+        }
+        if length == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut buffer = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                buffer.as_mut_ptr().cast(),
+                length,
+                &mut length,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(buffer)
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(crate::extended_windows_path(path))
+        .map_err(|error| error.to_string())?;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32).to_string());
+    }
+    let _descriptor = SecurityDescriptor(descriptor);
+    if owner.is_null() {
+        return Err("Assigned directory has no verifiable owner SID.".into());
+    }
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let user_info = token_information(token.as_raw_handle(), TokenUser)?;
+    let user = unsafe { &*user_info.as_ptr().cast::<TOKEN_USER>() };
+    if unsafe { EqualSid(owner, user.User.Sid) } != 0 {
+        return Ok(true);
+    }
+    // Elevated processes create directories with their token's default owner SID.
+    let owner_info = token_information(token.as_raw_handle(), TokenOwner)?;
+    let default_owner = unsafe { &*owner_info.as_ptr().cast::<TOKEN_OWNER>() };
+    Ok(unsafe { EqualSid(owner, default_owner.Owner) } != 0)
+}
+
+#[derive(Debug)]
+struct WritableDirectory {
+    path: PathBuf,
+    identity: crate::WorktreeDirectoryIdentity,
+}
+
+impl WritableDirectory {
+    fn capture(path: &Path) -> Result<Self, String> {
+        let canonical = dunce::canonicalize(path).map_err(|error| {
+            format!(
+                "Assigned workspace access unavailable at {}: {error}",
+                path.display()
+            )
+        })?;
+        let metadata = std::fs::metadata(&canonical).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "Assigned workspace access requires a directory: {}",
+                path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { nix::libc::geteuid() } {
+                return Err(format!(
+                    "Assigned workspace directory is not owned by this user: {}",
+                    path.display()
+                ));
+            }
+        }
+        #[cfg(windows)]
+        if !windows_directory_owned_by_current_user(&canonical).map_err(|error| {
+            format!(
+                "Cannot verify assigned workspace owner at {}: {error}",
+                path.display()
+            )
+        })? {
+            return Err(format!(
+                "Assigned workspace directory is not owned by this user: {}",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            identity: crate::worktree_directory_identity(&canonical)
+                .map_err(|error| format!("Cannot inspect assigned workspace identity: {error}"))?,
+            path: canonical,
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let current = Self::capture(&self.path)?;
+        if current.path != self.path || current.identity != self.identity {
+            return Err(format!("Assigned workspace directory was replaced: {}. Reopen the thread after restoring its assigned location.", self.path.display()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CodexWorkspaceAccess {
+    directories: Vec<WritableDirectory>,
+}
+
+impl CodexWorkspaceAccess {
+    fn capture(scope: &Path, extra_writable: &[PathBuf]) -> Result<Self, String> {
+        let mut directories = vec![WritableDirectory::capture(scope)?];
+        for path in extra_writable {
+            if std::fs::symlink_metadata(path)
+                .map_err(|error| format!("Cannot inspect owned writable directory: {error}"))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(format!(
+                    "Owned writable directory was replaced by a symlink: {}",
+                    path.display()
+                ));
+            }
+            let directory = WritableDirectory::capture(path)?;
+            if !directories
+                .iter()
+                .any(|current| current.path == directory.path)
+            {
+                directories.push(directory);
+            }
+        }
+        Ok(Self { directories })
+    }
+
+    fn validate(&self, cwd: Option<&str>) -> Result<(), String> {
+        for directory in &self.directories {
+            directory.validate()?;
+        }
+        if let Some(cwd) = cwd {
+            let cwd = dunce::canonicalize(cwd)
+                .map_err(|error| format!("Assigned session directory is unavailable: {error}"))?;
+            if !cwd.starts_with(&self.directories[0].path) {
+                return Err("Session directory is outside its assigned workspace. Start a new agent in that location.".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn profile_config(&self) -> Result<String, String> {
+        self.validate(None)?;
+        let mut rules = Vec::new();
+        for directory in &self.directories {
+            let path = directory
+                .path
+                .to_str()
+                .ok_or("Assigned workspace path is not valid UTF-8.")?;
+            let key = serde_json::to_string(path).map_err(|error| error.to_string())?;
+            rules.push(format!("{key}=\"write\""));
+        }
+        serde_json::to_string(&json!({
+            "configOverrides": [
+                "default_permissions=\"sail-agent\"",
+                "permissions.sail-read-only={extends=\":read-only\"}",
+                format!("permissions.sail-agent={{extends=\":read-only\",filesystem={{{}}}}}", rules.join(","))
+            ],
+            "modeProfiles": {
+                "read-only": "sail-read-only",
+                "agent": "sail-agent",
+                "agent-full-access": "sail-agent"
+            }
+        })).map_err(|error| error.to_string())
+    }
 }
 
 fn session_servers(browser: Value) -> Vec<Value> {
@@ -1531,6 +1738,10 @@ impl Connection {
         write_message: impl FnOnce(&Value) -> Result<(), String>,
         after_write: impl FnOnce(),
     ) -> Result<PendingResponse, String> {
+        if method.starts_with("session/") || method.starts_with("_session/") {
+            self.validate_codex_workspace(params.get("cwd").and_then(Value::as_str))?;
+        }
+
         if !self.alive.load(Ordering::Acquire) {
             return Err("Agent process stopped. Reopen the thread to reconnect.".into());
         }
@@ -4404,6 +4615,7 @@ fn connect_blocking_inner(
         .cloned();
     if let Some(existing) = existing {
         if existing.alive.load(Ordering::Acquire) {
+            existing.validate_codex_workspace(None)?;
             drop(_startup);
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut capabilities = existing
@@ -4563,29 +4775,37 @@ fn connect_blocking_inner(
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
-    if let Some(temp) = owned_temp.as_ref() {
-        if let Some(overlay) = overlay.as_ref() {
-            let shared_cache = data_directory
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(&data_directory)
-                .join("terminal-package-downloads");
-            std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
-            command.env(
-                "CODEX_ACP_PERMISSION_PROFILE_CONFIG",
-                codex_overlay_profile_config(
-                    worktree,
-                    overlay,
-                    &temp.0,
-                    &[data_directory.clone(), shared_cache],
-                )?,
-            );
-        }
-    }
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
     #[cfg(not(unix))]
-    let scratch_path = None;
+    let scratch_path: Option<&Path> = None;
+    let codex_workspace_access = if let Some(temp) = owned_temp.as_ref() {
+        let shared_cache = data_directory
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&data_directory)
+            .join("terminal-package-downloads");
+        std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
+        let mut writable = vec![temp.0.clone(), data_directory.clone(), shared_cache];
+        if let Some(overlay) = overlay.as_ref() {
+            writable.push(overlay.git_dir.clone());
+        }
+        if let Some(scratch) = scratch_path {
+            writable.push(scratch.to_path_buf());
+        }
+        if let Some(build) = shared_build_directory.as_ref() {
+            std::fs::create_dir_all(build).map_err(|error| error.to_string())?;
+            writable.push(build.clone());
+        }
+        let access = CodexWorkspaceAccess::capture(worktree, &writable)?;
+        command.env(
+            "CODEX_ACP_PERMISSION_PROFILE_CONFIG",
+            access.profile_config()?,
+        );
+        Some(access)
+    } else {
+        None
+    };
     for (name, value) in runtime_environment(
         &data_directory,
         storage_lease.temp_directory(),
@@ -4691,6 +4911,7 @@ fn connect_blocking_inner(
         owner: owner.map(str::to_string),
         #[cfg(unix)]
         shared_build_directory,
+        codex_workspace_access,
         _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
         #[cfg(unix)]
@@ -7733,6 +7954,7 @@ time.sleep(10)
             owner: owner.map(str::to_string),
             #[cfg(unix)]
             shared_build_directory: build_directory,
+            codex_workspace_access: None,
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
@@ -8113,6 +8335,7 @@ time.sleep(10)
                 owner: None,
                 #[cfg(unix)]
                 shared_build_directory: None,
+                codex_workspace_access: None,
                 _storage_lease: None,
                 child: Mutex::new(child),
                 scratch_owner: None,
@@ -8496,6 +8719,177 @@ time.sleep(10)
         assert_eq!(request["mcpServers"][0]["name"], "sail-browser");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn codex_workspace_access_checks_windows_directory_ownership() {
+        let assigned = std::env::current_dir().unwrap();
+        CodexWorkspaceAccess::capture(&assigned, &[]).unwrap();
+        let system = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"));
+        let error = CodexWorkspaceAccess::capture(&system, &[]).unwrap_err();
+        assert!(error.contains("not owned by this user"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_workspace_access_rejects_steering_and_stops_invalid_runtime() {
+        let assigned = std::env::current_dir().unwrap();
+        let previous = assigned.parent().unwrap();
+        let runtime = test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &assigned,
+            "session",
+            None,
+        );
+        let mut runtime = Arc::try_unwrap(runtime).ok().unwrap();
+        let mut access = CodexWorkspaceAccess::capture(&assigned, &[]).unwrap();
+        access.directories[0].identity = crate::worktree_directory_identity(previous).unwrap();
+        runtime.codex_workspace_access = Some(access);
+        let error = runtime
+            .request(
+                "_session/steering",
+                json!({"sessionId":"session"}),
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(error.contains("replaced"), "{error}");
+        assert!(!runtime.alive.load(Ordering::Acquire));
+        assert!(runtime.pending.lock().unwrap().is_empty());
+        assert!(runtime.child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn codex_workspace_access_is_canonical_and_survives_restore_checks() {
+        let root = scratch("codex-access");
+        let assigned = root.join("assigned");
+        let owned = root.join("owned");
+        let sibling = root.join("sibling");
+        for path in [&assigned, &owned, &sibling] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let access =
+            CodexWorkspaceAccess::capture(&assigned, std::slice::from_ref(&owned)).unwrap();
+        access.validate(Some(assigned.to_str().unwrap())).unwrap();
+        access.validate(Some(assigned.to_str().unwrap())).unwrap();
+        assert!(access
+            .validate(Some(sibling.to_str().unwrap()))
+            .unwrap_err()
+            .contains("outside"));
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let rules = config["configOverrides"][2].as_str().unwrap();
+        assert!(rules.contains("extends=\":read-only\""));
+        assert!(!rules.contains(":workspace"));
+        assert!(!rules.contains(sibling.to_str().unwrap()));
+        assert!(!rules.contains(":tmpdir"));
+        #[cfg(unix)]
+        {
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(&assigned, &alias).unwrap();
+            let aliased =
+                CodexWorkspaceAccess::capture(&alias, std::slice::from_ref(&owned)).unwrap();
+            assert_eq!(
+                access.profile_config().unwrap(),
+                aliased.profile_config().unwrap()
+            );
+            access.validate(Some(alias.to_str().unwrap())).unwrap();
+            assert!(CodexWorkspaceAccess::capture(&assigned, &[alias])
+                .unwrap_err()
+                .contains("symlink"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_workspace_access_rejects_missing_files_and_replaced_roots() {
+        let root = scratch("codex-invalid-access");
+        assert!(CodexWorkspaceAccess::capture(&root.join("missing"), &[]).is_err());
+        let file = root.join("file");
+        std::fs::write(&file, "data").unwrap();
+        assert!(CodexWorkspaceAccess::capture(&file, &[]).is_err());
+        let assigned = root.join("assigned");
+        std::fs::create_dir(&assigned).unwrap();
+        let access = CodexWorkspaceAccess::capture(&assigned, &[]).unwrap();
+        std::fs::rename(&assigned, root.join("previous")).unwrap();
+        std::fs::create_dir(&assigned).unwrap();
+        assert!(access.validate(None).unwrap_err().contains("replaced"));
+        #[cfg(unix)]
+        {
+            let unowned = Path::new("/");
+            use std::os::unix::fs::MetadataExt;
+            if std::fs::metadata(unowned).unwrap().uid() != unsafe { nix::libc::geteuid() } {
+                assert!(CodexWorkspaceAccess::capture(unowned, &[])
+                    .unwrap_err()
+                    .contains("not owned"));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_workspace_access_runs_format_and_build_inside_the_sandbox() {
+        let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") else {
+            return;
+        };
+        let root = scratch("codex-sandbox-access");
+        let assigned = root.join("assigned");
+        let owned = root.join("owned");
+        let sibling = root.join("sibling");
+        for path in [&assigned, &owned, &sibling] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let source = assigned.join("main.rs");
+        std::fs::write(&source, "fn main(){println!(\"assigned workspace\");}").unwrap();
+        let access =
+            CodexWorkspaceAccess::capture(&assigned, std::slice::from_ref(&owned)).unwrap();
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let run = |cwd: &Path, arguments: &[&str]| {
+            let mut command = Command::new(&codex);
+            command
+                .arg("sandbox")
+                .args(["-P", "sail-agent", "-C"])
+                .arg(cwd);
+            for value in config["configOverrides"].as_array().unwrap() {
+                command.arg("-c").arg(value.as_str().unwrap());
+            }
+            command.arg("--").args(arguments).output().unwrap()
+        };
+        let formatted = run(&assigned, &["rustfmt", source.to_str().unwrap()]);
+        assert!(
+            formatted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&formatted.stderr)
+        );
+        let binary = owned.join("program");
+        let built = run(
+            &assigned,
+            &[
+                "rustc",
+                source.to_str().unwrap(),
+                "-o",
+                binary.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        assert!(binary.is_file());
+        let forbidden = sibling.join("denied");
+        for cwd in [&assigned, &sibling] {
+            let denied = run(cwd, &["/usr/bin/touch", forbidden.to_str().unwrap()]);
+            assert!(!denied.status.success());
+            assert!(!forbidden.exists());
+        }
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&assigned, &alias).unwrap();
+        assert!(run(&alias, &["rustfmt", source.to_str().unwrap()])
+            .status
+            .success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn linked_worktree_session_grants_only_its_private_git_overlay() {
         let root = scratch("linked-git");
@@ -8555,13 +8949,16 @@ time.sleep(10)
             crate::acp_terminal::stable_worktree_identity(&linked.canonicalize().unwrap())
         );
         let build_cache = root.join("task-build-cache");
+        let task_temp = root.join("task-tmp");
+        std::fs::create_dir(&build_cache).unwrap();
+        std::fs::create_dir(&task_temp).unwrap();
         let profile: Value = serde_json::from_str(
-            &codex_overlay_profile_config(
+            &CodexWorkspaceAccess::capture(
                 &linked,
-                &overlay,
-                &root.join("task-tmp"),
-                std::slice::from_ref(&build_cache),
+                &[overlay.git_dir.clone(), task_temp, build_cache.clone()],
             )
+            .unwrap()
+            .profile_config()
             .unwrap(),
         )
         .unwrap();
@@ -8576,14 +8973,23 @@ time.sleep(10)
             value.as_str().is_some_and(|value| {
                 value.contains("filesystem")
                     && value.contains(
-                        &serde_json::to_string(&overlay.git_dir.to_string_lossy()).unwrap(),
+                        &serde_json::to_string(
+                            &dunce::canonicalize(&overlay.git_dir)
+                                .unwrap()
+                                .to_string_lossy(),
+                        )
+                        .unwrap(),
                     )
             })
         }));
         assert!(overrides
             .iter()
-            .any(|value| value.as_str().is_some_and(|value| value
-                .contains(&serde_json::to_string(&build_cache.to_string_lossy()).unwrap()))));
+            .any(|value| value.as_str().is_some_and(|value| value.contains(
+                &serde_json::to_string(
+                    &dunce::canonicalize(&build_cache).unwrap().to_string_lossy()
+                )
+                .unwrap()
+            ))));
         let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
         assert_eq!(
             restored["additionalDirectories"],
@@ -9030,6 +9436,7 @@ mod native_subagent_fence_tests {
             owner: None,
             #[cfg(unix)]
             shared_build_directory: None,
+            codex_workspace_access: None,
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
