@@ -111,6 +111,13 @@ int main(void) {
             continue;
         }
         int tool_call = strstr(line, "\"method\":\"tools/call\"") != NULL;
+        if (tool_call && strstr(line, "\"name\":\"get\"")) {
+            printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"content\":\"", value);
+            for (size_t index = 0; index < 2 * 1024 * 1024; index++) putchar('x');
+            puts("\"}}");
+            fflush(stdout);
+            continue;
+        }
         int tools_changed = tool_call && strstr(line, "\"name\":\"fixture_tools_changed\"");
         if (tool_call && roots_supported) {
             puts("{\"jsonrpc\":\"2.0\",\"id\":884,\"method\":\"roots/list\"}");

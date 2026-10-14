@@ -311,9 +311,11 @@ int sail_context_service_main(void) {
                             stopInvalidatedProvider(session, binding);
                         }
                         NSString *request = field(message, "request");
+                        uint64_t responseLimit = xpc_dictionary_get_uint64(message, "responseLimit");
                         if (!session || !equalCapability(capability, session[@"capability"]) ||
                             ![binding[@"projectKey"] isEqualToString:session[@"projectKey"]] ||
-                            !request || request.length > 1024 * 1024) {
+                            !request || request.length > 1024 * 1024 ||
+                            responseLimit < 2 || responseLimit > 64ULL * 1024 * 1024 + 1) {
                             closeSession(sessions, key);
                             xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                         } else {
@@ -355,13 +357,13 @@ int sail_context_service_main(void) {
                                     });
                                     return accepted;
                                 };
-                                char *output = calloc(1024 * 1024 + 1, 1);
+                                char *output = calloc((size_t)responseLimit, 1);
                                 bool success = output && sail_context_provider_request(
                                     [session[@"directory"] UTF8String],
                                     [session[@"fingerprint"] UTF8String],
                                     [session[@"capability"] UTF8String], request.UTF8String,
                                     deliverNotification, (__bridge void *)notify,
-                                    output, 1024 * 1024 + 1);
+                                    output, (size_t)responseLimit);
                                 dispatch_async(queue, ^{
                                     NSString *responseText = output ? [NSString stringWithUTF8String:output] : nil;
                                     NSString *responseLine = [[responseText componentsSeparatedByString:@"\n"] lastObject];
@@ -595,6 +597,7 @@ static bool sessionExchange(void *handle, const char *op, const char *message,
         xpc_dictionary_set_string(request, "op", op);
         xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
         if (message) xpc_dictionary_set_string(request, "request", message);
+        xpc_dictionary_set_uint64(request, "responseLimit", outputLength);
         xpc_object_t reply = xpc_connection_send_message_with_reply_sync(session.connection, request);
         if (!sessionGenerationValid(session) ||
             ![senderBundlePath(reply) isEqualToString:session.bundlePath]) {

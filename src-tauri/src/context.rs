@@ -12,6 +12,10 @@ use tauri::Manager;
 
 const CONFIG: &str = ".sail/worktree.json";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "macos")]
+const DEFAULT_PROVIDER_RESPONSE_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "macos")]
+const LARGE_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -539,7 +543,7 @@ pub fn provider_mcp_server(app: &tauri::AppHandle, directory: &Path) -> Option<s
     }
     let executable = std::env::current_exe().ok()?;
     Some(serde_json::json!({
-        "name": current.id?,
+        "name": "sail-context",
         "command": executable.to_string_lossy(),
         "args": ["--context-mcp", canonical.to_string_lossy()],
         "env": []
@@ -887,9 +891,12 @@ impl ContextSession {
     }
 
     pub fn request(&self, message: &str) -> Result<Option<String>, String> {
+        let response_limit = serde_json::from_str::<serde_json::Value>(message)
+            .map(|request| provider_response_limit(&request))
+            .unwrap_or(DEFAULT_PROVIDER_RESPONSE_BYTES);
         let message = std::ffi::CString::new(message)
             .map_err(|_| "Context MCP request contains a NUL byte.".to_string())?;
-        let mut output = vec![0_i8; 1024 * 1024 + 1];
+        let mut output = vec![0_i8; response_limit + 1];
         let mut error = [0_i8; 512];
         if !unsafe {
             sail_context_session_request(
@@ -924,12 +931,50 @@ impl ContextSession {
 
 #[cfg(target_os = "macos")]
 pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
+    use crate::context_output_store::{OutputLimits, OutputScope, OutputStore};
     use std::io::BufRead;
     enum Event {
         Input(Result<Option<String>, String>),
         Response(Result<Option<String>, String>),
         OutputError(String),
     }
+    let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
+    let provider = locked_store(&service_store_path()?, |store| {
+        Ok((status(&canonical, store), false))
+    })?;
+    if provider.state != "approved" {
+        return Err("Context provider is not approved.".into());
+    }
+    let provider_id = provider.id.ok_or("Context provider ID is unavailable.")?;
+    let revision = provider
+        .revision
+        .ok_or("Context provider revision is unavailable.")?;
+    let common_dir = String::from_utf8(git(&canonical, &["rev-parse", "--git-common-dir"])?)
+        .map_err(|_| "Context repository path is invalid.")?;
+    let repository = dunce::canonicalize(canonical.join(common_dir.trim()))
+        .map_err(|error| error.to_string())?;
+    let scope = OutputScope {
+        repository: repository.to_string_lossy().into_owned(),
+        worktree: canonical.to_string_lossy().into_owned(),
+        user: unsafe { nix::libc::geteuid() }.to_string(),
+        provider: provider_id.clone(),
+        session: uuid::Uuid::new_v4().to_string(),
+        revision,
+    };
+    #[cfg(feature = "e2e")]
+    let data_root = PathBuf::from(
+        std::env::var_os("SAIL_E2E_CONFIG_DIR")
+            .ok_or("Set SAIL_E2E_CONFIG_DIR for isolated broker data.")?,
+    );
+    #[cfg(not(feature = "e2e"))]
+    let data_root = dirs::data_dir()
+        .ok_or("Cannot locate broker data directory.")?
+        .join("sail");
+    fs::create_dir_all(&data_root).map_err(|error| error.to_string())?;
+    let store = OutputStore::open(data_root.join("context-output"), OutputLimits::default())
+        .map_err(|warning| warning.message().to_owned())?;
+    let broker = crate::context_broker_mcp::BrokerMcp::new(provider_id, scope, store);
+    let provider_state = std::sync::Arc::new(std::sync::Mutex::new((false, 1_u64)));
     let session = std::sync::Arc::new(ContextSession::open(directory)?);
     let (send, receive) = std::sync::mpsc::sync_channel(32);
     let (output, writes) = std::sync::mpsc::sync_channel::<String>(32);
@@ -987,10 +1032,25 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
         if !active {
             if let Some(line) = queued.pop_front() {
                 let session = session.clone();
+                let broker = broker.clone();
+                let provider_state = provider_state.clone();
                 let responses = send.clone();
                 active = true;
                 std::thread::spawn(move || {
-                    let _ = responses.send(Event::Response(session.request(&line)));
+                    let response = (|| {
+                        session.check()?;
+                        let response = {
+                            let mut state =
+                                provider_state.lock().map_err(|error| error.to_string())?;
+                            let (initialized, next_id) = &mut *state;
+                            broker.handle(&line, |method, params| {
+                                broker_provider_call(&session, initialized, next_id, method, params)
+                            })
+                        };
+                        session.check()?;
+                        Ok(response.map(|value| value.to_string()))
+                    })();
+                    let _ = responses.send(Event::Response(response));
                 });
             } else if ended {
                 drop(output);
@@ -1033,6 +1093,79 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
             Event::OutputError(error) => return Err(error),
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn provider_response_limit(request: &serde_json::Value) -> usize {
+    if request.get("method").and_then(serde_json::Value::as_str) == Some("tools/call")
+        && matches!(
+            request
+                .pointer("/params/name")
+                .and_then(serde_json::Value::as_str),
+            Some("get" | "search")
+        )
+    {
+        LARGE_PROVIDER_RESPONSE_BYTES
+    } else {
+        DEFAULT_PROVIDER_RESPONSE_BYTES
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn broker_provider_call(
+    session: &ContextSession,
+    initialized: &mut bool,
+    next_id: &mut u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ()> {
+    if !*initialized {
+        let response = broker_provider_request(
+            session,
+            next_id,
+            "initialize",
+            serde_json::json!({
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"sail-context","version":env!("CARGO_PKG_VERSION")}
+            }),
+        )?;
+        if response
+            .pointer("/result/protocolVersion")
+            .and_then(serde_json::Value::as_str)
+            != Some("2025-06-18")
+        {
+            return Err(());
+        }
+        session
+            .request(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .map_err(|_| ())?;
+        *initialized = true;
+    }
+    broker_provider_request(session, next_id, method, params)
+}
+
+#[cfg(target_os = "macos")]
+fn broker_provider_request(
+    session: &ContextSession,
+    next_id: &mut u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ()> {
+    let id = *next_id;
+    *next_id = next_id.checked_add(1).ok_or(())?;
+    let request = serde_json::json!({
+        "jsonrpc":"2.0","id":id,"method":method,"params":params
+    });
+    let response = session
+        .request(&request.to_string())
+        .map_err(|_| ())?
+        .ok_or(())?;
+    response
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("id").and_then(serde_json::Value::as_u64) == Some(id))
+        .ok_or(())
 }
 
 #[cfg(target_os = "macos")]
@@ -2171,7 +2304,7 @@ fn start_provider_output(process: &mut ProviderProcess) -> Result<(), String> {
     std::thread::spawn(move || {
         let result = (|| -> Result<(), String> {
             loop {
-                let line = read_bounded_line(&mut reader, 1024 * 1024)?;
+                let line = read_bounded_line(&mut reader, LARGE_PROVIDER_RESPONSE_BYTES)?;
                 let value: serde_json::Value = serde_json::from_str(line.trim_end())
                     .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
                 if !value.is_object()
@@ -2293,6 +2426,7 @@ fn exchange_provider_request(
     deadline: Option<std::time::Instant>,
 ) -> Result<Option<String>, String> {
     use std::time::Duration;
+    let response_limit = provider_response_limit(request);
     let session_active = || session_is_active(capability);
     let method = request
         .get("method")
@@ -2395,8 +2529,8 @@ fn exchange_provider_request(
         }
         if !cancellations.is_empty() {
             let cancelled = cancelled_provider_response(request_id);
-            if buffered.len() + cancelled.len() > 1024 * 1024 {
-                return Err("Buffered provider output exceeds 1 MiB.".into());
+            if buffered.len() + cancelled.len() > response_limit {
+                return Err("Buffered provider output exceeds its limit.".into());
             }
             buffered.push_str(&cancelled);
             break buffered;
@@ -2440,8 +2574,8 @@ fn exchange_provider_request(
                     }
                     notifications.push_str(&message);
                 } else {
-                    if buffered.len() + message.len() > 1024 * 1024 {
-                        return Err("Buffered provider output exceeds 1 MiB.".into());
+                    if buffered.len() + message.len() > response_limit {
+                        return Err("Buffered provider output exceeds its limit.".into());
                     }
                     buffered.push_str(&message);
                 }
@@ -2459,8 +2593,8 @@ fn exchange_provider_request(
                 flush_provider_notifications(&mut notify, &mut notifications)?;
                 value["id"] = request_id.clone();
                 let message = value.to_string();
-                if buffered.len() + message.len() > 1024 * 1024 {
-                    return Err("Buffered provider output exceeds 1 MiB.".into());
+                if buffered.len() + message.len() > response_limit {
+                    return Err("Buffered provider output exceeds its limit.".into());
                 }
                 buffered.push_str(&message);
                 break buffered;
@@ -2505,7 +2639,7 @@ fn read_bounded_line(reader: &mut impl std::io::BufRead, limit: usize) -> Result
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |position| position + 1);
         if output.len() + count > limit {
-            return Err("MCP message exceeds 1 MiB.".into());
+            return Err("MCP message exceeds its limit.".into());
         }
         let done = available[count - 1] == b'\n';
         output.extend_from_slice(&available[..count]);
@@ -2927,6 +3061,49 @@ mod tests {
             assert_eq!(first["result"]["initializeCount"], initialize_count);
             assert_eq!(second["result"]["initializeCount"], initialize_count);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn approved_get_reads_a_large_provider_result() {
+        let repository = Repository::new("runtime-large-get");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let request = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{"name":"get","arguments":{"id":"large"}}});
+        assert_eq!(
+            provider_response_limit(&request),
+            LARGE_PROVIDER_RESPONSE_BYTES
+        );
+        assert_eq!(
+            provider_response_limit(&json!({"method":"tools/call","params":{"name":"search"}})),
+            LARGE_PROVIDER_RESPONSE_BYTES
+        );
+        let response = provider_request_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            &request.to_string(),
+            &store_path,
+            &repository.0.join("data"),
+        )
+        .unwrap()
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["content"].as_str().unwrap().len(),
+            2 * 1024 * 1024
+        );
     }
 
     #[cfg(target_os = "macos")]
