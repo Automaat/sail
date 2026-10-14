@@ -1280,6 +1280,9 @@
   );
   let notificationSound = $state(getSetting('sai-notification-sound') !== 'false');
   let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
+  let worktreeAutodiscoveryEnabled = $state(
+    getSetting('sai-worktree-autodiscovery-enabled') === 'true',
+  );
   let copiedStatus = $state('');
   let copiedStatusTimer: ReturnType<typeof setTimeout> | undefined;
   let copiedStatusGeneration = 0;
@@ -2243,6 +2246,7 @@
       notificationPrefs,
       notificationSound,
       autoCopyEnabled,
+      worktreeAutodiscoveryEnabled,
       personalPostTurnChecks,
       agentWorktreesEnabled,
       agentTerminalsEnabled,
@@ -2441,6 +2445,9 @@
         } else if (action.type === 'auto-copy') {
           autoCopyEnabled = action.value;
           setSetting('sai-auto-copy-enabled', String(action.value));
+        } else if (action.type === 'worktree-autodiscovery') {
+          worktreeAutodiscoveryEnabled = action.value;
+          setSetting('sai-worktree-autodiscovery-enabled', String(action.value));
         } else if (action.type === 'personal-post-turn-checks') {
           personalPostTurnChecks = action.value;
           setSetting('sai-post-turn-personal', JSON.stringify(action.value));
@@ -13972,6 +13979,7 @@
         worktreeDialogRequest={paletteWorktreeRequest}
         {worktreeCreations}
         {worktreeDeletions}
+        {worktreeAutodiscoveryEnabled}
         onretryworktree={retryWorktreeCreation}
         ondismissworktree={dismissWorktreeCreation}
         onworktreecancelled={(repository) =>
