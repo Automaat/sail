@@ -35,7 +35,7 @@ suite(`real native child Tasks (${provider ?? 'requires explicit provider enviro
     await chooseTopbarAction('New agent', names[provider]);
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer [data-pane-prompt]').setValue(
-      'Test native child session task identity. Do not edit files, use terminal tools, inspect credentials, or access network services. First call Sail sail_tasks_read and sail_tasks_report for your own parent-only task, title Parent task identity, status done, focus null, with the current turnId and expectedRevision. Then spawn exactly one native child using your provider native subagent tool, not sail agent_spawn. Child prompt: Call Sail sail_tasks_read. If available, report child-only, title Child task identity, status in_progress, focus child-only with the read turnId/revision. Read again, update child-only to done, focus null. If identity or tools are unavailable, report the precise limitation in your final response and do not report through the parent. Wait for the child to finish. Do not make task calls on behalf of the child. Reply Native child identity check complete.',
+      'Test native child session task identity. Do not edit files, use terminal tools, inspect credentials, or access network services. First call Sail sail_tasks_read and sail_tasks_report for your own parent-only task, title Parent task identity, status done, focus null, with the current turnId and expectedRevision. Then spawn exactly one native child using your provider native subagent tool, not sail agent_spawn. Child prompt: Call Sail sail_tasks_read. If available, report child-only, title Child task identity, status in_progress, focus child-only with the read turnId/revision. Read again, then attempt one report with turnId stale-child-turn, the fresh expectedRevision, and a negative-only task title Rejected stale child report. Require an explicit different-turn error. Read again and verify negative-only is absent, then update child-only to done, focus null. Include the tool error in your final response. If identity or tools are unavailable, report the precise limitation in your final response and do not report through the parent. Wait for the child to finish. Do not make task calls on behalf of the child. Reply Native child identity check complete.',
     );
     await $('.agent-actions button:last-child').click();
     await expect($('.project-agent-row[data-depth="1"]')).toBeDisplayed();
@@ -58,15 +58,34 @@ suite(`real native child Tasks (${provider ?? 'requires explicit provider enviro
     );
     if (provider === 'opencode') {
       await expect(panel).toHaveText(expect.stringContaining('Child task identity'));
+      await expect($('.agent-conversation')).toHaveText(expect.stringContaining('different turn'));
       const child = saved.find((item: { snapshot: { tasks: { id: string }[] } }) =>
         item.snapshot.tasks.some((task) => task.id === 'child-only'),
       );
       expect(child).toBeDefined();
       expect(child.scope.sessionId).not.toBe(parent.scope.sessionId);
+      expect(child.snapshot.tasks.some((task: { id: string }) => task.id === 'negative-only')).toBe(
+        false,
+      );
       expect(child.snapshot.focus).toBeNull();
       expect(child.snapshot.turnId).toBeNull();
       expect(
         child.snapshot.tasks.find((task: { id: string }) => task.id === 'child-only').status,
+      ).toBe('done');
+      await browser.refresh();
+      await expect(panel).toHaveText(expect.stringContaining('Child task identity'));
+      await browser.waitUntil(async () => !(await panel.getText()).includes('Current focus'));
+      const restored = await browser.execute(() =>
+        JSON.parse(localStorage.getItem('sai-session-tasks') ?? '[]'),
+      );
+      const restoredChild = restored.find(
+        (item: { scope: { sessionId: string } }) => item.scope.sessionId === child.scope.sessionId,
+      );
+      expect(restoredChild.snapshot.turnId).toBeNull();
+      expect(restoredChild.snapshot.focus).toBeNull();
+      expect(
+        restoredChild.snapshot.tasks.find((task: { id: string }) => task.id === 'child-only')
+          .status,
       ).toBe('done');
     } else {
       await expect(panel).toHaveText(expect.stringContaining('Observed activity:'));
