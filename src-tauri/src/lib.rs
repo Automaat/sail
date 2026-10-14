@@ -5036,7 +5036,7 @@ mod tests {
         discover_nested_worktree_terminal_roots, encode_manifest_path,
         ensure_expected_worktree_generation, ensure_expected_worktree_inventory,
         existing_shipping_worktree, git_change_action, git_patch, git_reference,
-        move_worktree_for_removal, normalize_picker_path, parse_registered_worktrees_sync,
+        move_worktree_for_removal, normalize_picker_path, parse_registered_worktrees,
         pending_cleanup_paths_absent, persist_worktree_data_manifest,
         register_worktree_terminal_data, registered_worktrees_sync,
         remove_remaining_worktree_files, remove_worktree, remove_worktree_guarded,
