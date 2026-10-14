@@ -4579,6 +4579,63 @@ fn codex_native_activity_update(message: &Value, owner: Option<&str>) -> Option<
     Some(json!({"method":"session/update","params":{"sessionId":parent,"update":update}}))
 }
 
+fn claude_native_activity_update(
+    message: &Value,
+    registered: impl FnOnce(&str, &str) -> bool,
+) -> Option<Value> {
+    if message.get("method").and_then(Value::as_str) != Some("session/update") {
+        return None;
+    }
+    let parent = message
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)?;
+    let update = message.pointer("/params/update")?;
+    if !matches!(
+        update.get("sessionUpdate").and_then(Value::as_str),
+        Some("tool_call" | "tool_call_update")
+    ) {
+        return None;
+    }
+    let tool_id = update
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .filter(|tool_id| !tool_id.trim().is_empty())?;
+    let child = format!("{parent}:claude-subagent:{tool_id}");
+    let state = match update.get("status").and_then(Value::as_str) {
+        Some("completed") => Some("completed"),
+        Some("failed") => Some("failed"),
+        Some("cancelled" | "interrupted") => Some("cancelled"),
+        _ => None,
+    };
+    let normalized = if let Some(state) = state {
+        if !registered(parent, &child) {
+            return None;
+        }
+        json!({
+            "sessionUpdate":"subagent_state_update",
+            "subagentSessionId":child,
+            "state":state
+        })
+    } else {
+        if update.get("subagent").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let task = update
+            .get("title")
+            .and_then(Value::as_str)
+            .or_else(|| update.pointer("/input/description").and_then(Value::as_str))
+            .filter(|task| !task.trim().is_empty())
+            .unwrap_or("Delegated task");
+        json!({
+            "sessionUpdate":"subagent_spawned",
+            "subagentSessionId":child,
+            "name":task,
+            "task":task
+        })
+    };
+    Some(json!({"method":"session/update","params":{"sessionId":parent,"update":normalized}}))
+}
+
 fn native_activity_fence(update: &Value) -> Option<(&str, bool)> {
     let tool_id = update.get("toolCallId").and_then(Value::as_str)?;
     let status = update.get("status").and_then(Value::as_str);
@@ -5653,6 +5710,53 @@ fn connect_blocking_inner(
                                     directory: session_directory(&reader, parent_id),
                                     worktree: Some(reader.worktree.to_string_lossy().into_owned()),
                                     message: normalized,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            if agent_id == "claude" {
+                let mut normalized = claude_native_activity_update(&message, |parent, child| {
+                    reader.native_subagents.lock().ok().is_some_and(|native| {
+                        native
+                            .0
+                            .get(child)
+                            .is_some_and(|entry| entry.parent_session_id == parent)
+                    })
+                });
+                if let Some(normalized) = normalized.as_mut() {
+                    if let Some(params) =
+                        normalized.get_mut("params").and_then(Value::as_object_mut)
+                    {
+                        params.insert("sailCapabilityProfile".into(), profile.as_str().into());
+                    }
+                    let parent_id = normalized
+                        .pointer("/params/sessionId")
+                        .and_then(Value::as_str);
+                    let update = normalized.pointer("/params/update");
+                    if let (Some(parent_id), Some(update)) = (parent_id, update) {
+                        if let Err(error) = record_native_subagent_update(
+                            &app,
+                            &reader_manager,
+                            &worktree_fence,
+                            &reader,
+                            &agent_id,
+                            parent_id,
+                            update,
+                        ) {
+                            crate::diagnostics::record(
+                                "acp_native_activity_rejected",
+                                json!({"agent":agent_id,"sessionId":parent_id,"error":error}),
+                            );
+                        } else {
+                            let _ = app.emit(
+                                "acp-event",
+                                AgentEvent {
+                                    agent: agent_id.clone(),
+                                    directory: session_directory(&reader, parent_id),
+                                    worktree: Some(reader.worktree.to_string_lossy().into_owned()),
+                                    message: normalized.clone(),
                                 },
                             );
                         }
@@ -11051,6 +11155,97 @@ mod capability_profile_tests {
         assert!(codex_native_activity_update(&message, Some(owner)).is_some());
         message["params"]["update"]["rawInput"]["agentThreadId"] = Value::Null;
         assert!(codex_native_activity_update(&message, Some(owner)).is_none());
+    }
+
+    #[test]
+    fn claude_activity_becomes_observed_native_child_updates() {
+        let activity = |status: &str, subagent: Option<bool>, tool_call_id: &str| {
+            let mut update = json!({
+                "sessionUpdate":"tool_call_update",
+                "toolCallId":tool_call_id,
+                "title":"Child task identity check",
+                "status":status,
+                "input":{"description":"Child task identity check"}
+            });
+            if let Some(subagent) = subagent {
+                update["subagent"] = json!(subagent);
+            }
+            json!({"method":"session/update","params":{"sessionId":"parent","update":update}})
+        };
+        let child = "parent:claude-subagent:toolu_child";
+
+        let started = claude_native_activity_update(
+            &activity("in_progress", Some(true), "toolu_child"),
+            |_, _| false,
+        )
+        .unwrap();
+        assert_eq!(
+            started.pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_spawned",
+                "subagentSessionId":child,
+                "name":"Child task identity check",
+                "task":"Child task identity check"
+            }))
+        );
+
+        for (status, state) in [
+            ("completed", "completed"),
+            ("failed", "failed"),
+            ("interrupted", "cancelled"),
+        ] {
+            let settled = claude_native_activity_update(
+                &activity(status, None, "toolu_child"),
+                |parent, candidate| parent == "parent" && candidate == child,
+            )
+            .unwrap();
+            assert_eq!(
+                settled.pointer("/params/update"),
+                Some(&json!({
+                    "sessionUpdate":"subagent_state_update",
+                    "subagentSessionId":child,
+                    "state":state
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn claude_activity_rejects_untrusted_and_mismatched_updates() {
+        let activity = |status: &str, marker: Value, tool_call_id: &str| {
+            json!({"method":"session/update","params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call",
+                "toolCallId":tool_call_id,
+                "title":"Child task identity check",
+                "status":status,
+                "subagent":marker
+            }}})
+        };
+
+        assert!(claude_native_activity_update(
+            &activity("in_progress", json!(false), "toolu_child"),
+            |_, _| false,
+        )
+        .is_none());
+        assert!(claude_native_activity_update(
+            &activity("in_progress", json!("true"), "toolu_child"),
+            |_, _| false,
+        )
+        .is_none());
+        assert!(claude_native_activity_update(
+            &activity("completed", json!(true), "toolu_other"),
+            |_, _| false,
+        )
+        .is_none());
+        assert!(claude_native_activity_update(
+            &json!({"method":"session/update","params":{"sessionId":"parent","update":{
+                "sessionUpdate":"agent_message_chunk",
+                "toolCallId":"toolu_child",
+                "subagent":true
+            }}}),
+            |_, _| true,
+        )
+        .is_none());
     }
 
     #[test]

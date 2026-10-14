@@ -54,6 +54,14 @@ function codexEvent(update: Record<string, unknown>): AgentEvent {
   };
 }
 
+function claudeEvent(update: Record<string, unknown>): AgentEvent {
+  return {
+    agent: 'claude',
+    directory: '/repo',
+    message: { method: 'session/update', params: { sessionId: 'parent', update } },
+  };
+}
+
 await test('unfinished agent inventory blocks cleanup after the deadline', async () => {
   const unresolved = new Promise<void>(() => {});
 
@@ -455,6 +463,46 @@ await test('a completed Codex lifecycle leaves one inspectable depth-1 child row
     [
       ['parent', 0],
       ['child-thread', 1],
+    ],
+  );
+  assert.equal(rows[0].hiddenHistoricalChildren, 0);
+});
+
+await test('a completed observed Claude lifecycle leaves one inspectable depth-1 child row', () => {
+  const childId = 'parent:claude-subagent:toolu_child';
+  let store = updateNativeSubagents(
+    {},
+    claudeEvent({
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: childId,
+      name: 'Child task identity check',
+      task: 'Child task identity check',
+    }),
+    '/repo',
+    10,
+  );
+  store = updateNativeSubagents(
+    store,
+    claudeEvent({
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: childId,
+      state: 'completed',
+    }),
+    '/repo',
+    20,
+  );
+
+  const child = Object.values(store)[0];
+  assert.equal(child.taskIdentity, 'observed');
+  const rows = sidebarThreadRows(
+    [{ ...parentThread, agent: 'claude' }, ...nativeSubagentThreads(store)],
+    nativeSubagentReceipts(store),
+  );
+  assert.deepEqual(
+    rows.map((row) => [row.thread.sessionId, row.depth]),
+    [
+      ['parent', 0],
+      [childId, 1],
     ],
   );
   assert.equal(rows[0].hiddenHistoricalChildren, 0);
