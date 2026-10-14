@@ -2171,8 +2171,53 @@ fn runtime_environment(
         ("NPM_CONFIG_CACHE", shared_download_cache.join("npm")),
         ("YARN_CACHE_FOLDER", shared_download_cache.join("yarn")),
         ("COREPACK_HOME", shared_download_cache.join("corepack")),
+        ("UV_TOOL_DIR", data_directory.join("uv-tools")),
+        ("UV_TOOL_BIN_DIR", data_directory.join("bin")),
     ]);
     environment
+}
+
+fn configured_tool_paths(
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if windows {
+        if let Some(local) = local_app_data {
+            paths.push(local.join("mise/shims"));
+        }
+    } else if let Some(home) = home {
+        paths.push(home.join(".local/share/mise/shims"));
+    }
+    if let Some(home) = home {
+        paths.extend([home.join(".local/bin"), home.join(".cargo/bin")]);
+    }
+    paths.into_iter().filter(|path| path.is_dir()).collect()
+}
+
+fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
+    let directory = home?.join(".gnupg");
+    std::fs::symlink_metadata(&directory)
+        .ok()?
+        .file_type()
+        .is_dir()
+        .then_some(directory)
+}
+
+fn agent_path(
+    mut paths: Vec<PathBuf>,
+    scoped_tool_bin: PathBuf,
+    original: &std::ffi::OsStr,
+) -> Result<std::ffi::OsString, String> {
+    let scoped_index = usize::from(
+        paths
+            .first()
+            .is_some_and(|path| path.ends_with(Path::new("mise/shims"))),
+    );
+    paths.insert(scoped_index, scoped_tool_bin);
+    std::env::join_paths(paths.into_iter().chain(std::env::split_paths(original)))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(unix)]
@@ -2200,6 +2245,8 @@ fn prepare_runtime_directories(data_directory: &Path, temp_directory: &Path) -> 
         temp_directory.to_path_buf(),
         data_directory.join("cache"),
         data_directory.join("build"),
+        data_directory.join("bin"),
+        data_directory.join("uv-tools"),
         temp_directory.join("go-tmp"),
     ] {
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
@@ -5377,11 +5424,15 @@ fn connect_blocking_inner(
     #[cfg(not(unix))]
     let shared_build_directory: Option<PathBuf> = None;
     let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     #[cfg(feature = "e2e")]
     let test_agent = std::env::var_os("SAIL_ACP_TEST_AGENT");
     #[cfg(not(feature = "e2e"))]
     let test_agent: Option<std::ffi::OsString> = None;
-    let mut paths = Vec::new();
+    let mut paths =
+        configured_tool_paths(home.as_deref(), local_app_data.as_deref(), cfg!(windows));
     let is_test_agent = test_agent.is_some();
     let mut owned_temp = None;
     let background = crate::background_priority::enabled(&app);
@@ -5431,11 +5482,6 @@ fn connect_blocking_inner(
             }
         }
     };
-    paths.extend(std::env::split_paths(&original_path));
-    command.env(
-        "PATH",
-        std::env::join_paths(paths).map_err(|error| error.to_string())?,
-    );
     if let Some(connection_file) = crate::hook_activity::connection_file(
         app.state::<crate::hook_activity::HookActivityManager>()
             .inner(),
@@ -5458,6 +5504,10 @@ fn connect_blocking_inner(
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
+    command.env(
+        "PATH",
+        agent_path(paths, data_directory.join("bin"), &original_path)?,
+    );
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
     #[cfg(not(unix))]
@@ -5470,6 +5520,9 @@ fn connect_blocking_inner(
             .join("terminal-package-downloads");
         std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
         let mut writable = vec![temp.0.clone(), data_directory.clone(), shared_cache];
+        if let Some(gnupg) = default_gnupg_directory(home.as_deref()) {
+            writable.push(gnupg);
+        }
         if let Some(overlay) = overlay.as_ref() {
             writable.push(overlay.git_dir.clone());
         }
@@ -9339,6 +9392,12 @@ time.sleep(10)
             runtime_environment(&first_data, &first_temp, Some(&first_scratch), None);
         let second_environment =
             runtime_environment(&second_data, &second_temp, Some(&second_scratch), None);
+        assert!(
+            first_environment
+                .iter()
+                .all(|(name, _)| *name != "MISE_STATE_DIR"),
+            "agent runtimes must inherit mise's trusted configuration state"
+        );
         let path = |environment: &[(&str, PathBuf)], name| {
             environment
                 .iter()
@@ -9353,6 +9412,8 @@ time.sleep(10)
             "CARGO_TARGET_DIR",
             "GOCACHE",
             "GOTMPDIR",
+            "UV_TOOL_DIR",
+            "UV_TOOL_BIN_DIR",
         ] {
             assert_ne!(
                 path(&first_environment, name),
@@ -9367,9 +9428,13 @@ time.sleep(10)
         for directory in [
             first_temp.clone(),
             first_data.join("cache"),
+            first_data.join("bin"),
+            first_data.join("uv-tools"),
             first_temp.join("go-tmp"),
             second_temp.clone(),
             second_data.join("cache"),
+            second_data.join("bin"),
+            second_data.join("uv-tools"),
             second_temp.join("go-tmp"),
         ] {
             assert!(
@@ -9392,6 +9457,116 @@ time.sleep(10)
             );
         }
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn configured_tool_paths_prefer_repository_tool_shims() {
+        let root = scratch("configured-tool-paths");
+        let shims = root.join(".local/share/mise/shims");
+        let local = root.join(".local/bin");
+        let cargo = root.join(".cargo/bin");
+        let local_app_data = root.join("AppData/Local");
+        let windows_shims = local_app_data.join("mise/shims");
+        for directory in [&shims, &local, &cargo, &windows_shims] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        assert_eq!(
+            configured_tool_paths(Some(&root), None, false),
+            vec![shims.clone(), local.clone(), cargo.clone()]
+        );
+        assert_eq!(
+            configured_tool_paths(Some(&root), Some(&local_app_data), true),
+            vec![windows_shims.clone(), local, cargo]
+        );
+        assert_eq!(
+            configured_tool_paths(None, Some(&local_app_data), true),
+            vec![windows_shims.clone()]
+        );
+        assert!(configured_tool_paths(None, None, false).is_empty());
+
+        let scoped_bin = root.join("agent-data/bin");
+        let inherited =
+            std::env::join_paths([root.join("system/bin"), root.join("usr/bin")]).unwrap();
+        let joined = agent_path(
+            configured_tool_paths(Some(&root), None, false),
+            scoped_bin.clone(),
+            &inherited,
+        )
+        .unwrap();
+        assert_eq!(
+            std::env::split_paths(&joined).collect::<Vec<_>>(),
+            vec![
+                shims,
+                scoped_bin.clone(),
+                root.join(".local/bin"),
+                root.join(".cargo/bin"),
+                root.join("system/bin"),
+                root.join("usr/bin")
+            ]
+        );
+        let windows_joined = agent_path(
+            configured_tool_paths(Some(&root), Some(&local_app_data), true),
+            scoped_bin,
+            &inherited,
+        )
+        .unwrap();
+        assert_eq!(
+            std::env::split_paths(&windows_joined).collect::<Vec<_>>(),
+            vec![
+                windows_shims,
+                root.join("agent-data/bin"),
+                root.join(".local/bin"),
+                root.join(".cargo/bin"),
+                root.join("system/bin"),
+                root.join("usr/bin")
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_gnupg_access_is_limited_to_the_existing_directory() {
+        let root = scratch("default-gnupg");
+        let home = root.join("home");
+        let assigned = root.join("assigned");
+        let gnupg = home.join(".gnupg");
+        let sibling = home.join(".ssh");
+        for directory in [&assigned, &gnupg, &sibling] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        assert_eq!(default_gnupg_directory(Some(&home)), Some(gnupg.clone()));
+        assert!(default_gnupg_directory(Some(&root.join("missing-home"))).is_none());
+        assert!(default_gnupg_directory(None).is_none());
+
+        let access = CodexWorkspaceAccess::capture(
+            &assigned,
+            std::slice::from_ref(&default_gnupg_directory(Some(&home)).unwrap()),
+        )
+        .unwrap();
+        let rules = serde_json::from_str::<Value>(&access.profile_config().unwrap()).unwrap()
+            ["configOverrides"][2]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let writable_rule = |path: &Path| {
+            format!(
+                "{}=\"write\"",
+                serde_json::to_string(path.to_str().unwrap()).unwrap()
+            )
+        };
+        assert!(rules.contains(&writable_rule(&dunce::canonicalize(&gnupg).unwrap())));
+        assert!(!rules.contains(&writable_rule(&dunce::canonicalize(&home).unwrap())));
+        assert!(!rules.contains(&writable_rule(&dunce::canonicalize(&sibling).unwrap())));
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&gnupg).unwrap();
+            std::os::unix::fs::symlink(&sibling, &gnupg).unwrap();
+            assert!(default_gnupg_directory(Some(&home)).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -10080,6 +10255,47 @@ time.sleep(10)
             .status
             .success());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_workspace_access_runs_gpg_without_granting_home() {
+        let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") else {
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let gnupg = default_gnupg_directory(Some(&home)).unwrap();
+        let gpg = find_executable("gpg").unwrap();
+        let assigned = scratch("codex-gpg-access");
+        std::fs::create_dir_all(&assigned).unwrap();
+        let access =
+            CodexWorkspaceAccess::capture(&assigned, std::slice::from_ref(&gnupg)).unwrap();
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let run = |arguments: &[&str]| {
+            let mut command = Command::new(&codex);
+            command
+                .arg("sandbox")
+                .args(["-P", "sail-agent", "-C"])
+                .arg(&assigned);
+            for value in config["configOverrides"].as_array().unwrap() {
+                command.arg("-c").arg(value.as_str().unwrap());
+            }
+            command.arg("--").args(arguments).output().unwrap()
+        };
+
+        let trustdb = run(&[gpg.to_str().unwrap(), "--check-trustdb"]);
+        assert!(
+            trustdb.status.success(),
+            "{}",
+            String::from_utf8_lossy(&trustdb.stderr)
+        );
+
+        let denied = home.join(format!(".sail-codex-gpg-denied-{}", std::process::id()));
+        assert!(!denied.exists());
+        let denied_write = run(&["/usr/bin/touch", denied.to_str().unwrap()]);
+        assert!(!denied_write.status.success());
+        assert!(!denied.exists());
+        std::fs::remove_dir_all(assigned).unwrap();
     }
 
     #[test]
