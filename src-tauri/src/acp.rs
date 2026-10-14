@@ -4547,7 +4547,7 @@ fn codex_native_activity_update(message: &Value, owner: Option<&str>) -> Option<
     let name = input
         .get("agentPath")
         .and_then(Value::as_str)
-        .and_then(|path| path.split('/').filter(|part| !part.is_empty()).next_back())
+        .and_then(|path| path.split('/').rfind(|part| !part.is_empty()))
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("Subagent");
     let update = match activity {
@@ -4829,7 +4829,6 @@ fn record_native_subagent_update(
     fence: &AgentWorktreeFence,
     runtime: &Arc<Connection>,
     agent: &str,
-    profile: CapabilityProfile,
     parent_id: &str,
     update: &Value,
 ) -> Result<(), String> {
@@ -4849,7 +4848,8 @@ fn record_native_subagent_update(
                 .get(parent_id)
                 .cloned()
                 .ok_or("Native child parent directory is unavailable.")?;
-            let owner = register_session(manager, agent, profile, child_id, directory.clone())?;
+            let owner =
+                register_session(manager, agent, runtime.profile, child_id, directory.clone())?;
             let parent_live = runtime
                 .prompt_state
                 .lock()
@@ -5626,7 +5626,6 @@ fn connect_blocking_inner(
                             &worktree_fence,
                             &reader,
                             &agent_id,
-                            profile,
                             parent_id,
                             update,
                         ) {
@@ -5684,7 +5683,6 @@ fn connect_blocking_inner(
                             &worktree_fence,
                             &reader,
                             &agent_id,
-                            profile,
                             session_id,
                             update,
                         ) {
