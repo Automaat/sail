@@ -5982,10 +5982,16 @@
       return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
     }
     const receiptActivity = await acp.activity(receipt.targetDirectory).then(
-      (states) => states[receipt.provider],
-      () => null,
+      (states) => ({ resolved: true as const, state: states[receipt.provider] ?? null }),
+      () => ({ resolved: false as const, state: null }),
     );
-    reconcileAcpSpawnReceipt(receipt, receiptActivity);
+    if (
+      !receiptActivity.resolved &&
+      receipt.validation &&
+      resourceQueues.validation.isActive(receipt.receiptId)
+    )
+      return receipt;
+    reconcileAcpSpawnReceipt(receipt, receiptActivity.state);
     return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
   }
 
