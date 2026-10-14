@@ -1,5 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
-import { Buffer } from 'node:buffer';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -19,6 +18,7 @@ import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { e2eContextService, e2eIdentity } from './e2e-identity.mjs';
+import { runOwnedCommand } from './native-test-process.mjs';
 import {
   artifactKey,
   artifactMatches,
@@ -30,22 +30,13 @@ import {
 const checkout = realpathSync(join(dirname(fileURLToPath(import.meta.url)), '..'));
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 let cancelled = false;
-const children = new Set();
+const cancellation = new AbortController();
 const cancel = () => {
   cancelled = true;
-  for (const child of children) signalChild(child, 'SIGTERM');
+  cancellation.abort();
 };
 process.once('SIGINT', cancel);
 process.once('SIGTERM', cancel);
-
-function signalChild(child, signal) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  try {
-    process.kill(-child.pid, signal);
-  } catch (error) {
-    if (error.code !== 'ESRCH') throw error;
-  }
-}
 
 function command(program, args, options = {}) {
   const result = spawnSync(program, args, { cwd: checkout, encoding: 'utf8', ...options });
@@ -55,25 +46,7 @@ function command(program, args, options = {}) {
 }
 
 async function loggedCommand(program, args, env, log) {
-  if (cancelled) throw new Error('Native run cancelled');
-  const output = [];
-  const child = spawn(program, args, { cwd: checkout, env, detached: true });
-  children.add(child);
-  child.stdout.on('data', (data) => output.push(data));
-  child.stderr.on('data', (data) => output.push(data));
-  const killTimer = setInterval(() => {
-    if (cancelled) signalChild(child, 'SIGKILL');
-  }, 5000);
-  try {
-    return await new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.once('close', (code) => resolve(code ?? 1));
-    });
-  } finally {
-    clearInterval(killTimer);
-    children.delete(child);
-    writeFileSync(log, Buffer.concat(output));
-  }
+  return runOwnedCommand(program, args, { cwd: checkout, env, log, signal: cancellation.signal });
 }
 
 async function availablePort() {

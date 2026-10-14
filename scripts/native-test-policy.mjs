@@ -22,6 +22,8 @@ export function artifactMatches(manifest, requirements, binaryHash, identifier, 
 }
 
 export function nativeEnvironment(root, checkout, inherited, port) {
+  mkdirSync(root, { recursive: true });
+  const canonicalRoot = realpathSync(root);
   const paths = {
     TMPDIR: 'tmp',
     SAIL_E2E_CONFIG_DIR: 'tmp/config',
@@ -37,16 +39,17 @@ export function nativeEnvironment(root, checkout, inherited, port) {
   };
   const env = { ...inherited };
   for (const [name, directory] of Object.entries(paths)) {
-    mkdirSync(join(root, directory), { recursive: true });
-    env[name] = realpathSync(join(root, directory));
+    mkdirSync(join(canonicalRoot, directory), { recursive: true });
+    env[name] = realpathSync(join(canonicalRoot, directory));
   }
   Object.assign(env, {
     TAURI_WEBDRIVER_PORT: String(port),
     SAIL_ACP_TEST_AGENT: realpathSync(join(checkout, 'test/e2e/acp-agent.mjs')),
     SAIL_E2E_ATTACH: '1',
     SAIL_E2E_MACHINE_READING: 'healthy',
-    SAIL_E2E_OPEN_URL_LOG: join(root, 'external-link.log'),
-    SAIL_E2E_SETUP_REPORT: join(root, 'setup.json'),
+    SAIL_E2E_OPEN_URL_LOG: join(canonicalRoot, 'external-link.log'),
+    SAIL_E2E_SETUP_REPORT: join(canonicalRoot, 'setup.json'),
+    SAIL_HOOK_CONNECTION_FILE: join(canonicalRoot, 'hook-connection.json'),
   });
   return env;
 }

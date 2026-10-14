@@ -52,7 +52,11 @@ await test('sequential runs canonicalize aliases and isolate every fixture path'
   const root = mkdtempSync(join(tmpdir(), 'sail-native-policy-'));
   const alias = join(root, 'alias');
   symlinkSync(realpathSync(root), alias, 'dir');
-  const inherited = { SAIL_E2E_CONFIG_DIR: '/user/config', XDG_DATA_HOME: '/user/data' };
+  const inherited = {
+    SAIL_E2E_CONFIG_DIR: '/user/config',
+    XDG_DATA_HOME: '/user/data',
+    SAIL_HOOK_CONNECTION_FILE: '/owning-app/hook-connection.json',
+  };
   const first = nativeEnvironment(join(alias, 'first'), process.cwd(), inherited, 12345);
   const second = nativeEnvironment(join(alias, 'second'), process.cwd(), inherited, 12346);
   for (const name of [
@@ -75,4 +79,10 @@ await test('sequential runs canonicalize aliases and isolate every fixture path'
   assert.equal(first.TAURI_WEBDRIVER_PORT, '12345');
   assert.equal(first.SAIL_E2E_MACHINE_READING, 'healthy');
   assert.equal(inherited.SAIL_E2E_CONFIG_DIR, '/user/config');
+  assert.equal(
+    first.SAIL_HOOK_CONNECTION_FILE,
+    join(realpathSync(root), 'first', 'hook-connection.json'),
+  );
+  assert.notEqual(first.SAIL_HOOK_CONNECTION_FILE, second.SAIL_HOOK_CONNECTION_FILE);
+  assert.equal(inherited.SAIL_HOOK_CONNECTION_FILE, '/owning-app/hook-connection.json');
 });
