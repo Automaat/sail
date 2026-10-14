@@ -80,7 +80,11 @@ function sourceRequirements() {
     rust: command('rustc', ['-Vv']),
     cargo: command('cargo', ['-V']),
     node: process.version,
-    xcode: command('xcodebuild', ['-version']),
+    appleToolchain: {
+      sdkPath: command('xcrun', ['--sdk', 'macosx', '--show-sdk-path']),
+      sdkVersion: command('xcrun', ['--sdk', 'macosx', '--show-sdk-version']),
+      compiler: command('xcrun', ['--sdk', 'macosx', 'clang', '--version']),
+    },
     architecture: process.arch,
     signing: 'ad-hoc',
     entitlementsHash: hashFile(join(checkout, 'src-tauri/Entitlements.e2e.plist')),
@@ -297,7 +301,21 @@ async function main() {
   const canonical = realpathSync(root);
   const run = realpathSync(mkdtempSync(join(canonical, 'run-')));
   process.stdout.write(`Native diagnostics: ${run}\n`);
-  const requirements = sourceRequirements();
+  let requirements;
+  try {
+    requirements = sourceRequirements();
+  } catch (error) {
+    const failed = {
+      verdict: 'SETUP_FAILED',
+      phase: 'source/toolchain preflight',
+      error: error.stack ?? String(error),
+    };
+    writeFileSync(join(run, 'result.json'), JSON.stringify(failed, null, 2));
+    process.stderr.write(`Native precondition failed: ${failed.error}\n`);
+    process.stdout.write(`SETUP_FAILED: ${run}\n`);
+    process.exitCode = 1;
+    return;
+  }
   let result = { verdict: 'SETUP_FAILED' };
   const runAttempt = async (index) => {
     if (cancelled || index > limit) return;
