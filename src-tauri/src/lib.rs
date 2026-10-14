@@ -5156,8 +5156,6 @@ async fn clean_pending_worktree_temp(
 mod tests {
     #[cfg(any(unix, windows))]
     use super::working_tree_generation;
-    #[cfg(unix)]
-    use super::worktree_size_bytes;
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
         discover_nested_worktree_terminal_roots, encode_manifest_path,
@@ -5173,10 +5171,12 @@ mod tests {
         repository_worktrees_inner, restore_pending_worktree_inner, shipping_base_revision,
         shipping_changed_paths, shipping_default_branch, shipping_fetch_source,
         version_is_compatible, version_number, working_tree_diff, worktree_overviews,
-        worktree_preview_state_with_hook, worktree_summary_dirty, ExpectedRegisteredWorktree,
-        WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
+        worktree_preview_state_with_hook, ExpectedRegisteredWorktree, WorktreeOperationLocks,
+        NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
+    #[cfg(unix)]
+    use super::{worktree_size_bytes, worktree_summary_dirty};
     use crate::worktree_storage;
     use crate::GitCanonical;
     use std::fs;
