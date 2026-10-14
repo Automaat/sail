@@ -4,8 +4,9 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { Button } from '@smykla-skalski/sui';
   import { invoke } from '@tauri-apps/api/core';
-  import { ask, open as openDialog } from '@tauri-apps/plugin-dialog';
+  import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import OptionPicker from './OptionPicker.svelte';
+  import ConfirmDialog from './ConfirmDialog.svelte';
   import { getSetting } from './lib/settings';
   import { loadProjectCatalog } from './lib/projects';
   import {
@@ -71,6 +72,9 @@
     reason: string;
     sizeBytes: number | null;
     cleanupToken: string | null;
+    directoryId?: string;
+    path?: string;
+    ownerPath?: string;
   };
   type WorktreeCacheUsage = {
     worktree: string;
@@ -85,6 +89,7 @@
   let worktreeCacheUsage = $state<WorktreeCacheUsage[]>([]);
   let worktreeStorageLoading = $state(false);
   let worktreeStorageError = $state('');
+  let pendingTempConfirmation = $state<WorktreeStoragePending | null>(null);
   let worktreeStorageDirectory = '';
   const openCodeAgent = $derived(snapshot?.agents.find((agent) => agent.id === 'opencode'));
   const notificationsOn = $derived(
@@ -327,33 +332,45 @@
   }
 
   async function cleanPendingTemp(item: WorktreeStoragePending) {
-    if (!item.cleanupToken || worktreeStorageLoading) return;
-    let confirmed: boolean;
-    try {
-      confirmed = await ask(
-        `I checked that no process is using this ${formatStorageSize(item.sizeBytes)} of temporary data (${item.reason}). Remove it?`,
-        { title: 'Clean pending temporary data' },
-      );
-    } catch (cause) {
-      worktreeStorageError = `Private agent storage confirmation: ${String(cause)}`;
+    if (
+      !item.cleanupToken ||
+      !item.path ||
+      !item.ownerPath ||
+      !item.directoryId ||
+      worktreeStorageLoading
+    )
       return;
-    }
-    if (!confirmed) return;
     worktreeStorageLoading = true;
     worktreeStorageError = '';
+    let failure = '';
     try {
       worktreeStoragePending = await invoke<WorktreeStoragePending[]>(
         'clean_pending_worktree_temp',
         {
           token: item.cleanupToken,
+          expectedPreview: {
+            path: item.path,
+            ownerPath: item.ownerPath,
+            directoryId: item.directoryId,
+            sizeBytes: item.sizeBytes,
+            reason: item.reason,
+          },
           confirmedUnused: true,
         },
       );
     } catch (cause) {
-      worktreeStorageError = `Private agent storage cleanup: ${String(cause)}`;
+      failure = `Private agent storage cleanup: ${String(cause)}`;
     } finally {
       worktreeStorageLoading = false;
+      await refreshWorktreeStorage();
+      if (failure) worktreeStorageError = failure;
     }
+  }
+
+  function answerPendingTempConfirmation(confirmed: boolean) {
+    const item = pendingTempConfirmation;
+    pendingTempConfirmation = null;
+    if (confirmed && item) void cleanPendingTemp(item);
   }
 
   async function chooseContextExecutable() {
@@ -1303,21 +1320,30 @@
         >
         {#if worktreeStorageError}<p class="runtime-diagnostic" role="alert">
             {worktreeStorageError}
-          </p>
-        {:else if worktreeStoragePending.length > 0}
+          </p>{/if}
+        {#if worktreeStoragePending.length > 0}
           <p role="status">
             {worktreeStoragePending.length} cleanup item(s) are pending. Their data was retained because
             Sail could not verify that no process still owns it or that its Git worktree identity is unchanged.
           </p>
           <ul>
             {#each worktreeStoragePending as item (`${item.cacheKey}:${item.reason}:${item.cleanupToken ?? ''}`)}
-              <li>
-                {item.reason} · {formatStorageSize(item.sizeBytes)} <code>{item.cacheKey}</code>
-                {#if item.cleanupToken}
+              <li data-pending-temp-path={item.path} data-pending-temp-owner={item.ownerPath}>
+                <p>
+                  Pending reason: {item.reason} · Retained size: {formatStorageSize(item.sizeBytes)}
+                </p>
+                {#if item.path && item.ownerPath}
+                  <p>Owner worktree: <code>{item.ownerPath}</code></p>
+                  <p>Temporary data: <code>{item.path}</code></p>
+                {:else}
+                  <code>{item.cacheKey}</code>
+                {/if}
+                {#if item.cleanupToken && item.path && item.ownerPath && item.directoryId}
                   <Button
                     size="sm"
                     disabled={worktreeStorageLoading}
-                    onclick={() => void cleanPendingTemp(item)}>Clean after checking unused</Button
+                    onclick={() => (pendingTempConfirmation = item)}
+                    >Clean after checking unused</Button
                   >
                 {/if}
               </li>
@@ -2462,3 +2488,18 @@
     {/if}
   </main>
 </div>
+<ConfirmDialog
+  request={pendingTempConfirmation?.cleanupToken &&
+  pendingTempConfirmation.path &&
+  pendingTempConfirmation.ownerPath &&
+  pendingTempConfirmation.directoryId
+    ? {
+        id: pendingTempConfirmation.cleanupToken,
+        title: 'Clean pending temporary data',
+        message: `I checked that no process is using this temporary data and no other process will write to, move, or replace it until cleanup finishes. Remove only this temporary data?\n\nOwner worktree: ${pendingTempConfirmation.ownerPath}\nTemporary data: ${pendingTempConfirmation.path}\nRetained size: ${formatStorageSize(pendingTempConfirmation.sizeBytes)}\nPending reason: ${pendingTempConfirmation.reason}`,
+        confirmLabel: 'Remove selected temporary data',
+        destructive: true,
+      }
+    : null}
+  onanswer={answerPendingTempConfirmation}
+/>

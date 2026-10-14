@@ -18,6 +18,9 @@ const REPOSITORY_FILE: &str = "sail-repository-generation-v1";
 const REPOSITORY_HEADER: &str = "sail-repository-generation-v1";
 const ACTIVE_PREFIX: &str = ".active-";
 const QUARANTINE_PREFIX: &str = ".reclaim-";
+const EXPLICIT_CLEANUP_MARKER: &str = ".sail-explicit-cleanup-pending-v1";
+const EXPLICIT_CLEANUP_HEADER: &str = "sail-explicit-worktree-storage-cleanup-v1\n";
+const DURABLE_CLEANUP_HEADER: &str = "sail-explicit-worktree-storage-owner-v3\n";
 const TEMP_ROOT: &str = "turn-temp";
 const TEMP_OWNER_FILE: &str = "sail-temp-owner-v2";
 const TEMP_OWNER_HEADER: &str = "sail-temp-owner-v3";
@@ -27,6 +30,7 @@ const LEGACY_TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
 const TEMP_PROCESS_UNSTARTED: &str = "sail-temp-process-state-v1\nunstarted\n";
 const TEMP_PROCESS_EXPOSED: &str = "sail-temp-process-state-v1\nexposed\n";
 const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
+const TEMP_QUARANTINE_PREFIX: &str = ".sail-selected-temp-";
 const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
 const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
 const CACHE_LIMIT_FILE: &str = "sail-cache-limit-v1";
@@ -60,6 +64,68 @@ struct WorktreeIdentity {
     repository_generation: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DurableCleanupIdentity {
+    owner: WorktreeIdentity,
+    directory_id: String,
+}
+
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| format!("Cannot inspect selected storage directory identity: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("Selected storage is not a directory.".into());
+    }
+    let created = metadata
+        .created()
+        .map_err(|error| format!("Cannot verify selected storage creation time: {error}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("Invalid selected storage creation time: {error}"))?;
+    Ok(format!(
+        "unix:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        created.as_nanos()
+    ))
+}
+
+#[cfg(windows)]
+fn directory_identity(path: &Path) -> Result<String, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|error| format!("Cannot open selected storage directory identity: {error}"))?;
+    let created = file
+        .metadata()
+        .and_then(|metadata| metadata.created())
+        .map_err(|error| format!("Cannot verify selected storage creation time: {error}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("Invalid selected storage creation time: {error}"))?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+        return Err(format!(
+            "Cannot inspect selected storage directory identity: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(format!(
+        "windows:{}:{}:{}:{}",
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+        created.as_nanos()
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CleanupPending {
@@ -67,6 +133,12 @@ pub(crate) struct CleanupPending {
     pub(crate) reason: String,
     pub(crate) size_bytes: Option<u64>,
     pub(crate) cleanup_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) directory_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -81,7 +153,7 @@ pub(crate) struct CacheUsage {
     pub(crate) reason: Option<String>,
 }
 
-fn pending_size(path: &Path) -> Option<u64> {
+pub(crate) fn pending_size(path: &Path) -> Option<u64> {
     let mut total = 0u64;
     let mut remaining = vec![path.to_path_buf()];
     while let Some(path) = remaining.pop() {
@@ -98,15 +170,32 @@ fn pending_size(path: &Path) -> Option<u64> {
 }
 
 fn pending_item(key: String, reason: &str, path: Option<&Path>, can_clean: bool) -> CleanupPending {
+    let size_bytes = path.and_then(pending_size);
+    let directory_id = path.and_then(|path| match directory_identity(path) {
+        Ok(identity) => Some(identity),
+        Err(_)
+            if fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Some("absent".into())
+        }
+        Err(_) => None,
+    });
     CleanupPending {
         cache_key: key,
         reason: reason.into(),
-        size_bytes: path.and_then(pending_size),
-        cleanup_token: if can_clean {
+        size_bytes,
+        cleanup_token: if can_clean
+            && directory_id.is_some()
+            && (size_bytes.is_some() || directory_id.as_deref() == Some("absent"))
+        {
             path.and_then(|path| cache_key(path).ok())
         } else {
             None
         },
+        directory_id,
+        path: None,
+        owner_path: None,
     }
 }
 
@@ -744,8 +833,31 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             continue;
         };
         if let Some(key) = name.strip_prefix(QUARANTINE_PREFIX) {
-            if let Some((key, _)) = key.split_once('-').filter(|(key, _)| valid_cache_key(key)) {
-                remove_quarantine(&entry.path(), key);
+            if let Some((key, suffix)) = key.split_once('-').filter(|(key, _)| valid_cache_key(key))
+            {
+                if suffix
+                    .strip_suffix(".tmp")
+                    .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok())
+                {
+                    match has_durable_cleanup_marker_by_key(cache_directory, key) {
+                        Ok(true) => report_pending(&entry.path(), "explicit-cleanup-required"),
+                        Ok(false) => match has_explicit_cleanup_marker(&entry.path()) {
+                            Ok(true) => report_pending(&entry.path(), "explicit-cleanup-required"),
+                            Ok(false) => {
+                                let _ = remove_quarantine(&entry.path(), key);
+                            }
+                            Err(_) => {
+                                report_pending(
+                                    &entry.path(),
+                                    "explicit-cleanup-marker-unverifiable",
+                                );
+                            }
+                        },
+                        Err(_) => {
+                            report_pending(&entry.path(), "explicit-cleanup-marker-unverifiable");
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -861,6 +973,27 @@ pub(crate) fn reconcile(cache_directory: &Path) {
                 continue;
             }
         }
+        match has_durable_cleanup_marker(cache_directory, &data_directory) {
+            Ok(true) => {
+                report_pending(&data_directory, "explicit-cleanup-required");
+                continue;
+            }
+            Ok(false) => match has_explicit_cleanup_marker(&data_directory) {
+                Ok(true) => {
+                    report_pending(&data_directory, "explicit-cleanup-required");
+                    continue;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    report_pending(&data_directory, "explicit-cleanup-marker-unverifiable");
+                    continue;
+                }
+            },
+            Err(_) => {
+                report_pending(&data_directory, "explicit-cleanup-marker-unverifiable");
+                continue;
+            }
+        }
         let pending_temp = temp_directory_status(cache_directory, &data_directory);
         if !pending_temp.is_empty() {
             for item in pending_temp {
@@ -889,7 +1022,7 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         drop(lease);
         drop(mutation);
         drop(repo_lock);
-        remove_quarantine(&quarantine, &quarantine_key);
+        let _ = remove_quarantine(&quarantine, &quarantine_key);
     }
     trim_all_idle_caches(cache_directory);
 }
@@ -925,8 +1058,63 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
         let name = entry.file_name().to_string_lossy().into_owned();
         let directory = entry.path();
         pending.extend(temp_directory_status(cache_directory, &directory));
+        if name.starts_with(QUARANTINE_PREFIX) {
+            let temporary = match quarantine_temporary_data(&directory) {
+                Ok(Some(path)) if path == directory.join(TEMP_ROOT) => {
+                    Some((path, "turn-temp-owner-unverifiable"))
+                }
+                Ok(Some(path)) => Some((path, "legacy-temp-owner-unverified")),
+                Err(_) => Some((directory.clone(), "turn-temp-scan-failed")),
+                Ok(None) => None,
+            };
+            if let Some((path, reason)) = temporary {
+                let mut item = pending_item(
+                    cache_key(&path).unwrap_or_else(|_| "unknown".into()),
+                    reason,
+                    Some(&path),
+                    false,
+                );
+                item.path = path.to_str().map(str::to_owned);
+                item.owner_path = name
+                    .strip_prefix(QUARANTINE_PREFIX)
+                    .and_then(|name| name.split_once('-'))
+                    .and_then(|(key, _)| {
+                        durable_cleanup_identity_by_key(cache_directory, key)
+                            .ok()
+                            .flatten()
+                            .filter(|durable| {
+                                identity_data_directory(cache_directory, &durable.owner)
+                                    .ok()
+                                    .and_then(|path| cache_key(&path).ok())
+                                    .as_deref()
+                                    == Some(key)
+                            })
+                    })
+                    .filter(|durable| {
+                        directory_identity(&directory).ok().as_deref()
+                            == Some(&durable.directory_id)
+                    })
+                    .and_then(|durable| durable.owner.root.to_str().map(str::to_owned));
+                pending.push(item);
+            }
+        }
         let reason = if name.starts_with(QUARANTINE_PREFIX) {
-            Some("cleanup-interrupted")
+            let durable = name
+                .strip_prefix(QUARANTINE_PREFIX)
+                .and_then(|name| name.split_once('-'))
+                .filter(|(key, _)| valid_cache_key(key))
+                .map(|(key, _)| has_durable_cleanup_marker_by_key(cache_directory, key));
+            match durable.transpose().and_then(|durable| {
+                if durable == Some(true) {
+                    Ok(true)
+                } else {
+                    has_explicit_cleanup_marker(&directory)
+                }
+            }) {
+                Ok(true) => Some("explicit-cleanup-required"),
+                Ok(false) => Some("cleanup-interrupted"),
+                Err(_) => Some("explicit-cleanup-marker-unverifiable"),
+            }
         } else if !valid_cache_key(&name) {
             None
         } else {
@@ -979,7 +1167,20 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
                         }
                     } else {
                         match verify_identity_removed(&identity) {
-                            Ok(true) => Some("stale-worktree-storage"),
+                            Ok(true) => {
+                                match has_durable_cleanup_marker(cache_directory, &directory)
+                                    .and_then(|durable| {
+                                        if durable {
+                                            Ok(true)
+                                        } else {
+                                            has_explicit_cleanup_marker(&directory)
+                                        }
+                                    }) {
+                                    Ok(true) => Some("explicit-cleanup-required"),
+                                    Ok(false) => Some("stale-worktree-storage"),
+                                    Err(_) => Some("explicit-cleanup-marker-unverifiable"),
+                                }
+                            }
                             Ok(false) => Some("git-worktree-registration-still-present"),
                             Err(reason) => Some(reason),
                         }
@@ -1613,14 +1814,52 @@ fn reclaim_verified_unstarted_temp(cache_directory: &Path, data_directory: &Path
 /// Remove one pending temporary directory after the user has checked that it is unused.
 /// The token identifies a path already reported by cleanup_status; it is never a path
 /// supplied by the frontend.
+#[cfg(test)]
 pub(crate) fn clean_pending_temp(
     cache_directory: &Path,
     token: &str,
 ) -> Result<Vec<CleanupPending>, String> {
+    clean_pending_temp_inner(cache_directory, token, None, None)?;
+    Ok(retry_cleanup(cache_directory))
+}
+
+pub(crate) fn clean_pending_temp_checked(
+    cache_directory: &Path,
+    token: &str,
+    expected_path: &Path,
+    expected_owner_path: &Path,
+    expected_directory_id: &str,
+    expected_size_bytes: Option<u64>,
+    expected_reason: &str,
+) -> Result<Vec<CleanupPending>, String> {
+    clean_pending_temp_inner(
+        cache_directory,
+        token,
+        None,
+        Some((
+            expected_path,
+            expected_owner_path,
+            expected_directory_id,
+            expected_size_bytes,
+            expected_reason,
+        )),
+    )?;
+    Ok(retry_cleanup(cache_directory))
+}
+
+fn clean_pending_temp_inner(
+    cache_directory: &Path,
+    token: &str,
+    selected_storage: Option<(&Path, &DurableCleanupIdentity)>,
+    expected_view: Option<(&Path, &Path, &str, Option<u64>, &str)>,
+) -> Result<(), String> {
     if !valid_cache_key(token) {
         return Err("Invalid pending temporary data token.".into());
     }
     let (data_directory, target, lock_directory) = find_pending_temp(cache_directory, token)?;
+    if selected_storage.is_some_and(|(expected, _)| data_directory != expected) {
+        return Err("Pending temporary data belongs to another private storage directory.".into());
+    }
     let _mutation = FileLock::try_acquire(
         &lock_path(cache_directory, "mutation", &data_directory)?,
         true,
@@ -1632,12 +1871,52 @@ pub(crate) fn clean_pending_temp(
     if !verified_data_owner(cache_directory, &data_directory) {
         return Err("Private storage ownership changed; refresh cleanup status.".into());
     }
-    if !temp_directory_status(cache_directory, &data_directory)
-        .iter()
-        .any(|item| item.cleanup_token.as_deref() == Some(token))
-    {
-        return Err("Temporary data is no longer pending; refresh cleanup status.".into());
+    if !selected_temp_quarantines(&data_directory)?.is_empty() {
+        return Err("Selected temporary data quarantine requires separate recovery.".into());
     }
+    let current = temp_directory_status(cache_directory, &data_directory)
+        .into_iter()
+        .find(|item| item.cleanup_token.as_deref() == Some(token))
+        .ok_or("Temporary data is no longer pending; refresh cleanup status.")?;
+    if let Some((expected_path, expected_owner_path, expected_id, expected_size, expected_reason)) =
+        expected_view
+    {
+        let owner_path = read_owner(&data_directory)
+            .ok()
+            .filter(|identity| {
+                identity_data_directory(cache_directory, identity)
+                    .ok()
+                    .as_deref()
+                    == Some(data_directory.as_path())
+            })
+            .map(|identity| identity.root)
+            .or_else(|| read_plain_owner(cache_directory, &data_directory).ok());
+        if target != expected_path
+            || owner_path.as_deref() != Some(expected_owner_path)
+            || current.directory_id.as_deref() != Some(expected_id)
+            || current.size_bytes != expected_size
+            || current.reason != expected_reason
+        {
+            return Err(
+                "Pending temporary data path, owner, identity, size, or reason changed; refresh cleanup status.".into(),
+            );
+        }
+    }
+    if let Some((_, expected)) = selected_storage {
+        if directory_identity(&data_directory).ok().as_deref() != Some(&expected.directory_id)
+            || read_owner(&data_directory).ok().as_ref() != Some(&expected.owner)
+            || !verify_selected_identity_removed(&expected.owner).map_err(str::to_string)?
+        {
+            return Err(
+                "Selected private storage changed during temporary cleanup; its bytes were retained."
+                    .into(),
+            );
+        }
+    }
+    let expected_directory_id = expected_view
+        .map(|(_, _, id, _, _)| id)
+        .or(current.directory_id.as_deref())
+        .ok_or("Temporary directory identity cannot be verified.")?;
     if target == data_directory.join(TEMP_ROOT) {
         let states = process_state_paths(cache_directory, &cache_key(&data_directory)?)?;
         if !states.iter().any(|path| !unstarted_process_state(path)) {
@@ -1656,12 +1935,29 @@ pub(crate) fn clean_pending_temp(
             return Err("Temporary data still has an active owner.".into());
         }
         match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&target).map_err(|error| {
-                report_pending(&target, "manual-temp-removal-failed");
-                format!("Cannot remove pending temporary data: {error}")
-            })?,
+            Ok(metadata) if metadata.is_dir() && expected_directory_id != "absent" => {
+                let quarantine =
+                    quarantine_selected_temp(&data_directory, &target, expected_directory_id)?;
+                if temp_directory_in_use(&quarantine) {
+                    return Err(format!(
+                        "Temporary data is still in use and was preserved at {}.",
+                        quarantine.display()
+                    ));
+                }
+                fs::remove_dir_all(&quarantine).map_err(|error| {
+                    report_pending(&quarantine, "manual-temp-removal-failed");
+                    format!(
+                        "Cannot remove pending temporary data at {}: {error}",
+                        quarantine.display()
+                    )
+                })?;
+            }
             Ok(_) => return Err("Temporary root is not an unused directory.".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if expected_directory_id != "absent" {
+                    return Err("Temporary root changed since confirmation.".into());
+                }
+            }
             Err(error) => return Err(error.to_string()),
         }
         for state in states {
@@ -1672,7 +1968,7 @@ pub(crate) fn clean_pending_temp(
         }
         drop(_lease);
         drop(_mutation);
-        return Ok(retry_cleanup(cache_directory));
+        return Ok(());
     }
     let _temp_lock = if let Some(lock_directory) = &lock_directory {
         Some(
@@ -1694,6 +1990,20 @@ pub(crate) fn clean_pending_temp(
             return Err("Temporary data still has a verified active owner.".into());
         }
     }
+    let quarantine = quarantine_selected_temp(&data_directory, &target, expected_directory_id)?;
+    if temp_directory_in_use(&quarantine) {
+        return Err(format!(
+            "Temporary data is still in use and was preserved at {}.",
+            quarantine.display()
+        ));
+    }
+    fs::remove_dir_all(&quarantine).map_err(|error| {
+        report_pending(&quarantine, "manual-temp-removal-failed");
+        format!(
+            "Cannot remove pending temporary data at {}: {error}",
+            quarantine.display()
+        )
+    })?;
     if let Some(lock_directory) = &lock_directory {
         let process_state_file = process_state_path(cache_directory, lock_directory)?;
         if unstarted_process_state(&process_state_file) {
@@ -1707,14 +2017,10 @@ pub(crate) fn clean_pending_temp(
             }
         }
     }
-    fs::remove_dir_all(&target).map_err(|error| {
-        report_pending(&target, "manual-temp-removal-failed");
-        format!("Cannot remove pending temporary data: {error}")
-    })?;
     drop(_temp_lock);
     drop(_lease);
     drop(_mutation);
-    Ok(retry_cleanup(cache_directory))
+    Ok(())
 }
 
 fn find_pending_temp(
@@ -1769,6 +2075,40 @@ fn find_pending_temp(
     Err("Pending temporary data was not found; refresh cleanup status.".into())
 }
 
+fn selected_temp_quarantines(data_directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(data_directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(TEMP_QUARANTINE_PREFIX)
+        {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+
+fn quarantine_selected_temp(
+    data_directory: &Path,
+    target: &Path,
+    expected_directory_id: &str,
+) -> Result<PathBuf, String> {
+    let quarantine =
+        data_directory.join(format!("{TEMP_QUARANTINE_PREFIX}{}", uuid::Uuid::new_v4()));
+    crate::rename_without_replace(target, &quarantine)
+        .map_err(|error| format!("Cannot quarantine selected temporary data: {error}"))?;
+    if directory_identity(&quarantine).ok().as_deref() != Some(expected_directory_id) {
+        report_pending(&quarantine, "selected-temp-identity-changed");
+        return Err(format!(
+            "Selected temporary data changed before removal and was preserved at {}. Refresh cleanup status.",
+            quarantine.display()
+        ));
+    }
+    Ok(quarantine)
+}
+
 fn original_run_name(name: &str) -> Option<&str> {
     let original = name
         .strip_prefix('.')
@@ -1792,14 +2132,56 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
     if !verified_data_owner(cache_directory, data_directory) {
         return pending;
     }
+    let owner_path = read_owner(data_directory)
+        .ok()
+        .filter(|identity| {
+            identity_data_directory(cache_directory, identity)
+                .ok()
+                .as_deref()
+                == Some(data_directory)
+        })
+        .map(|identity| identity.root)
+        .or_else(|| read_plain_owner(cache_directory, data_directory).ok())
+        .and_then(|path| path.to_str().map(str::to_owned));
+    let temp_item = |key: String, reason: &str, path: Option<&Path>, can_clean: bool| {
+        let mut item = pending_item(key, reason, path, can_clean);
+        if let (Some(path), Some(owner)) = (path.and_then(Path::to_str), owner_path.as_deref()) {
+            item.path = Some(path.to_owned());
+            item.owner_path = Some(owner.to_owned());
+        } else {
+            item.cleanup_token = None;
+        }
+        item
+    };
+    let quarantines = match selected_temp_quarantines(data_directory) {
+        Ok(paths) => paths,
+        Err(_) => {
+            pending.push(temp_item(
+                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                "selected-temp-quarantine-scan-failed",
+                Some(data_directory),
+                false,
+            ));
+            return pending;
+        }
+    };
+    for path in &quarantines {
+        pending.push(temp_item(
+            cache_key(path).unwrap_or_else(|_| "unknown".into()),
+            "selected-temp-quarantine-recovery-required",
+            Some(path),
+            false,
+        ));
+    }
     let root = data_directory.join(TEMP_ROOT);
     match cache_key(data_directory).and_then(|key| exposed_process_states(cache_directory, &key)) {
         Ok(states) if !states.is_empty() => {
-            let can_clean = match fs::symlink_metadata(&root) {
-                Ok(metadata) => metadata.is_dir(),
-                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-            };
-            let mut item = pending_item(
+            let can_clean = quarantines.is_empty()
+                && match fs::symlink_metadata(&root) {
+                    Ok(metadata) => metadata.is_dir(),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                };
+            let mut item = temp_item(
                 cache_key(&root).unwrap_or_else(|_| "unknown".into()),
                 "turn-temp-owner-unverifiable",
                 Some(&root),
@@ -1808,7 +2190,7 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
             item.size_bytes = Some(item.size_bytes.unwrap_or(0));
             pending.push(item);
         }
-        Err(_) => pending.push(pending_item(
+        Err(_) => pending.push(temp_item(
             cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
             "turn-temp-state-scan-failed",
             Some(data_directory),
@@ -1822,25 +2204,25 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
     ] {
         let key = cache_key(&legacy).unwrap_or_else(|_| "unknown".into());
         match fs::symlink_metadata(&legacy) {
-            Ok(metadata) if metadata.is_dir() => pending.push(pending_item(
+            Ok(metadata) if metadata.is_dir() => pending.push(temp_item(
                 key,
                 "legacy-temp-owner-unverified",
                 Some(&legacy),
                 true,
             )),
-            Ok(_) => pending.push(pending_item(
+            Ok(_) => pending.push(temp_item(
                 key,
                 "legacy-temp-root-unverifiable",
                 Some(&legacy),
                 false,
             )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => pending.push(pending_item(key, "legacy-temp-scan-failed", None, false)),
+            Err(_) => pending.push(temp_item(key, "legacy-temp-scan-failed", None, false)),
         }
     }
     if let Ok(metadata) = fs::symlink_metadata(&root) {
         if !metadata.is_dir() {
-            pending.push(pending_item(
+            pending.push(temp_item(
                 cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
                 "turn-temp-root-unverifiable",
                 Some(&root),
@@ -1853,7 +2235,7 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return pending,
         Err(_) => {
-            pending.push(pending_item(
+            pending.push(temp_item(
                 cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
                 "turn-temp-scan-failed",
                 None,
@@ -1864,7 +2246,7 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
     };
     for entry in entries {
         let Ok(entry) = entry else {
-            pending.push(pending_item(
+            pending.push(temp_item(
                 cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
                 "turn-temp-entry-unreadable",
                 None,
@@ -1880,7 +2262,7 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
             None => {
                 let can_clean =
                     fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir());
-                pending.push(pending_item(
+                pending.push(temp_item(
                     key,
                     "turn-temp-owner-unverifiable",
                     Some(&directory),
@@ -1924,7 +2306,7 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
             }
         };
         if let Some(reason) = reason {
-            pending.push(pending_item(
+            pending.push(temp_item(
                 key,
                 reason,
                 Some(&directory),
@@ -2123,6 +2505,31 @@ pub(crate) fn data_directory_for_root(cache_directory: &Path, root: &Path) -> Op
     match_path
 }
 
+pub(crate) fn data_directory_for_removal(
+    cache_directory: &Path,
+    root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let identity = resolve_identity(root)?;
+    let directory = identity_data_directory(cache_directory, &identity)?;
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect selected private storage at {}: {error}",
+                directory.display()
+            ));
+        }
+    };
+    if !metadata.is_dir() || read_owner(&directory).ok().as_ref() != Some(&identity) {
+        return Err(format!(
+            "Selected private storage at {} has an unverifiable owner. Its files were kept.",
+            directory.display()
+        ));
+    }
+    Ok(Some(directory))
+}
+
 pub(crate) fn is_managed_directory(path: &Path) -> bool {
     read_owner(path).is_ok()
 }
@@ -2216,6 +2623,113 @@ pub(crate) fn remove_after_worktree_removal(
     cache_directory: &Path,
     data_directories: &[PathBuf],
 ) -> Result<(), String> {
+    remove_after_worktree_removal_with_policy(cache_directory, data_directories, false, None)
+}
+
+fn remove_after_worktree_removal_with_policy(
+    cache_directory: &Path,
+    data_directories: &[PathBuf],
+    allow_verified_replacement: bool,
+    expected_directory_id: Option<&str>,
+) -> Result<(), String> {
+    for data_directory in data_directories {
+        if !data_directory
+            .symlink_metadata()
+            .map_err(|error| format!("Cannot inspect selected private storage: {error}"))?
+            .is_dir()
+        {
+            return Err("Selected private storage is not a managed directory.".into());
+        }
+        let identity = read_owner(data_directory).map_err(|reason| {
+            report_pending(data_directory, reason);
+            format!("Private agent data is retained pending ownership verification ({reason}).")
+        })?;
+        if identity_data_directory(cache_directory, &identity)? != *data_directory {
+            report_pending(data_directory, "owner-cache-key-mismatch");
+            return Err(
+                "Private agent data is retained because its owner key does not match.".into(),
+            );
+        }
+        let _repo_lock = FileLock::acquire(
+            &lock_path(cache_directory, "repo", &identity.common_dir)?,
+            true,
+        )?;
+        let _mutation = FileLock::acquire(
+            &lock_path(cache_directory, "mutation", data_directory)?,
+            true,
+        )?;
+        let _lease =
+            FileLock::try_acquire(&lock_path(cache_directory, "lease", data_directory)?, true)
+                .map_err(|_| {
+                    report_pending(data_directory, "active-use");
+                    "Private agent data is retained because another Sail process is still using it."
+                        .to_string()
+                })?;
+        if expected_directory_id.is_some_and(|expected| {
+            directory_identity(data_directory).ok().as_deref() != Some(expected)
+        }) {
+            return Err("Selected private storage directory changed during cleanup; its bytes were retained.".into());
+        }
+        if has_active_markers(data_directory) {
+            report_pending(data_directory, "unclean-active-use");
+            return Err(
+                "Private agent data is retained because prior active use was not cleanly closed."
+                    .into(),
+            );
+        }
+        let current_owner = read_owner(data_directory)?;
+        if current_owner != identity {
+            report_pending(data_directory, "owner-changed-during-removal");
+            return Err("Private agent data ownership changed during worktree removal.".into());
+        }
+        if !verify_identity_removed_inner(&identity, allow_verified_replacement).map_err(
+            |reason| {
+                report_pending(data_directory, reason);
+                format!(
+                "Private agent data is retained because worktree identity is ambiguous ({reason})."
+            )
+            },
+        )? {
+            report_pending(data_directory, "worktree-identity-still-present");
+            return Err(
+                "Private agent data is retained because Git still identifies this worktree.".into(),
+            );
+        }
+        let pending_temp = temp_directory_status(cache_directory, data_directory);
+        if !pending_temp.is_empty() {
+            for item in pending_temp {
+                report_pending(data_directory, &item.reason);
+            }
+            return Err("Private agent data is retained while temporary data is still in use or cannot be verified.".into());
+        }
+        let name = cache_key(data_directory)?;
+        let quarantine = quarantine_path(
+            data_directory
+                .parent()
+                .ok_or("Invalid private storage path.")?,
+            &name,
+        )?;
+        fs::rename(data_directory, &quarantine).map_err(|error| {
+            report_pending(data_directory, "cannot-quarantine-storage");
+            error.to_string()
+        })?;
+        drop(_lease);
+        drop(_mutation);
+        drop(_repo_lock);
+        if let Some(expected) = expected_directory_id {
+            remove_quarantine_with_identity(&quarantine, &name, &identity, Some(expected))?;
+        } else {
+            remove_quarantine(&quarantine, &name)?;
+        }
+        let _ = clear_durable_cleanup_marker(cache_directory, data_directory);
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_ready_before_worktree_removal(
+    cache_directory: &Path,
+    data_directories: &[PathBuf],
+) -> Result<(), String> {
     for data_directory in data_directories {
         match fs::symlink_metadata(data_directory) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2254,45 +2768,430 @@ pub(crate) fn remove_after_worktree_removal(
                     .into(),
             );
         }
-        let current_owner = read_owner(data_directory)?;
-        if current_owner != identity {
-            report_pending(data_directory, "owner-changed-during-removal");
-            return Err("Private agent data ownership changed during worktree removal.".into());
-        }
-        if !verify_identity_removed(&identity).map_err(|reason| {
-            report_pending(data_directory, reason);
-            format!(
-                "Private agent data is retained because worktree identity is ambiguous ({reason})."
-            )
-        })? {
-            report_pending(data_directory, "worktree-identity-still-present");
-            return Err(
-                "Private agent data is retained because Git still identifies this worktree.".into(),
-            );
+        if read_owner(data_directory)? != identity {
+            report_pending(data_directory, "owner-changed-before-removal");
+            return Err("Private agent data ownership changed before worktree removal.".into());
         }
         let pending_temp = temp_directory_status(cache_directory, data_directory);
         if !pending_temp.is_empty() {
             for item in pending_temp {
                 report_pending(data_directory, &item.reason);
             }
-            return Err("Private agent data is retained while temporary data is still in use or cannot be verified.".into());
+            return Err(
+                "Private agent data is retained while temporary data is still in use or cannot be verified."
+                    .into(),
+            );
         }
-        let name = cache_key(data_directory)?;
-        let quarantine = quarantine_path(
-            data_directory
-                .parent()
-                .ok_or("Invalid private storage path.")?,
-            &name,
-        )?;
-        fs::rename(data_directory, &quarantine).map_err(|error| {
-            report_pending(data_directory, "cannot-quarantine-storage");
-            error.to_string()
-        })?;
-        drop(_lease);
-        drop(_mutation);
-        drop(_repo_lock);
-        remove_quarantine(&quarantine, &name);
+        persist_durable_cleanup_marker(cache_directory, data_directory)?;
+        if !has_explicit_cleanup_marker(data_directory)? {
+            let mut marker = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(data_directory.join(EXPLICIT_CLEANUP_MARKER))
+                .map_err(|error| format!("Cannot preserve selected private storage: {error}"))?;
+            marker
+                .write_all(EXPLICIT_CLEANUP_HEADER.as_bytes())
+                .and_then(|_| marker.sync_all())
+                .map_err(|error| format!("Cannot persist selected private storage: {error}"))?;
+        }
     }
+    Ok(())
+}
+
+pub(crate) fn retained_selected_storage_locations(
+    cache_directory: &Path,
+    data_directories: &[PathBuf],
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let cache_root = cache_directory.join("terminal-worktrees");
+    let entries = fs::read_dir(&cache_root)
+        .map_err(|error| format!("Cannot inspect retained private storage: {error}"))?
+        .map(|entry| {
+            entry
+                .map(|entry| (entry.file_name(), entry.path()))
+                .map_err(|error| format!("Cannot inspect retained private storage: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut retained = Vec::new();
+    for original in data_directories {
+        let key = original
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| valid_cache_key(name))
+            .ok_or("Selected private storage key is invalid.")?
+            .to_owned();
+        if !matches!(
+            original.symlink_metadata(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            retained.push((key.clone(), original.clone()));
+        }
+        let prefix = format!("{QUARANTINE_PREFIX}{}-", cache_key(original)?);
+        for (name, path) in &entries {
+            if name
+                .to_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|suffix| suffix.strip_suffix(".tmp"))
+                .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok())
+            {
+                retained.push((key.clone(), path.clone()));
+            }
+        }
+    }
+    Ok(retained)
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SelectedStorageLocation {
+    pub(crate) cache_key: String,
+    pub(crate) path: PathBuf,
+    pub(crate) size_bytes: Option<u64>,
+}
+
+fn malformed_marker_proven_unrelated(
+    cache_directory: &Path,
+    marker_key: &str,
+    selected_root: &Path,
+    common_dir: &Path,
+    repository_generation: &str,
+) -> bool {
+    let original = cache_directory.join("terminal-worktrees").join(marker_key);
+    let Ok(locations) =
+        retained_selected_storage_locations(cache_directory, std::slice::from_ref(&original))
+    else {
+        return false;
+    };
+    !locations.is_empty()
+        && locations.iter().all(|(_, path)| {
+            read_owner(path).is_ok_and(|owner| {
+                identity_data_directory(cache_directory, &owner)
+                    .is_ok_and(|owner_path| owner_path == original)
+                    && (!owner.root.starts_with(selected_root)
+                        || owner.common_dir != common_dir
+                        || owner.repository_generation != repository_generation)
+            })
+        })
+}
+
+pub(crate) fn selected_removed_storage_locations(
+    cache_directory: &Path,
+    repository: &Path,
+    original_worktree: &Path,
+    expected_generation: &str,
+) -> Result<Vec<SelectedStorageLocation>, String> {
+    let common_dir = git_path(
+        repository,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common_dir = dunce::canonicalize(common_dir)
+        .map_err(|_| "Selected repository identity cannot be verified.".to_string())?;
+    let selected_root = stable_worktree_identity(original_worktree);
+    let (repository_generation, worktree_generation) = expected_generation
+        .split_once(':')
+        .ok_or("The selected worktree generation is malformed.")?;
+    let locks = cache_directory.join("terminal-worktree-locks");
+    let entries = match fs::read_dir(locks) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A new app cache has neither markers nor private storage. An
+            // existing storage root without markers remains ambiguous.
+            match fs::symlink_metadata(cache_directory.join("terminal-worktrees")) {
+                Err(storage_error) if storage_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                _ => {}
+            }
+            return Err(format!("Cannot inspect selected storage markers: {error}"));
+        }
+        Err(error) => return Err(format!("Cannot inspect selected storage markers: {error}")),
+    };
+    let mut locations = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Cannot inspect selected storage marker: {error}"))?;
+        let name = entry.file_name();
+        let Some(marker_key) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("explicit-"))
+            .and_then(|name| name.strip_suffix(".pending"))
+            .filter(|key| valid_cache_key(key))
+        else {
+            continue;
+        };
+        let durable = match durable_cleanup_identity_by_key(cache_directory, marker_key) {
+            Ok(Some(durable)) => durable,
+            Ok(None) => continue,
+            Err(_error)
+                if malformed_marker_proven_unrelated(
+                    cache_directory,
+                    marker_key,
+                    &selected_root,
+                    &common_dir,
+                    repository_generation,
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let identity = &durable.owner;
+        if !identity.root.starts_with(&selected_root)
+            || identity.common_dir != common_dir
+            || identity.repository_generation != repository_generation
+            || (identity.root == selected_root && identity.generation != worktree_generation)
+        {
+            continue;
+        }
+        let original = identity_data_directory(cache_directory, identity)?;
+        if cache_key(&original)? != marker_key
+            || !verify_selected_identity_removed(identity).map_err(str::to_string)?
+        {
+            continue;
+        }
+        for (_, path) in
+            retained_selected_storage_locations(cache_directory, std::slice::from_ref(&original))?
+        {
+            if directory_identity(&path).ok().as_deref() != Some(&durable.directory_id) {
+                continue;
+            }
+            locations.push(SelectedStorageLocation {
+                cache_key: original
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or("Selected private storage key is invalid.")?
+                    .to_owned(),
+                size_bytes: pending_size(&path),
+                path,
+            });
+        }
+    }
+    Ok(locations)
+}
+
+fn has_explicit_cleanup_marker(data_directory: &Path) -> Result<bool, String> {
+    let marker = data_directory.join(EXPLICIT_CLEANUP_MARKER);
+    let metadata = match marker.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Cannot inspect selected cleanup marker: {error}")),
+    };
+    if !metadata.file_type().is_file() {
+        return Err("Selected cleanup marker is not a regular file.".into());
+    }
+    let contents = fs::read_to_string(&marker)
+        .map_err(|error| format!("Cannot read selected cleanup marker: {error}"))?;
+    if contents != EXPLICIT_CLEANUP_HEADER {
+        return Err("Selected cleanup marker does not match its expected format.".into());
+    }
+    Ok(true)
+}
+
+fn durable_cleanup_marker_path(cache_directory: &Path, key: &str) -> PathBuf {
+    cache_directory
+        .join("terminal-worktree-locks")
+        .join(format!("explicit-{key}.pending"))
+}
+
+fn durable_cleanup_identity_by_key(
+    cache_directory: &Path,
+    key: &str,
+) -> Result<Option<DurableCleanupIdentity>, String> {
+    let marker = durable_cleanup_marker_path(cache_directory, key);
+    let metadata = match marker.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Cannot inspect durable cleanup marker: {error}")),
+    };
+    if !metadata.file_type().is_file() {
+        return Err("Durable cleanup marker is not a regular file.".into());
+    }
+    let contents = fs::read_to_string(marker)
+        .map_err(|error| format!("Cannot read durable cleanup marker: {error}"))?;
+    let body = contents
+        .strip_prefix(DURABLE_CLEANUP_HEADER)
+        .ok_or("Durable cleanup marker has no verifiable owner identity.")?;
+    let (directory_id, owner) = body
+        .split_once('\n')
+        .filter(|(id, _)| !id.is_empty())
+        .ok_or("Durable cleanup marker has no directory identity.")?;
+    let owner = parse_owner(owner)
+        .map_err(|reason| format!("Durable cleanup owner identity is invalid ({reason})."))?;
+    Ok(Some(DurableCleanupIdentity {
+        owner,
+        directory_id: directory_id.to_owned(),
+    }))
+}
+
+fn has_durable_cleanup_marker_by_key(cache_directory: &Path, key: &str) -> Result<bool, String> {
+    Ok(durable_cleanup_identity_by_key(cache_directory, key)?.is_some())
+}
+
+fn has_durable_cleanup_marker(
+    cache_directory: &Path,
+    data_directory: &Path,
+) -> Result<bool, String> {
+    has_durable_cleanup_marker_by_key(cache_directory, &cache_key(data_directory)?)
+}
+
+fn persist_durable_cleanup_marker(
+    cache_directory: &Path,
+    data_directory: &Path,
+) -> Result<(), String> {
+    let key = cache_key(data_directory)?;
+    if has_durable_cleanup_marker_by_key(cache_directory, &key)? {
+        return Ok(());
+    }
+    let identity = read_owner(data_directory)
+        .map_err(|reason| format!("Cannot preserve selected storage owner ({reason})."))?;
+    let directory_id = directory_identity(data_directory)?;
+    let marker = durable_cleanup_marker_path(cache_directory, &key);
+    fs::create_dir_all(
+        marker
+            .parent()
+            .ok_or("Invalid durable cleanup marker path.")?,
+    )
+    .map_err(|error| format!("Cannot create durable cleanup marker directory: {error}"))?;
+    let temporary = marker.with_extension(format!("pending-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("Cannot preserve selected private storage: {error}"))?;
+    let written = file
+        .write_all(
+            format!(
+                "{DURABLE_CLEANUP_HEADER}{directory_id}\n{}",
+                encode_owner(&identity)
+            )
+            .as_bytes(),
+        )
+        .and_then(|_| file.sync_all())
+        .and_then(|_| fs::rename(&temporary, &marker));
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written.map_err(|error| format!("Cannot persist selected private storage: {error}"))
+}
+
+fn clear_durable_cleanup_marker(
+    cache_directory: &Path,
+    data_directory: &Path,
+) -> Result<(), String> {
+    let marker = durable_cleanup_marker_path(cache_directory, &cache_key(data_directory)?);
+    match fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Cannot clear durable cleanup marker: {error}")),
+    }
+}
+
+pub(crate) fn retry_selected_removed_worktree_storage(
+    cache_directory: &Path,
+    repository: &Path,
+    original_worktree: &Path,
+    expected_generation: &str,
+    selected_cache_key: &str,
+) -> Result<(), String> {
+    if !valid_cache_key(selected_cache_key) {
+        return Err("Invalid selected private storage key.".into());
+    }
+    let data_directory = cache_directory
+        .join("terminal-worktrees")
+        .join(selected_cache_key);
+    let locations = retained_selected_storage_locations(
+        cache_directory,
+        std::slice::from_ref(&data_directory),
+    )?;
+    let [(_, selected)] = locations.as_slice() else {
+        return Err("Selected private storage has no unique retained location; refresh pending cleanup before retrying.".into());
+    };
+    match selected.symlink_metadata() {
+        Err(error) => return Err(format!("Cannot inspect selected private storage: {error}")),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err("Selected private storage is not a managed directory.".into());
+        }
+        Ok(_) => {}
+    }
+    let marker_key = cache_key(&data_directory)?;
+    let durable = durable_cleanup_identity_by_key(cache_directory, &marker_key)?
+        .ok_or("Selected private storage lacks an explicit cleanup marker.")?;
+    if directory_identity(selected)? != durable.directory_id {
+        return Err("Selected private storage directory changed; its bytes were retained.".into());
+    }
+    let selected_owner = read_owner(selected);
+    let identity =
+        match &selected_owner {
+            Ok(identity) if *identity == durable.owner => identity.clone(),
+            Err("owner-metadata-missing") if *selected != data_directory => durable.owner.clone(),
+            _ => return Err(
+                "Selected private storage ownership cannot be verified against its durable marker."
+                    .into(),
+            ),
+        };
+    let common_dir = git_path(
+        repository,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common_dir = dunce::canonicalize(common_dir)
+        .map_err(|_| "Selected repository identity cannot be verified.".to_string())?;
+    let selected_root = stable_worktree_identity(original_worktree);
+    let (expected_repository_generation, expected_worktree_generation) = expected_generation
+        .split_once(':')
+        .ok_or("The selected worktree generation is malformed.")?;
+    if !identity.root.starts_with(&selected_root)
+        || identity.common_dir != common_dir
+        || identity.repository_generation != expected_repository_generation
+        || (identity.root == selected_root && identity.generation != expected_worktree_generation)
+        || identity_data_directory(cache_directory, &identity)? != data_directory
+    {
+        return Err("Selected private storage belongs to a different worktree generation.".into());
+    }
+    if !verify_selected_identity_removed(&identity).map_err(str::to_string)? {
+        return Err(
+            "The selected worktree generation is still registered; private storage remains intact."
+                .into(),
+        );
+    }
+    if *selected == data_directory {
+        return remove_after_worktree_removal_with_policy(
+            cache_directory,
+            &[data_directory],
+            true,
+            Some(&durable.directory_id),
+        );
+    }
+    let quarantine_key = cache_key(&data_directory)?;
+    let _repo_lock = FileLock::acquire(
+        &lock_path(cache_directory, "repo", &identity.common_dir)?,
+        true,
+    )?;
+    let _mutation = FileLock::acquire(
+        &lock_path(cache_directory, "mutation", &data_directory)?,
+        true,
+    )?;
+    let _lease =
+        FileLock::try_acquire(&lock_path(cache_directory, "lease", &data_directory)?, true)
+            .map_err(|_| "Selected private storage is in active use.".to_string())?;
+    if has_active_markers(selected)
+        || directory_identity(selected).ok().as_deref() != Some(&durable.directory_id)
+        || match &selected_owner {
+            Ok(_) => read_owner(selected).ok().as_ref() != Some(&identity),
+            Err(_) => read_owner(selected).is_ok(),
+        }
+        || durable_cleanup_identity_by_key(cache_directory, &marker_key)?.as_ref() != Some(&durable)
+        || !verify_selected_identity_removed(&identity).map_err(str::to_string)?
+    {
+        return Err(
+            "Selected private storage changed during retry; its bytes were retained.".into(),
+        );
+    }
+    remove_quarantine_with_identity(
+        selected,
+        &quarantine_key,
+        &identity,
+        Some(&durable.directory_id),
+    )?;
+    let _ = clear_durable_cleanup_marker(cache_directory, &data_directory);
     Ok(())
 }
 
@@ -2530,6 +3429,10 @@ fn read_owner(data_directory: &Path) -> Result<WorktreeIdentity, &'static str> {
         return Err("owner-metadata-not-regular");
     }
     let contents = fs::read_to_string(owner_file).map_err(|_| "owner-metadata-unreadable")?;
+    parse_owner(&contents)
+}
+
+fn parse_owner(contents: &str) -> Result<WorktreeIdentity, &'static str> {
     let mut lines = contents.lines();
     if lines.next() != Some(OWNER_HEADER) {
         return Err("legacy-or-unknown-owner-metadata");
@@ -2578,8 +3481,26 @@ fn validate_owner(
 }
 
 fn verify_identity_removed(identity: &WorktreeIdentity) -> Result<bool, &'static str> {
-    if identity.root.exists() {
+    verify_identity_removed_inner(identity, false)
+}
+
+fn verify_selected_identity_removed(identity: &WorktreeIdentity) -> Result<bool, &'static str> {
+    verify_identity_removed_inner(identity, true)
+}
+
+fn verify_identity_removed_inner(
+    identity: &WorktreeIdentity,
+    allow_verified_replacement: bool,
+) -> Result<bool, &'static str> {
+    if identity.root.exists() && !allow_verified_replacement {
         return Ok(false);
+    }
+    if identity.root.exists() {
+        match resolve_identity(&identity.root) {
+            Ok(current) if current == *identity => return Ok(false),
+            Ok(_) => {}
+            Err(_) => return Err("worktree-replacement-identity-ambiguous"),
+        }
     }
     let common = dunce::canonicalize(&identity.common_dir)
         .map_err(|_| "git-common-dir-missing-or-unreadable")?;
@@ -2592,11 +3513,17 @@ fn verify_identity_removed(identity: &WorktreeIdentity) -> Result<bool, &'static
         Err(_) => return Err("git-repository-generation-ambiguous"),
     }
     let listed = git_worktrees(&identity.common_dir).map_err(|_| "git-worktree-list-failed")?;
-    if listed
-        .iter()
-        .any(|path| lexical_absolute(path) == lexical_absolute(&identity.root))
-    {
-        return Ok(false);
+    for path in &listed {
+        if lexical_absolute(path) == lexical_absolute(&identity.root) {
+            if !allow_verified_replacement {
+                return Ok(false);
+            }
+            match resolve_identity(path) {
+                Ok(current) if current == *identity => return Ok(false),
+                Ok(_) => {}
+                Err(_) => return Err("worktree-replacement-identity-ambiguous"),
+            }
+        }
     }
     let admin_metadata = match fs::symlink_metadata(&identity.admin_dir) {
         Ok(metadata) => Some(metadata),
@@ -2609,6 +3536,7 @@ fn verify_identity_removed(identity: &WorktreeIdentity) -> Result<bool, &'static
         }
         match read_generation(&identity.admin_dir.join(GENERATION_FILE)) {
             Ok(Some(generation)) if generation == identity.generation => return Ok(false),
+            Ok(Some(_)) if allow_verified_replacement => {}
             Ok(_) => return Ok(false),
             Err(_) => return Err("git-admin-generation-ambiguous"),
         }
@@ -2684,22 +3612,99 @@ fn quarantine_path(cache_root: &Path, key: &str) -> Result<PathBuf, String> {
     Err("Cannot select a private storage quarantine path.".into())
 }
 
-fn remove_quarantine(path: &Path, key: &str) {
+fn remove_quarantine(path: &Path, key: &str) -> Result<(), String> {
     let identity = match read_owner(path) {
         Ok(identity) => identity,
         Err(_) => {
             report_pending(path, "quarantine-owner-unverifiable");
-            return;
+            return Err(format!(
+                "Private storage remains at {} because its quarantine owner is unverifiable.",
+                path.display()
+            ));
         }
     };
+    remove_quarantine_with_identity(path, key, &identity, None)
+}
+
+fn quarantine_temporary_data(path: &Path) -> Result<Option<PathBuf>, String> {
+    if let Some(selected) = selected_temp_quarantines(path)?.into_iter().next() {
+        return Ok(Some(selected));
+    }
+    let legacy = path.join("tmp");
+    match fs::symlink_metadata(&legacy) {
+        Ok(_) => return Ok(Some(legacy)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect quarantined temporary data: {error}"
+            ))
+        }
+    }
+    let build = path.join("build");
+    match fs::symlink_metadata(&build) {
+        Ok(metadata) if metadata.is_dir() => {
+            let legacy = build.join("go-tmp");
+            match fs::symlink_metadata(&legacy) {
+                Ok(_) => return Ok(Some(legacy)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot inspect quarantined temporary data: {error}"
+                    ))
+                }
+            }
+        }
+        Ok(_) => return Ok(Some(build)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect quarantined temporary data: {error}"
+            ))
+        }
+    }
+    let root = path.join(TEMP_ROOT);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() => {
+            let mut entries = fs::read_dir(&root)
+                .map_err(|error| format!("Cannot inspect quarantined temporary data: {error}"))?;
+            match entries.next() {
+                Some(Ok(_)) => Ok(Some(root)),
+                Some(Err(error)) => Err(format!(
+                    "Cannot inspect quarantined temporary data: {error}"
+                )),
+                None => Ok(None),
+            }
+        }
+        Ok(_) => Ok(Some(root)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Cannot inspect quarantined temporary data: {error}"
+        )),
+    }
+}
+
+fn remove_quarantine_with_identity(
+    path: &Path,
+    key: &str,
+    identity: &WorktreeIdentity,
+    expected_directory_id: Option<&str>,
+) -> Result<(), String> {
+    if expected_directory_id
+        .is_some_and(|expected| directory_identity(path).ok().as_deref() != Some(expected))
+    {
+        return Err("Selected quarantine directory changed; its bytes were retained.".into());
+    }
     let expected = match identity_data_directory(
         path.parent().and_then(Path::parent).unwrap_or(path),
-        &identity,
+        identity,
     ) {
         Ok(expected) => expected,
         Err(_) => {
             report_pending(path, "quarantine-owner-unverifiable");
-            return;
+            return Err(format!(
+                "Private storage remains at {} because its quarantine owner is unverifiable.",
+                path.display()
+            ));
         }
     };
     if cache_key(&expected)
@@ -2707,26 +3712,70 @@ fn remove_quarantine(path: &Path, key: &str) {
         .unwrap_or(true)
     {
         report_pending(path, "quarantine-owner-key-mismatch");
-        return;
+        return Err(format!(
+            "Private storage remains at {} because its quarantine key does not match.",
+            path.display()
+        ));
     }
     let cache_directory = path.parent().and_then(Path::parent).unwrap_or(path);
     match exposed_process_states(cache_directory, key) {
         Ok(states) if !states.is_empty() => {
             report_pending(path, "turn-temp-owner-unverifiable");
-            return;
+            return Err(
+                "Private storage retains temporary process state; review it before cleanup.".into(),
+            );
         }
         Err(_) => {
             report_pending(path, "turn-temp-state-scan-failed");
-            return;
+            return Err("Cannot verify private storage temporary process state.".into());
         }
         Ok(_) => {}
     }
-    match fs::remove_dir_all(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => report_pending(path, "quarantine-removal-failed"),
+    match quarantine_temporary_data(path) {
+        Ok(Some(_)) => {
+            report_pending(path, "turn-temp-owner-unverifiable");
+            return Err("Private storage retains temporary data; review it before cleanup.".into());
+        }
+        Err(error) => {
+            report_pending(path, "turn-temp-scan-failed");
+            return Err(error);
+        }
+        Ok(None) => {}
     }
-    let _ = key;
+    // Remove the empty temporary root before deleting storage. This fails if a
+    // late writer populated it after the scan and closes an already-open root
+    // directory handle against subsequent child creation on Unix.
+    let temp_root = path.join(TEMP_ROOT);
+    match fs::symlink_metadata(&temp_root) {
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir(&temp_root).map_err(|error| {
+                report_pending(path, "turn-temp-owner-unverifiable");
+                format!("Private storage retains temporary data: {error}")
+            })?;
+        }
+        Ok(_) => {
+            report_pending(path, "turn-temp-owner-unverifiable");
+            return Err("Private storage temporary root changed during cleanup.".into());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            report_pending(path, "turn-temp-scan-failed");
+            return Err(format!(
+                "Cannot inspect quarantined temporary data: {error}"
+            ));
+        }
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            report_pending(path, "quarantine-removal-failed");
+            Err(format!(
+                "Private storage remains at {} because removal failed: {error}",
+                path.display()
+            ))
+        }
+    }
 }
 
 fn report_pending(path: &Path, reason: &str) {
@@ -2858,12 +3907,12 @@ fn log_lock_holder(path: &Path) {
     }
 }
 
-struct FileLock {
+pub(crate) struct FileLock {
     file: File,
 }
 
 impl FileLock {
-    fn acquire(path: &Path, exclusive: bool) -> Result<Self, String> {
+    pub(crate) fn acquire(path: &Path, exclusive: bool) -> Result<Self, String> {
         Self::acquire_mode(path, exclusive, false)
     }
 
@@ -3015,30 +4064,8 @@ mod tests {
             fs::write(repository.join("tracked"), "fixture").unwrap();
             Self::git(&repository, &["add", "tracked"]);
             Self::git(&repository, &["commit", "--quiet", "-m", "fixture"]);
-            Self::git(
-                &repository,
-                &[
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    "--detach",
-                    "--lock",
-                    first.to_str().unwrap(),
-                    "HEAD",
-                ],
-            );
-            Self::git(
-                &repository,
-                &[
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    "--detach",
-                    "--lock",
-                    second.to_str().unwrap(),
-                    "HEAD",
-                ],
-            );
+            Self::add_locked_worktree(&repository, &first);
+            Self::add_locked_worktree(&repository, &second);
             Self {
                 root,
                 repository,
@@ -3062,6 +4089,18 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             output.stdout
+        }
+
+        fn add_locked_worktree(repository: &Path, worktree: &Path) {
+            let path = worktree.to_str().unwrap();
+            Self::git(
+                repository,
+                &["worktree", "add", "--quiet", "--detach", path, "HEAD"],
+            );
+            // Git 2.55 failed in CI while --lock opened its marker in a
+            // missing admin directory. Finish add first, then lock the same
+            // fixture worktree for every test.
+            Self::git(repository, &["worktree", "lock", path]);
         }
 
         fn remove(&self, worktree: &Path) {
@@ -3246,18 +4285,7 @@ mod tests {
     fn unicode_git_worktree_paths_register_and_clean() {
         let fixture = GitFixture::new();
         let worktree = fixture.root.join("café-工作");
-        GitFixture::git(
-            &fixture.repository,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "--detach",
-                "--lock",
-                worktree.to_str().unwrap(),
-                "HEAD",
-            ],
-        );
+        GitFixture::add_locked_worktree(&fixture.repository, &worktree);
         let (directory, lease) = register(&fixture.cache, &worktree).unwrap();
         lease.mark_started();
         lease.release_clean().unwrap();
@@ -3431,9 +4459,125 @@ mod tests {
 
         let item = pending_with_reason(&fixture.cache, "turn-temp-owner-unverified");
         assert!(item.size_bytes.unwrap() >= 6);
+        assert_eq!(item.path.as_deref(), temp.to_str());
+        assert_eq!(
+            item.owner_path.as_deref(),
+            dunce::canonicalize(&fixture.first).unwrap().to_str()
+        );
+        assert!(clean_pending_temp_checked(
+            &fixture.cache,
+            item.cleanup_token.as_deref().unwrap(),
+            &temp.join("another-run"),
+            &fixture.first,
+            item.directory_id.as_deref().unwrap(),
+            item.size_bytes,
+            &item.reason,
+        )
+        .is_err());
         assert_eq!(fs::read_to_string(&artifact).unwrap(), "retain");
         assert_pending_temp_cleaned(&fixture.cache, item.cleanup_token.as_deref().unwrap());
         assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn selected_temp_preview_rejects_a_same_size_path_replacement() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        let target = directory.join("tmp");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "old").unwrap();
+        let preview = pending_with_reason(&fixture.cache, "legacy-temp-owner-unverified");
+        let original = fixture.root.join("previewed-temp");
+        fs::rename(&target, &original).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "new").unwrap();
+
+        let result = clean_pending_temp_checked(
+            &fixture.cache,
+            preview.cleanup_token.as_deref().unwrap(),
+            Path::new(preview.path.as_deref().unwrap()),
+            Path::new(preview.owner_path.as_deref().unwrap()),
+            preview.directory_id.as_deref().unwrap(),
+            preview.size_bytes,
+            &preview.reason,
+        );
+
+        assert!(result.unwrap_err().contains("identity"));
+        assert_eq!(
+            fs::read_to_string(original.join("artifact")).unwrap(),
+            "old"
+        );
+        assert_eq!(fs::read_to_string(target.join("artifact")).unwrap(), "new");
+    }
+
+    #[test]
+    fn selected_temp_swap_at_atomic_move_preserves_replacement_in_quarantine() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        let target = directory.join("tmp");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "old").unwrap();
+        let previewed_id = directory_identity(&target).unwrap();
+        let original = fixture.root.join("previewed-temp");
+        fs::rename(&target, &original).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "new").unwrap();
+
+        let result = quarantine_selected_temp(&directory, &target, &previewed_id);
+        assert!(result.unwrap_err().contains("preserved at"));
+        let pending = temp_directory_status(&fixture.cache, &directory);
+        let quarantined = pending
+            .iter()
+            .find(|item| item.reason == "selected-temp-quarantine-recovery-required")
+            .unwrap();
+        assert!(quarantined.cleanup_token.is_none());
+        let path = Path::new(quarantined.path.as_deref().unwrap());
+        assert_eq!(quarantined.size_bytes, Some(3));
+        assert_eq!(fs::read_to_string(path.join("artifact")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(original.join("artifact")).unwrap(),
+            "old"
+        );
+        retry_cleanup(&fixture.cache);
+        assert_eq!(fs::read_to_string(path.join("artifact")).unwrap(), "new");
+    }
+
+    #[test]
+    fn selected_temp_preview_removes_the_verified_directory() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        let target = directory.join("tmp");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "unused").unwrap();
+        let preview = pending_with_reason(&fixture.cache, "legacy-temp-owner-unverified");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match clean_pending_temp_checked(
+                &fixture.cache,
+                preview.cleanup_token.as_deref().unwrap(),
+                Path::new(preview.path.as_deref().unwrap()),
+                Path::new(preview.owner_path.as_deref().unwrap()),
+                preview.directory_id.as_deref().unwrap(),
+                preview.size_bytes,
+                &preview.reason,
+            ) {
+                Ok(_) => break,
+                Err(error)
+                    if error == "Private storage still has an active owner."
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("verified selected temp cleanup failed: {error}"),
+            }
+        }
+
+        assert!(!target.exists());
+        assert!(selected_temp_quarantines(&directory).unwrap().is_empty());
     }
 
     #[test]
@@ -3851,21 +4995,47 @@ mod tests {
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
         let artifact = temp.join("artifact");
+        let ready = fixture.root.join("detached-worker-ready");
         fs::write(&artifact, "live").unwrap();
         let mut worker = std::process::Command::new("python3")
             .arg("-c")
-            .arg("import sys,time; time.sleep(30); open(sys.argv[1]).read()")
+            .arg("import os,sys,time; os.chdir(sys.argv[2]); open(sys.argv[1]).read(); open(sys.argv[3], 'w').write('ready'); time.sleep(30)")
             .arg(&artifact)
+            .arg(&temp)
+            .arg(&ready)
             .env("TMPDIR", &temp)
             .spawn()
             .unwrap();
-        for _ in 0..100 {
-            if temp_directory_in_use(&temp) {
-                break;
-            }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(temp_directory_in_use(&temp));
+        let worker_ready = ready.exists();
+        let observed = if worker_ready {
+            let detection_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if temp_directory_in_use(&temp) {
+                    break true;
+                }
+                if std::time::Instant::now() >= detection_deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        } else {
+            false
+        };
+        if !worker_ready || !observed {
+            if worker.try_wait().unwrap().is_none() {
+                worker.kill().unwrap();
+            }
+            worker.wait().unwrap();
+        }
+        assert!(worker_ready, "detached worker did not open temporary data");
+        assert!(
+            observed,
+            "detached worker was not visible to temporary process detection"
+        );
 
         lease.mark_started();
         assert!(lease.release_clean().is_err());
@@ -3882,7 +5052,13 @@ mod tests {
         worker.wait().unwrap();
         lease.release_clean().unwrap();
         drop(lease);
-        retry_cleanup(&fixture.cache);
+        for _ in 0..100 {
+            retry_cleanup(&fixture.cache);
+            if !directory.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(!directory.exists());
     }
 
@@ -4008,7 +5184,7 @@ mod tests {
             fs::remove_dir_all(&temp).unwrap();
             fixture.remove(&fixture.first);
             fs::rename(&directory, &quarantine).unwrap();
-            remove_quarantine(&quarantine, &key);
+            assert!(remove_quarantine(&quarantine, &key).is_err());
             fs::write(&trigger, "go").unwrap();
         }
         let artifact = quarantine.join(TEMP_ROOT).join("late/artifact");
@@ -4149,6 +5325,520 @@ mod tests {
         assert!(!pending
             .iter()
             .any(|item| item.cache_key == directory.file_name().unwrap().to_string_lossy()));
+    }
+
+    #[test]
+    fn stale_active_marker_refuses_cleanup_before_git_removal() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        drop(lease);
+        let marker = directory.join(".active-stale.v1");
+        fs::write(&marker, "previous process").unwrap();
+
+        let error =
+            ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&directory))
+                .unwrap_err();
+
+        assert!(error.contains("not cleanly closed"), "{error}");
+        assert!(fixture.first.is_dir());
+        assert!(directory.is_dir());
+        fs::remove_file(marker).unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&directory))
+            .unwrap();
+    }
+
+    #[test]
+    fn selected_storage_retry_requires_the_removed_owner_generation() {
+        let fixture = GitFixture::new();
+        let generation = generation(&fixture.first).unwrap();
+        let (selected, selected_lease) = register(&fixture.cache, &fixture.first).unwrap();
+        selected_lease.release_clean().unwrap();
+        let (sibling, sibling_lease) = register(&fixture.cache, &fixture.second).unwrap();
+        sibling_lease.release_clean().unwrap();
+        let selected_key = selected.file_name().unwrap().to_string_lossy().into_owned();
+        let sibling_key = sibling.file_name().unwrap().to_string_lossy().into_owned();
+
+        let retry = |worktree: &Path, expected: &str, key: &str| {
+            retry_selected_removed_worktree_storage(
+                &fixture.cache,
+                &fixture.repository,
+                worktree,
+                expected,
+                key,
+            )
+        };
+        assert!(retry(&fixture.first, &generation, &selected_key).is_err());
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&selected))
+            .unwrap();
+        fixture.remove(&fixture.first);
+        assert!(retry(&fixture.second, &generation, &selected_key).is_err());
+        assert!(retry(&fixture.first, "wrong-generation", &selected_key).is_err());
+        assert!(retry(&fixture.first, &generation, &sibling_key).is_err());
+        assert!(selected.exists());
+        assert!(sibling.exists());
+
+        retry(&fixture.first, &generation, &selected_key).unwrap();
+        assert!(!selected.exists());
+        assert!(sibling.exists());
+    }
+
+    #[test]
+    fn selected_storage_scan_distinguishes_an_empty_cache_from_unmarked_storage() {
+        let fixture = GitFixture::new();
+        let generation = generation(&fixture.first).unwrap();
+        fixture.remove(&fixture.first);
+
+        assert!(selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &generation,
+        )
+        .unwrap()
+        .is_empty());
+
+        let retained = fixture.cache.join("terminal-worktrees").join("unmarked");
+        fs::create_dir_all(&retained).unwrap();
+        fs::write(retained.join("user-data"), "keep").unwrap();
+        assert!(selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &generation,
+        )
+        .is_err());
+        assert!(retained.join("user-data").exists());
+    }
+
+    #[test]
+    fn selected_storage_scan_ignores_only_proven_unrelated_malformed_markers() {
+        let fixture = GitFixture::new();
+        let generation = generation(&fixture.first).unwrap();
+        let (selected, selected_lease) = register(&fixture.cache, &fixture.first).unwrap();
+        selected_lease.release_clean().unwrap();
+        let (sibling, sibling_lease) = register(&fixture.cache, &fixture.second).unwrap();
+        sibling_lease.release_clean().unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&selected))
+            .unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&sibling))
+            .unwrap();
+        fixture.remove(&fixture.first);
+
+        let sibling_key = sibling.file_name().unwrap().to_str().unwrap();
+        fs::write(
+            durable_cleanup_marker_path(&fixture.cache, sibling_key),
+            "malformed marker",
+        )
+        .unwrap();
+        let found = selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &generation,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, selected);
+        let selected_key = selected.file_name().unwrap().to_str().unwrap();
+        fs::write(
+            durable_cleanup_marker_path(&fixture.cache, selected_key),
+            "malformed marker",
+        )
+        .unwrap();
+        assert!(selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &generation,
+        )
+        .is_err());
+        assert!(selected.exists());
+        assert!(sibling.exists());
+    }
+
+    #[test]
+    fn selected_storage_retry_preserves_a_replacement_checkout() {
+        let fixture = GitFixture::new();
+        let old_generation = generation(&fixture.first).unwrap();
+        let (storage, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+            .unwrap();
+        fixture.remove(&fixture.first);
+        GitFixture::git(
+            &fixture.repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                fixture.first.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let replacement_generation = generation(&fixture.first).unwrap();
+        assert_ne!(old_generation, replacement_generation);
+        let discovered = selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &old_generation,
+        )
+        .unwrap();
+        assert_eq!(discovered.len(), 1);
+        retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &old_generation,
+            storage.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(!storage.exists());
+        assert_eq!(generation(&fixture.first).unwrap(), replacement_generation);
+    }
+
+    #[test]
+    fn selected_storage_retry_accepts_only_removed_nested_storage() {
+        let fixture = GitFixture::new();
+        let outer_generation = generation(&fixture.first).unwrap();
+        let nested = fixture.first.join("nested-worktree");
+        GitFixture::git(
+            &fixture.repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                nested.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let (storage, lease) = register(&fixture.cache, &nested).unwrap();
+        lease.release_clean().unwrap();
+        let key = storage.file_name().unwrap().to_string_lossy().into_owned();
+
+        assert!(retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &outer_generation,
+            &key,
+        )
+        .is_err());
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+            .unwrap();
+        fixture.remove(&nested);
+        fixture.remove(&fixture.first);
+        retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &outer_generation,
+            &key,
+        )
+        .unwrap();
+        assert!(!storage.exists());
+    }
+
+    #[test]
+    fn selected_storage_remains_pending_across_startup_reconciliation() {
+        let fixture = GitFixture::new();
+        let outer_generation = generation(&fixture.first).unwrap();
+        let (storage, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+            .unwrap();
+        fixture.remove(&fixture.first);
+
+        reconcile(&fixture.cache);
+
+        assert!(storage.exists());
+        let discovered = selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &outer_generation,
+        )
+        .unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].path, storage);
+        assert!(cleanup_status(&fixture.cache).iter().any(|item| {
+            item.cache_key == storage.file_name().unwrap().to_string_lossy()
+                && item.reason == "explicit-cleanup-required"
+        }));
+        retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &outer_generation,
+            &storage.file_name().unwrap().to_string_lossy(),
+        )
+        .unwrap();
+        assert!(!storage.exists());
+    }
+
+    #[test]
+    fn exposed_temp_refuses_selected_checkout_removal_before_git() {
+        let fixture = GitFixture::new();
+        let (storage, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let artifact = lease.temp_directory().join("selected-artifact");
+        fs::write(&artifact, "selected").unwrap();
+        lease.prepare_process_start().unwrap();
+        lease.mark_started();
+        lease.release_clean().unwrap();
+
+        let error =
+            ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+                .unwrap_err();
+
+        assert!(error.contains("temporary data"), "{error}");
+        assert!(fixture.first.is_dir());
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "selected");
+        assert!(!has_explicit_cleanup_marker(&storage).unwrap());
+    }
+
+    #[test]
+    fn selected_storage_retry_keeps_exposed_temp_pending() {
+        let fixture = GitFixture::new();
+        let expected_generation = generation(&fixture.first).unwrap();
+        let (storage, initial_lease) = register(&fixture.cache, &fixture.first).unwrap();
+        initial_lease.release_clean().unwrap();
+
+        let (_, sibling_lease) = register(&fixture.cache, &fixture.second).unwrap();
+        let sibling_artifact = sibling_lease.temp_directory().join("sibling-artifact");
+        fs::write(&sibling_artifact, "keep").unwrap();
+        sibling_lease.prepare_process_start().unwrap();
+        sibling_lease.mark_started();
+        sibling_lease.release_clean().unwrap();
+
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+            .unwrap();
+        let (same_storage, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        assert_eq!(same_storage, storage);
+        let selected_artifact = lease.temp_directory().join("selected-artifact");
+        fs::write(&selected_artifact, "selected").unwrap();
+        lease.prepare_process_start().unwrap();
+        lease.mark_started();
+        lease.release_clean().unwrap();
+        fixture.remove(&fixture.first);
+        assert!(
+            remove_after_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+                .unwrap_err()
+                .contains("temporary data")
+        );
+        assert_eq!(fs::read_to_string(&selected_artifact).unwrap(), "selected");
+
+        let error = retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &expected_generation,
+            storage.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("temporary data"), "{error}");
+        assert!(storage.exists());
+        assert_eq!(fs::read_to_string(&selected_artifact).unwrap(), "selected");
+        let pending = cleanup_status(&fixture.cache);
+        let expected_owner = stable_worktree_identity(&fixture.first);
+        assert!(
+            pending.iter().any(|item| {
+                item.path.as_deref().is_some_and(|path| {
+                    fs::read_to_string(Path::new(path).join("selected-artifact"))
+                        .ok()
+                        .as_deref()
+                        == Some("selected")
+                }) && item.owner_path.as_deref() == expected_owner.to_str()
+            }),
+            "{pending:?}"
+        );
+        assert_eq!(fs::read_to_string(sibling_artifact).unwrap(), "keep");
+    }
+
+    #[test]
+    fn selected_quarantine_remains_visible_and_retryable_after_interruption() {
+        let fixture = GitFixture::new();
+        let outer_generation = generation(&fixture.first).unwrap();
+        let (storage, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+            .unwrap();
+        fixture.remove(&fixture.first);
+        let quarantine_key = cache_key(&storage).unwrap();
+        let recovery = quarantine_path(storage.parent().unwrap(), &quarantine_key).unwrap();
+        fs::rename(&storage, &recovery).unwrap();
+        fs::remove_file(recovery.join(EXPLICIT_CLEANUP_MARKER)).unwrap();
+
+        reconcile(&fixture.cache);
+
+        assert!(recovery.exists());
+        assert!(cleanup_status(&fixture.cache).iter().any(|item| {
+            item.cache_key == recovery.file_name().unwrap().to_string_lossy()
+                && item.reason == "explicit-cleanup-required"
+        }));
+        let retained =
+            retained_selected_storage_locations(&fixture.cache, std::slice::from_ref(&storage))
+                .unwrap();
+        assert_eq!(
+            retained,
+            vec![(
+                storage.file_name().unwrap().to_string_lossy().into_owned(),
+                recovery.clone()
+            )]
+        );
+        retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &outer_generation,
+            &storage.file_name().unwrap().to_string_lossy(),
+        )
+        .unwrap();
+        assert!(!recovery.exists());
+    }
+
+    #[test]
+    fn selected_quarantine_retry_retains_late_temporary_data() {
+        let fixture = GitFixture::new();
+        let expected_generation = generation(&fixture.first).unwrap();
+        let (storage, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+            .unwrap();
+        fixture.remove(&fixture.first);
+        let key = cache_key(&storage).unwrap();
+        let selected_key = storage.file_name().unwrap().to_str().unwrap().to_owned();
+        let recovery = quarantine_path(storage.parent().unwrap(), &key).unwrap();
+        fs::rename(&storage, &recovery).unwrap();
+        let late_temp = recovery
+            .join(TEMP_ROOT)
+            .join(format!("run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&late_temp).unwrap();
+        fs::write(late_temp.join("artifact"), "keep").unwrap();
+        let retained =
+            retained_selected_storage_locations(&fixture.cache, std::slice::from_ref(&storage))
+                .unwrap();
+        assert_eq!(retained, vec![(selected_key.clone(), recovery.clone())]);
+
+        let result = retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &expected_generation,
+            &selected_key,
+        );
+
+        let error = result.expect_err("late temporary data was deleted");
+        assert!(error.contains("temporary data"), "{error}");
+        assert_eq!(
+            fs::read_to_string(late_temp.join("artifact")).unwrap(),
+            "keep"
+        );
+        let pending = cleanup_status(&fixture.cache);
+        let temp_root = recovery.join(TEMP_ROOT);
+        let item = pending
+            .iter()
+            .find(|item| item.path.as_deref() == temp_root.to_str())
+            .expect("quarantined temporary data must be visible in Settings");
+        assert_eq!(item.reason, "turn-temp-owner-unverifiable");
+        assert_eq!(
+            item.owner_path.as_deref(),
+            stable_worktree_identity(&fixture.first).to_str()
+        );
+        assert!(item.size_bytes.is_some_and(|size| size > 0));
+        assert!(item.cleanup_token.is_none());
+    }
+
+    #[test]
+    fn selected_quarantine_with_partially_deleted_owner_is_retryable() {
+        let fixture = GitFixture::new();
+        let expected_generation = generation(&fixture.first).unwrap();
+        let (storage, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+            .unwrap();
+        fixture.remove(&fixture.first);
+        let key = cache_key(&storage).unwrap();
+        let recovery = quarantine_path(storage.parent().unwrap(), &key).unwrap();
+        fs::rename(&storage, &recovery).unwrap();
+        fs::remove_file(recovery.join(OWNER_FILE)).unwrap();
+        fs::write(
+            recovery.join("retained-artifact"),
+            "kept until explicit retry",
+        )
+        .unwrap();
+
+        reconcile(&fixture.cache);
+        let discovered = selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &expected_generation,
+        )
+        .unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(
+            discovered[0].cache_key,
+            storage.file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(discovered[0].path, recovery);
+        assert!(discovered[0].size_bytes.is_some_and(|size| size > 0));
+        assert_eq!(
+            fs::read_to_string(recovery.join("retained-artifact")).unwrap(),
+            "kept until explicit retry"
+        );
+        retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &expected_generation,
+            storage.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(!recovery.exists());
+    }
+
+    #[test]
+    fn selected_retry_keeps_a_replaced_quarantine_directory() {
+        let fixture = GitFixture::new();
+        let expected_generation = generation(&fixture.first).unwrap();
+        let (storage, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+            .unwrap();
+        fixture.remove(&fixture.first);
+        let key = cache_key(&storage).unwrap();
+        let recovery = quarantine_path(storage.parent().unwrap(), &key).unwrap();
+        let unrelated = fixture.root.join("unrelated-recovery");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("unrelated"), "keep").unwrap();
+        fs::rename(&storage, &recovery).unwrap();
+        fs::remove_dir_all(&recovery).unwrap();
+        fs::rename(&unrelated, &recovery).unwrap();
+
+        assert!(selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &expected_generation,
+        )
+        .unwrap()
+        .is_empty());
+        let error = retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &expected_generation,
+            storage.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("directory changed"), "{error}");
+        assert_eq!(
+            fs::read_to_string(recovery.join("unrelated")).unwrap(),
+            "keep"
+        );
     }
 
     #[test]
