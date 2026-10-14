@@ -9259,7 +9259,7 @@ mod native_subagent_fence_tests {
         );
         let mut promoted = false;
         let error = fence
-            .promote(&agents, &directory, || {
+            .promote(&AgentManager::default(), &directory, || {
                 promoted = true;
                 Ok(())
             })
