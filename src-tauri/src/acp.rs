@@ -782,6 +782,14 @@ fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]
     params
 }
 
+fn session_list_params(directory: &Path, cursor: Option<&str>) -> Value {
+    let mut params = json!({"cwd": directory.to_string_lossy()});
+    if let Some(cursor) = cursor {
+        params["cursor"] = json!(cursor);
+    }
+    params
+}
+
 #[cfg(windows)]
 fn windows_directory_owned_by_current_user(path: &Path) -> Result<bool, String> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -6453,21 +6461,19 @@ pub async fn acp_list_sessions(
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let directory = canonical_directory(&cwd);
         let mut attempts = 0;
         loop {
             attempts += 1;
             let (runtime, capabilities) =
-                listing_connection(&app, &manager, &agent, profile, Path::new(&cwd))?;
+                listing_connection(&app, &manager, &agent, profile, &directory)?;
             if capabilities
                 .pointer("/agentCapabilities/sessionCapabilities/list")
                 .is_none()
             {
                 return Ok(json!({"sessions": []}));
             }
-            let mut params = json!({"cwd": cwd});
-            if let Some(cursor) = &cursor {
-                params["cursor"] = json!(cursor);
-            }
+            let params = session_list_params(&directory, cursor.as_deref());
             let result = runtime.request("session/list", params, Duration::from_secs(30));
             // The shared agent may exit (idle, worktree removal) between lookup and request;
             // the next lookup respawns it.
@@ -9566,6 +9572,10 @@ time.sleep(10)
             assert_eq!(
                 session_request_params(alias.to_str().unwrap(), None, &[])["cwd"],
                 json!(assigned.canonicalize().unwrap())
+            );
+            assert_eq!(
+                session_list_params(&canonical_directory(alias.to_str().unwrap()), Some("next")),
+                json!({"cwd": assigned.canonicalize().unwrap(), "cursor": "next"})
             );
             access.validate(Some(alias.to_str().unwrap())).unwrap();
             assert!(CodexWorkspaceAccess::capture(&assigned, &[alias])
