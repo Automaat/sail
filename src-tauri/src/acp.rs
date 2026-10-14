@@ -4639,11 +4639,16 @@ fn claude_native_activity_update(
 }
 
 fn claude_adapter_subagent_signature(update: &Value) -> bool {
-    let name = update.get("name").and_then(Value::as_str);
     let adapter_name = update
         .pointer("/_meta/claudeCode/toolName")
         .and_then(Value::as_str);
-    if name != adapter_name || !matches!(name, Some("Agent" | "Task")) {
+    if !matches!(adapter_name, Some("Agent" | "Task")) {
+        return false;
+    }
+    if update
+        .get("name")
+        .is_some_and(|name| name.as_str() != adapter_name)
+    {
         return false;
     }
     let Some(input) = update.get("rawInput").and_then(Value::as_object) else {
@@ -11235,7 +11240,7 @@ mod capability_profile_tests {
 
     #[test]
     fn claude_adapter_agent_signature_becomes_observed_native_child_updates() {
-        let started = json!({
+        let partial = json!({
             "method":"session/update",
             "params":{"sessionId":"parent","update":{
                 "sessionUpdate":"tool_call",
@@ -11243,6 +11248,18 @@ mod capability_profile_tests {
                 "name":"Agent",
                 "title":"Native child task identity",
                 "status":"pending",
+                "rawInput":{},
+                "_meta":{"claudeCode":{"toolName":"Agent"}}
+            }}
+        });
+        assert!(claude_native_activity_update(&partial, |_, _| false).is_none());
+
+        let started = json!({
+            "method":"session/update",
+            "params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call_update",
+                "toolCallId":"toolu_01SP5UF44Tk2e4NNKGFz9Xua",
+                "title":"Native child task identity",
                 "rawInput":{
                     "description":"Native child task identity",
                     "subagent_type":"general-purpose",
