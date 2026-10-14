@@ -40,6 +40,196 @@ pub(crate) fn sweep_on_startup(cache_directory: Option<&Path>) {
     }
 }
 
+const RUNTIME_PREFIX: &str = "sail-runtime-";
+const UNMARKED_GRACE: Duration = Duration::from_secs(10 * 60);
+
+pub(crate) enum RuntimeRootEvent {
+    Removed { bytes: u64 },
+    Kept { reason: &'static str },
+}
+
+/// Removes `sail-runtime-<uuid>` roots whose agent has exited. Unlike the
+/// startup sweep it skips the idle-age check: a root with a dead owner and no
+/// open files has no user, and waiting two hours left multi-GB build output
+/// for a whole session.
+pub(crate) fn sweep_runtime_roots(
+    in_use: &dyn Fn(&Path) -> bool,
+    report: &mut dyn FnMut(&str, RuntimeRootEvent),
+) {
+    if let Err(error) = sweep_runtime_roots_in(
+        &std::env::temp_dir(),
+        SystemTime::now(),
+        has_open_files,
+        in_use,
+        report,
+    ) {
+        eprintln!("Sail runtime scratch cleanup unavailable: {error}");
+    }
+}
+
+const RUNTIME_SWEEP_DELAY: Duration = Duration::from_secs(15);
+const RUNTIME_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Reclaims runtime roots every five minutes, so one whose agent exited is gone
+/// within ten, whether it died in this session or an earlier one.
+pub(crate) fn spawn_runtime_sweeper(
+    in_use: impl Fn(&Path) -> bool + Send + 'static,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("sail-runtime-scratch-sweep".into())
+        .spawn(move || {
+            std::thread::sleep(RUNTIME_SWEEP_DELAY);
+            let mut log = RuntimeSweepLog::default();
+            loop {
+                log.sweep(&in_use, crate::diagnostics::record);
+                std::thread::sleep(RUNTIME_SWEEP_INTERVAL);
+            }
+        })
+        .map(|_| ())
+}
+
+// A kept root is logged once per reason, not on every pass.
+#[derive(Default)]
+struct RuntimeSweepLog {
+    kept: std::collections::HashMap<String, &'static str>,
+}
+
+impl RuntimeSweepLog {
+    fn sweep(
+        &mut self,
+        in_use: &dyn Fn(&Path) -> bool,
+        mut record: impl FnMut(&str, serde_json::Value),
+    ) {
+        let mut seen = std::collections::HashMap::new();
+        sweep_runtime_roots(in_use, &mut |name, event| {
+            self.observe(name, event, &mut seen, &mut record)
+        });
+        self.kept = seen;
+    }
+
+    fn observe(
+        &self,
+        name: &str,
+        event: RuntimeRootEvent,
+        seen: &mut std::collections::HashMap<String, &'static str>,
+        record: &mut impl FnMut(&str, serde_json::Value),
+    ) {
+        match event {
+            RuntimeRootEvent::Removed { bytes } => record(
+                "scratch_runtime_removed",
+                serde_json::json!({"root": name, "bytes": bytes}),
+            ),
+            RuntimeRootEvent::Kept { reason } => {
+                seen.insert(name.to_string(), reason);
+                if self.kept.get(name) != Some(&reason) {
+                    record(
+                        "scratch_runtime_kept",
+                        serde_json::json!({"root": name, "reason": reason}),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn sweep_runtime_roots_in(
+    temp: &Path,
+    now: SystemTime,
+    open_files: impl Fn(&Path) -> Option<bool>,
+    in_use: &dyn Fn(&Path) -> bool,
+    report: &mut dyn FnMut(&str, RuntimeRootEvent),
+) -> std::io::Result<()> {
+    let euid = unsafe { nix::libc::geteuid() };
+    let ignore_idle_age = now + IDLE_AGE + Duration::from_secs(1);
+    for entry in fs::read_dir(temp)? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name.strip_prefix(RUNTIME_PREFIX) else {
+            continue;
+        };
+        if !uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.uid() != euid {
+            continue;
+        }
+        let marker = path.join(MARKER);
+        match owner_status(&marker) {
+            Some(true) => {}
+            Some(false) => {
+                report(
+                    name,
+                    RuntimeRootEvent::Kept {
+                        reason: "owner running",
+                    },
+                );
+                continue;
+            }
+            None if marker.exists() => {
+                report(
+                    name,
+                    RuntimeRootEvent::Kept {
+                        reason: "unreadable owner marker",
+                    },
+                );
+                continue;
+            }
+            None => {
+                // A root is unmarked between its creation and the agent spawn.
+                let young = now
+                    .duration_since(metadata.modified()?)
+                    .is_ok_and(|age| age < UNMARKED_GRACE);
+                if !young {
+                    report(
+                        name,
+                        RuntimeRootEvent::Kept {
+                            reason: "no owner marker",
+                        },
+                    );
+                }
+                continue;
+            }
+        }
+        // A gate of another agent can build inside this root after its agent died.
+        if in_use(&path) {
+            report(
+                name,
+                RuntimeRootEvent::Kept {
+                    reason: "build in use",
+                },
+            );
+            continue;
+        }
+        let Ok(Some(bytes)) = inspect(&path, metadata.dev(), ignore_idle_age) else {
+            report(
+                name,
+                RuntimeRootEvent::Kept {
+                    reason: "not removable",
+                },
+            );
+            continue;
+        };
+        match reclaim_root(
+            temp,
+            &path,
+            name,
+            metadata.dev(),
+            ignore_idle_age,
+            &open_files,
+        ) {
+            Ok(()) => report(name, RuntimeRootEvent::Removed { bytes }),
+            Err(_) if !path.exists() => {}
+            Err(reason) => report(name, RuntimeRootEvent::Kept { reason }),
+        }
+    }
+    Ok(())
+}
+
 /// Native acceptance runs install a signed app under `~/Applications`, outside
 /// the system temporary directory, so the `$TMPDIR` sweep never sees them.
 fn sweep_native_roots(
@@ -100,14 +290,44 @@ pub(crate) fn owner_identity() -> Option<String> {
 }
 
 pub(crate) fn owner_identity_for_pid(pid: u32) -> Option<String> {
+    let started = process_start_time(pid)?;
+    Some(format!("{pid} {started}"))
+}
+
+// An agent that died but was not reaped still answers `kill(pid, 0)`. It has
+// exited and holds nothing, so its root is reclaimable.
+#[cfg(target_os = "macos")]
+fn unreaped_zombie(pid: u32) -> bool {
+    // sysinfo drops a macOS zombie and proc_pidinfo reports it as running, so
+    // read the kernel's process table entry through `ps`.
+    Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p"])
+        .arg(pid.to_string())
+        .output()
+        .is_ok_and(|output| output.stdout.trim_ascii().starts_with(b"Z"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unreaped_zombie(pid: u32) -> bool {
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
         ProcessRefreshKind::nothing(),
     );
-    let started = system.process(Pid::from_u32(pid))?.start_time();
-    Some(format!("{pid} {started}"))
+    system
+        .process(Pid::from_u32(pid))
+        .is_some_and(|process| process.status() == ProcessStatus::Zombie)
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    Some(system.process(Pid::from_u32(pid))?.start_time())
 }
 
 pub(crate) struct OwnedRuntimeScratch {
@@ -152,13 +372,29 @@ impl OwnedRuntimeScratch {
         if self.cleaned {
             return Ok(());
         }
-        if crate::worktree_directory_identity(&self.path)? != self.identity {
+        // The periodic sweep may have removed the root of an exited agent.
+        let removed = |error: &std::io::Error, path: &Path| {
+            error.kind() == std::io::ErrorKind::NotFound && !path.exists()
+        };
+        let identity = match crate::worktree_directory_identity(&self.path) {
+            Ok(identity) => identity,
+            Err(error) if removed(&error, &self.path) => {
+                self.cleaned = true;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if identity != self.identity {
             return Err(std::io::ErrorKind::InvalidData.into());
         }
-        if let Some(owner) = self.owner.as_deref() {
-            remove_owned_runtime_root(&self.path, owner)?;
+        let result = if let Some(owner) = self.owner.as_deref() {
+            remove_owned_runtime_root(&self.path, owner)
         } else {
-            fs::remove_dir_all(&self.path)?;
+            fs::remove_dir_all(&self.path)
+        };
+        match result {
+            Err(error) if !removed(&error, &self.path) => return Err(error),
+            _ => {}
         }
         self.cleaned = true;
         Ok(())
@@ -290,12 +526,6 @@ fn sweep_with(
 ) -> std::io::Result<u64> {
     let mut freed = 0;
     let owner = unsafe { nix::libc::geteuid() };
-    let mut processes = System::new();
-    processes.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing(),
-    );
     for entry in fs::read_dir(temp)? {
         let Ok(entry) = entry else {
             continue;
@@ -336,9 +566,8 @@ fn sweep_with(
             }
             let original = temp.join(original_name);
             let safe = inspect(&root, metadata.dev(), now).is_ok_and(|result| result.is_some())
-                && (marker_owner_dead(&root, &processes)
-                    || (!root.join(MARKER).exists()
-                        && owner_dead(&path.join(PRIVATE_OWNER), &processes)))
+                && (marker_owner_dead(&root)
+                    || (!root.join(MARKER).exists() && owner_dead(&path.join(PRIVATE_OWNER))))
                 && open_files(&root) == Some(false);
             if safe {
                 let bytes = inspect(&root, metadata.dev(), now)
@@ -362,70 +591,118 @@ fn sweep_with(
         let Ok(Some(bytes)) = inspect(&path, metadata.dev(), now) else {
             continue;
         };
-        if !marker_owner_dead(&path, &processes) {
+        if !marker_owner_dead(&path) {
             continue;
         }
         if stop_leftovers {
             stop_root_processes(&path);
         }
-        // An unknown lsof result is unsafe: lack of permission is not proof of idleness.
-        if open_files(&path) != Some(false) {
-            continue;
+        if reclaim_root(temp, &path, &name, metadata.dev(), now, &open_files).is_ok() {
+            freed += bytes;
         }
-        let private = temp.join(format!(
-            "sail-cleanup-private-{}-{name}",
-            uuid::Uuid::new_v4()
-        ));
-        if fs::create_dir(&private).is_err() {
-            continue;
-        }
-        if fs::write(private.join(PRIVATE_MARKER), PRIVATE_MARKER_VALUE).is_err() {
-            let _ = fs::remove_file(private.join(PRIVATE_MARKER));
-            let _ = fs::remove_dir(&private);
-            continue;
-        }
-        if fs::set_permissions(&private, fs::Permissions::from_mode(0o300)).is_err() {
-            remove_private_parent(&private);
-            continue;
-        }
-        // The child name is independent of the visible parent name. A process
-        // can list the temp directory, but cannot list this 0300 directory or
-        // derive the child path during the final open-file check and deletion.
-        let quarantine = private.join(uuid::Uuid::new_v4().to_string());
-        if fs::rename(&path, &quarantine).is_err() {
-            remove_private_parent(&private);
-            continue;
-        }
-        let safe = inspect(&quarantine, metadata.dev(), now).is_ok_and(|result| result.is_some())
-            && marker_owner_dead(&quarantine, &processes)
-            && open_files(&quarantine) == Some(false);
-        if !safe {
-            restore(&quarantine, &path);
-            if !quarantine.exists() {
-                remove_private_parent(&private);
-            }
-            continue;
-        }
-        // Keep the verified owner outside the tree being removed. A crash can
-        // otherwise delete the root marker first and strand a partial build.
-        if save_private_owner(&quarantine, &private).is_err() {
-            restore(&quarantine, &path);
-            if !quarantine.exists() {
-                remove_private_parent(&private);
-            }
-            continue;
-        }
-        if let Err(error) = fs::remove_dir_all(&quarantine) {
-            eprintln!(
-                "Sail scratch cleanup kept {}: {error}",
-                quarantine.display()
-            );
-            continue;
-        }
-        remove_private_parent(&private);
-        freed += bytes;
     }
     Ok(freed)
+}
+
+// Quarantines a verified dead-owner root and deletes it. The caller has
+// already checked the owner and idle age; this rechecks open files around the
+// rename so a process that opens the root meanwhile keeps it.
+fn reclaim_root(
+    temp: &Path,
+    path: &Path,
+    name: &str,
+    device: u64,
+    now: SystemTime,
+    open_files: &impl Fn(&Path) -> Option<bool>,
+) -> Result<(), &'static str> {
+    // An unknown lsof result is unsafe: lack of permission is not proof of idleness.
+    match open_files(path) {
+        Some(false) => {}
+        Some(true) => return Err("open files"),
+        None => return Err("open files unknown"),
+    }
+    let private = temp.join(format!(
+        "sail-cleanup-private-{}-{name}",
+        uuid::Uuid::new_v4()
+    ));
+    if fs::create_dir(&private).is_err() {
+        return Err("changed while removing");
+    }
+    if fs::write(private.join(PRIVATE_MARKER), PRIVATE_MARKER_VALUE).is_err() {
+        let _ = fs::remove_file(private.join(PRIVATE_MARKER));
+        let _ = fs::remove_dir(&private);
+        return Err("changed while removing");
+    }
+    if fs::set_permissions(&private, fs::Permissions::from_mode(0o300)).is_err() {
+        remove_private_parent(&private);
+        return Err("changed while removing");
+    }
+    // The child name is independent of the visible parent name. A process
+    // can list the temp directory, but cannot list this 0300 directory or
+    // derive the child path during the final open-file check and deletion.
+    let quarantine = private.join(uuid::Uuid::new_v4().to_string());
+    if fs::rename(path, &quarantine).is_err() {
+        remove_private_parent(&private);
+        return Err(if path.exists() {
+            "changed while removing"
+        } else {
+            "gone"
+        });
+    }
+    let safe = inspect(&quarantine, device, now).is_ok_and(|result| result.is_some())
+        && marker_owner_dead(&quarantine)
+        && open_files(&quarantine) == Some(false);
+    if !safe {
+        restore(&quarantine, path);
+        if !quarantine.exists() {
+            remove_private_parent(&private);
+        }
+        return Err("changed while removing");
+    }
+    // Keep the verified owner outside the tree being removed. A crash can
+    // otherwise delete the root marker first and strand a partial build.
+    if save_private_owner(&quarantine, &private).is_err() {
+        restore(&quarantine, path);
+        if !quarantine.exists() {
+            remove_private_parent(&private);
+        }
+        return Err("changed while removing");
+    }
+    // A read-only directory in the tree blocks deletion; a retry never gets
+    // another chance because the root has left its original name.
+    let mut removed = fs::remove_dir_all(&quarantine);
+    if removed.is_err() {
+        make_directories_writable(&quarantine);
+        removed = fs::remove_dir_all(&quarantine);
+    }
+    if let Err(error) = removed {
+        eprintln!(
+            "Sail scratch cleanup kept {}: {error}",
+            quarantine.display()
+        );
+        return Err("removal failed");
+    }
+    remove_private_parent(&private);
+    Ok(())
+}
+
+fn make_directories_writable(root: &Path) {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(metadata) = fs::symlink_metadata(&directory) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(mode | 0o700));
+        }
+        if let Ok(entries) = fs::read_dir(&directory) {
+            pending.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+        }
+    }
 }
 
 fn stop_root_processes(root: &Path) {
@@ -589,8 +866,8 @@ fn private_quarantine_name(name: &str) -> Option<&str> {
     Some(original)
 }
 
-fn marker_owner_dead(path: &Path, processes: &System) -> bool {
-    owner_dead(&path.join(MARKER), processes)
+fn marker_owner_dead(path: &Path) -> bool {
+    owner_dead(&path.join(MARKER))
 }
 
 fn save_private_owner(root: &Path, private: &Path) -> std::io::Result<()> {
@@ -608,33 +885,35 @@ fn restore_owner_marker(root: &Path, private: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn owner_dead(marker: &Path, processes: &System) -> bool {
-    if !marker.exists() {
-        return false;
-    }
-    let Ok(owner) = fs::read_to_string(marker) else {
-        return false;
-    };
+fn owner_dead(marker: &Path) -> bool {
+    owner_status(marker) == Some(true)
+}
+
+// Some(true) when the recorded owner has exited, Some(false) while it runs,
+// None when the marker is missing or malformed.
+fn owner_status(marker: &Path) -> Option<bool> {
+    let owner = fs::read_to_string(marker).ok()?;
     let mut parts = owner.split_whitespace();
     let (Some(pid), Some(started), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
+        return None;
     };
-    let Ok(pid) = pid.parse::<i32>() else {
-        return false;
-    };
-    let Ok(started) = started.parse::<u64>() else {
-        return false;
-    };
+    let pid = pid.parse::<i32>().ok()?;
+    let started = started.parse::<u64>().ok()?;
     if pid <= 0 || started == 0 {
-        return false;
+        return None;
     }
     let result = unsafe { nix::libc::kill(pid, 0) };
-    if result == -1 {
-        return std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ESRCH);
+    if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ESRCH) {
+        return Some(true);
     }
-    processes
-        .process(Pid::from_u32(pid as u32))
-        .is_some_and(|process| process.start_time() != started)
+    // A pid that answers but belongs to another user (EPERM) still has to
+    // match the recorded start time. Read it now: a snapshot taken before a
+    // long pass can predate a pid that was reused meanwhile. An unreaped
+    // child answers `kill` too, but it has exited and holds nothing.
+    Some(
+        unreaped_zombie(pid as u32)
+            || process_start_time(pid as u32).is_some_and(|current| current != started),
+    )
 }
 
 fn inspect(path: &Path, device: u64, now: SystemTime) -> std::io::Result<Option<u64>> {
@@ -1040,6 +1319,323 @@ mod tests {
         assert!(root.exists());
         assert!(alive(pid));
         unsafe { nix::libc::kill(pid, nix::libc::SIGKILL) };
+    }
+
+    fn runtime_root(temp: &Path, owner: Option<&str>) -> PathBuf {
+        let root = temp.join(format!("sail-runtime-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("build/go-tmp")).unwrap();
+        fs::write(root.join("build/artifact"), "build output").unwrap();
+        if let Some(owner) = owner {
+            fs::write(root.join(MARKER), owner).unwrap();
+        }
+        root
+    }
+
+    fn runtime_sweep(
+        temp: &Path,
+        open_files: impl Fn(&Path) -> Option<bool>,
+    ) -> Vec<(String, String)> {
+        let mut events = Vec::new();
+        sweep_runtime_roots_in(
+            temp,
+            SystemTime::now(),
+            open_files,
+            &|_| false,
+            &mut |name, event| {
+                let outcome = match event {
+                    RuntimeRootEvent::Removed { bytes } => {
+                        assert!(bytes > 0);
+                        "removed".to_string()
+                    }
+                    RuntimeRootEvent::Kept { reason } => format!("kept: {reason}"),
+                };
+                events.push((name.to_string(), outcome));
+            },
+        )
+        .unwrap();
+        events
+    }
+
+    #[test]
+    fn runtime_sweep_removes_a_fresh_dead_owner_root_while_sail_runs() {
+        let temp = fixture();
+        let dead = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let name = dead.file_name().unwrap().to_str().unwrap().to_string();
+        let events = runtime_sweep(&temp, |_| Some(false));
+        assert!(!dead.exists());
+        assert_eq!(events, vec![(name, "removed".to_string())]);
+    }
+
+    #[test]
+    fn runtime_sweep_removes_a_root_whose_pid_was_reused() {
+        let temp = fixture();
+        let identity = owner_identity().unwrap();
+        let (pid, started) = identity.split_once(' ').unwrap();
+        let old_start = started.parse::<u64>().unwrap() - 1;
+        let stale = runtime_root(&temp, Some(&format!("{pid} {old_start}")));
+        runtime_sweep(&temp, |_| Some(false));
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_keeps_live_open_and_unknown_roots_with_a_reason() {
+        let temp = fixture();
+        let live = runtime_root(&temp, Some(&owner_identity().unwrap()));
+        let open = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let unknown = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let garbage = runtime_root(&temp, Some("not a marker"));
+        let events = runtime_sweep(&temp, |path| {
+            if path == open {
+                Some(true)
+            } else if path == unknown {
+                None
+            } else {
+                Some(false)
+            }
+        });
+        for root in [&live, &open, &unknown, &garbage] {
+            assert!(root.exists());
+        }
+        let reason = |root: &Path| {
+            let name = root.file_name().unwrap().to_str().unwrap();
+            events
+                .iter()
+                .find(|(event, _)| event == name)
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(reason(&live), "kept: owner running");
+        assert_eq!(reason(&open), "kept: open files");
+        assert_eq!(reason(&unknown), "kept: open files unknown");
+        assert_eq!(reason(&garbage), "kept: unreadable owner marker");
+    }
+
+    #[test]
+    fn runtime_sweep_ignores_other_roots_and_young_unmarked_roots() {
+        let temp = fixture();
+        let other = temp.join("sail-339-target.dead");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        let named = temp.join("sail-runtime-notes");
+        fs::create_dir(&named).unwrap();
+        fs::write(named.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        let starting = runtime_root(&temp, None);
+        let events = runtime_sweep(&temp, |_| Some(false));
+        assert!(events.is_empty());
+        assert!(other.exists() && named.exists() && starting.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_removes_a_root_with_a_read_only_directory() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let read_only = root.join("build/ro");
+        fs::create_dir_all(read_only.join("nested")).unwrap();
+        fs::write(read_only.join("nested/file"), "module cache").unwrap();
+        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555)).unwrap();
+        let events = runtime_sweep(&temp, |_| Some(false));
+        assert!(!root.exists());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, "removed");
+        let private = fs::read_dir(&*temp)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sail-cleanup-private-")
+            });
+        assert!(!private);
+    }
+
+    #[test]
+    fn runtime_sweep_keeps_a_root_a_live_build_uses() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let busy = root.clone();
+        let mut events = Vec::new();
+        sweep_runtime_roots_in(
+            &temp,
+            SystemTime::now(),
+            |_| Some(false),
+            &|path| path == busy,
+            &mut |_, event| {
+                events.push(matches!(
+                    event,
+                    RuntimeRootEvent::Kept {
+                        reason: "build in use"
+                    }
+                ));
+            },
+        )
+        .unwrap();
+        assert_eq!(events, vec![true]);
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_does_not_report_a_root_removed_by_another_sweep() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let name = root.file_name().unwrap().to_str().unwrap().to_string();
+        let racing = root.clone();
+        let mut events = Vec::new();
+        sweep_runtime_roots_in(
+            &temp,
+            SystemTime::now(),
+            |path| {
+                if path == racing {
+                    fs::remove_dir_all(path).unwrap();
+                }
+                Some(false)
+            },
+            &|_| false,
+            &mut |reported, _| events.push(reported.to_string()),
+        )
+        .unwrap();
+        assert!(!events.contains(&name));
+    }
+
+    #[test]
+    fn runtime_sweep_removes_a_root_whose_agent_exited_but_was_not_reaped() {
+        let temp = fixture();
+        let mut child = Command::new("/bin/sleep").arg("1").spawn().unwrap();
+        let owner = owner_identity_for_pid(child.id()).unwrap();
+        let root = runtime_root(&temp, Some(&owner));
+        std::thread::sleep(Duration::from_millis(1600));
+        assert!(unsafe { nix::libc::kill(child.id() as i32, 0) } == 0);
+        let events = runtime_sweep(&temp, |_| Some(false));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, "removed");
+        assert!(!root.exists());
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn runtime_sweep_removes_a_root_whose_pid_now_belongs_to_another_user() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some("1 12345"));
+        runtime_sweep(&temp, |_| Some(false));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_ignores_non_canonical_uuid_spellings() {
+        let temp = fixture();
+        let compact = temp.join(format!("sail-runtime-{}", uuid::Uuid::new_v4().simple()));
+        let upper = temp.join(format!(
+            "sail-runtime-{}",
+            uuid::Uuid::new_v4().to_string().to_uppercase()
+        ));
+        for root in [&compact, &upper] {
+            fs::create_dir(root).unwrap();
+            fs::write(root.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        }
+        let events = runtime_sweep(&temp, |_| Some(false));
+        assert!(events.is_empty());
+        assert!(compact.exists() && upper.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_reports_an_old_unmarked_root() {
+        let temp = fixture();
+        let orphan = runtime_root(&temp, None);
+        let mut events = Vec::new();
+        let later = SystemTime::now() + UNMARKED_GRACE + Duration::from_secs(1);
+        sweep_runtime_roots_in(
+            &temp,
+            later,
+            |_| Some(false),
+            &|_| false,
+            &mut |name, event| {
+                events.push((
+                    name.to_string(),
+                    matches!(
+                        event,
+                        RuntimeRootEvent::Kept {
+                            reason: "no owner marker"
+                        }
+                    ),
+                ));
+            },
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].1);
+        assert!(orphan.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_leaves_a_private_quarantine_to_its_owner() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let name = root.file_name().unwrap().to_str().unwrap();
+        let private = temp.join(format!(
+            "sail-cleanup-private-{}-{name}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&private).unwrap();
+        fs::write(private.join(PRIVATE_MARKER), PRIVATE_MARKER_VALUE).unwrap();
+        runtime_sweep(&temp, |_| Some(false));
+        assert!(private.exists());
+    }
+
+    #[test]
+    fn a_connection_close_succeeds_when_the_sweep_already_removed_its_root() {
+        let temp = fixture();
+        let mut scratch = OwnedRuntimeScratch::create_in(&temp).unwrap();
+        let path = scratch.path().to_path_buf();
+        let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        scratch.mark_owner(child.id()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        runtime_sweep(&temp, |_| Some(false));
+        assert!(!path.exists());
+        scratch.cleanup_now().unwrap();
+    }
+
+    #[test]
+    fn ten_closed_connections_leave_no_runtime_root() {
+        let temp = fixture();
+        for _ in 0..10 {
+            let mut scratch = OwnedRuntimeScratch::create_in(&temp).unwrap();
+            fs::write(scratch.path().join("build/artifact"), "build output").unwrap();
+            let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+            scratch.mark_owner(child.id()).unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            std::mem::forget(scratch);
+        }
+        runtime_sweep(&temp, |_| Some(false));
+        let left = fs::read_dir(&*temp)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("sail-"))
+            .count();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn kept_roots_are_logged_once_per_reason() {
+        let mut log = RuntimeSweepLog::default();
+        let mut recorded = Vec::new();
+        let mut pass = |log: &mut RuntimeSweepLog, reason| {
+            let mut seen = std::collections::HashMap::new();
+            log.observe(
+                "sail-runtime-a",
+                RuntimeRootEvent::Kept { reason },
+                &mut seen,
+                &mut |event, details| recorded.push((event.to_string(), details)),
+            );
+            log.kept = seen;
+        };
+        pass(&mut log, "owner running");
+        pass(&mut log, "owner running");
+        pass(&mut log, "open files");
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1].1["reason"], "open files");
     }
 
     #[cfg(target_os = "macos")]
