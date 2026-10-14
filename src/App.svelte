@@ -27,9 +27,10 @@
   } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import { agentFocusDisplay, type AgentFocusDisplay } from './lib/agent-focus';
   import TasksPanel from './TasksPanel.svelte';
   import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
-  import { sessionTasks, TASK_TOOLS } from './lib/session-tasks';
+  import { sessionTasks, TASK_TOOLS, taskScopeKey } from './lib/session-tasks';
   import { createNativeTaskReconciler } from './lib/native-session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import {
@@ -1175,13 +1176,32 @@
         ]),
     ),
   );
+  let focusActiveTurns = $state<Record<string, string>>({});
+  let focusByThread = $derived.by(() => {
+    void tasksTick;
+    const result: Record<string, AgentFocusDisplay> = {};
+    for (const thread of [...agentStatusThreads, ...Object.values(sidebarThreads).flat()]) {
+      const key = threadKey(thread);
+      const focus = agentFocusDisplay(
+        sessionTasks().snapshot(thread),
+        agentStatusStatuses[key] ?? taskOverviewStatuses[key] ?? null,
+        focusActiveTurns[key] ?? null,
+      );
+      if (focus) result[key] = focus;
+    }
+    return result;
+  });
   let taskOverviewAgentNames = $derived(
     Object.fromEntries([
       ['opencode', 'OpenCode'],
       ...agentAvailability.map((agent) => [agent.id, agent.name]),
     ]),
   );
-  let agentStatusThreads = $derived([...agentThreads, ...sidebarOpenCodeThreads]);
+  let agentStatusThreads = $derived([
+    ...agentThreads,
+    ...nativeChildThreads,
+    ...sidebarOpenCodeThreads,
+  ]);
   let agentStatusStatuses = $derived(
     Object.fromEntries(
       agentStatusThreads.map((thread) => [
@@ -1204,6 +1224,7 @@
       agentNames: taskOverviewAgentNames,
       usage: agentUsage,
       rates: agentRates,
+      focusByThread,
     }),
   );
   let sidebarDirectoryKey = $derived(
@@ -6636,7 +6657,10 @@
           needsCorrection: await sessionTasks().requestCorrection(scope, request.arguments.turnId),
         };
       }
-      return sessionTasks().report(scope, request.arguments);
+      const snapshot = await sessionTasks().report(scope, request.arguments);
+      if (snapshot.turnId)
+        focusActiveTurns = { ...focusActiveTurns, [taskScopeKey(scope)]: snapshot.turnId };
+      return snapshot;
     }
     if (isPlanTool(request.name)) {
       return acpPlans().runTool(
@@ -12722,6 +12746,15 @@
         if (attempt < 2) await restoreAgentActivity(attempt + 1);
         return;
       }
+      focusActiveTurns = Object.fromEntries(
+        agentThreads.flatMap((thread) => {
+          const turn =
+            backendActivity[JSON.stringify([thread.directory, thread.agent])]?.activeTurns[
+              thread.sessionId
+            ];
+          return turn ? [[threadKey(thread), turn]] : [];
+        }),
+      );
       const previousAttention = threadAttention;
       threadAttention = reconcileAttention(
         threadAttention,
@@ -14123,6 +14156,7 @@
         agentNames={taskOverviewAgentNames}
         checks={postTurnResults}
         receipts={visibleSpawnReceipts}
+        {focusByThread}
         {directory}
         onopen={openTaskOverviewTarget}
         onopencheck={openTaskOverviewCheck}
@@ -14144,6 +14178,7 @@
     {/if}
     <div class="workspace-pane-host" hidden={workspaceView !== 'workspace'}>
       <PaneTree
+        {agentStatusStatuses}
         active={workspaceView === 'workspace'}
         pane={paneLayout}
         focused={focusedPane}
@@ -14346,6 +14381,7 @@
                     return child && child.taskIdentity !== 'verified' ? child.activity : null;
                   })()
                 : null}
+              status={acpThread ? (agentStatusStatuses[threadKey(acpThread)] ?? null) : null}
             />
           </div>{/if}
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">

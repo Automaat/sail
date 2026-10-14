@@ -752,7 +752,7 @@
     agentHeaderStatus({
       connecting,
       ready,
-      waiting: permissions.length > 0,
+      waiting: permissions.length > 0 || elicitations.length > 0,
       sending: busy && !turnEnded,
       hasSession: !!activeSessionId,
       running,
@@ -2892,6 +2892,11 @@
               <summary>Tasks ({taskSnapshot.tasks.length})</summary><TasksPanel
                 snapshot={taskSnapshot}
                 observedActivity={observedTaskActivity}
+                status={visibleStatus === 'waiting'
+                  ? 'waiting'
+                  : visibleStatus === 'working'
+                    ? 'working'
+                    : null}
               />
             </details>{/if}
           {#if nativePlan}<section class="native-plan" aria-label="Native plan">

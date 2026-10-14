@@ -21,6 +21,7 @@ const SnapshotSchema = z.strictObject({
   revision: z.number().int().nonnegative(),
   tasks: z.array(TaskSchema).max(200),
   focus: z.string().nullable(),
+  reportedAt: z.number().finite().nonnegative().nullable().optional(),
   reporting: z
     .object({
       turnId: z.string(),
@@ -46,7 +47,13 @@ export interface TaskStorage {
   read(): string | null;
   write(value: string): Promise<void>;
 }
-const empty = (): TaskSnapshot => ({ turnId: null, revision: 0, tasks: [], focus: null });
+const empty = (): TaskSnapshot => ({
+  turnId: null,
+  revision: 0,
+  tasks: [],
+  focus: null,
+  reportedAt: null,
+});
 const storageKey = 'sai-session-tasks';
 type TurnOutcome = 'done' | 'interrupted' | 'failed';
 type FinishedTurn = { turnId: string; status: TurnOutcome };
@@ -134,6 +141,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           ...before,
           turnId: null,
           focus: null,
+          reportedAt: null,
           revision: before.revision + 1,
           reporting: settledReporting(
             before,
@@ -176,6 +184,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           revision: before.revision + 1,
           tasks: [...before.tasks.filter((item) => item.id !== task.id).slice(-199), task],
           focus: task.id,
+          reportedAt: null,
           reporting: {
             turnId,
             state: 'awaiting',
@@ -231,6 +240,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           revision: before.revision + 1,
           tasks: [...history, ...current],
           focus: report.focus,
+          reportedAt: clock(),
           reporting: {
             turnId: report.turnId,
             state: 'reported',
@@ -265,6 +275,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           ...before,
           turnId: null,
           focus: null,
+          reportedAt: null,
           revision: before.revision + 1,
           reporting: settledReporting(before, outcome),
         });

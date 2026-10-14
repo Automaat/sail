@@ -84,7 +84,13 @@ await test('observed children never acquire a reportable scope, including spoofe
   const tasks = store();
   const reconcile = createNativeTaskReconciler(tasks);
   await reconcile('/repo', set(1, child({ taskIdentity: 'observed', taskTurnId: 'spoofed' })));
-  assert.deepEqual(tasks.snapshot(scope), { turnId: null, revision: 0, tasks: [], focus: null });
+  assert.deepEqual(tasks.snapshot(scope), {
+    turnId: null,
+    revision: 0,
+    tasks: [],
+    focus: null,
+    reportedAt: null,
+  });
 });
 
 await test('restoration retains durable child tasks, clears orphan focus and starts a fresh child turn', async () => {
