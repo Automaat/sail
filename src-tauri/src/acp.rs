@@ -1006,6 +1006,15 @@ fn session_servers(browser: Value) -> Vec<Value> {
     vec![browser]
 }
 
+fn with_context_server(servers: &mut Vec<Value>, context: Option<Value>) {
+    servers.retain(|server| {
+        server.pointer("/args/0").and_then(Value::as_str) != Some("--context-mcp")
+    });
+    if let Some(context) = context {
+        servers.push(context);
+    }
+}
+
 fn per_load_mcp() -> bool {
     std::env::var("SAIL_ACP_PER_LOAD_MCP").as_deref() == Ok("1")
 }
@@ -5759,7 +5768,11 @@ pub async fn acp_new_session(
             Some(profile.as_str()),
             crate::background_priority::enabled(&app),
         )?;
-        let servers = session_servers(mcp_server(&config));
+        let mut servers = session_servers(mcp_server(&config));
+        with_context_server(
+            &mut servers,
+            crate::context::provider_mcp_server(&app, Path::new(&cwd)),
+        );
         let _serial = runtime
             .session_creation
             .lock()
@@ -6325,7 +6338,7 @@ async fn restore_session(
                             .get(&session_id)
                             .copied()
                             .unwrap_or(0);
-                        let (params, minted_token) = {
+                        let (mut params, minted_token) = {
                             let mut configs = runtime
                                 .session_configs
                                 .lock()
@@ -6361,6 +6374,17 @@ async fn restore_session(
                                 |token| browser.release(token),
                             )?
                         };
+                        let context = crate::context::provider_mcp_server(&app, Path::new(&cwd));
+                        if let Some(servers) =
+                            params.get_mut("mcpServers").and_then(Value::as_array_mut)
+                        {
+                            with_context_server(servers, context);
+                            if let Ok(mut configs) = runtime.session_configs.lock() {
+                                if let Some(config) = configs.get_mut(&session_id) {
+                                    config.servers = servers.clone();
+                                }
+                            }
+                        }
                         Ok((forget_generation, params, minted_token))
                     },
                 )?;
@@ -7765,6 +7789,20 @@ fn spawn_test_session_process() -> std::process::Child {
 mod session_config_tests {
     use super::*;
     use crate::browser_agent::McpConfig;
+
+    #[test]
+    fn context_server_is_optional_and_registered_once() {
+        let browser = json!({"name":"sail-browser", "args":["--browser-mcp"]});
+        let context = json!({"name":"project-files", "args":["--context-mcp", "/project"]});
+        let mut servers = session_servers(browser.clone());
+        with_context_server(&mut servers, None);
+        assert_eq!(servers, vec![browser.clone()]);
+        with_context_server(&mut servers, Some(context.clone()));
+        with_context_server(&mut servers, Some(context.clone()));
+        assert_eq!(servers, vec![browser.clone(), context]);
+        with_context_server(&mut servers, None);
+        assert_eq!(servers, vec![browser]);
+    }
     use std::collections::BTreeMap;
 
     #[test]
@@ -7840,9 +7878,17 @@ mod session_config_tests {
     #[cfg(unix)]
     #[test]
     fn temporary_cleanup_retries_after_worker_exits() {
+        struct RuntimeGuard(Arc<Connection>);
+        impl Drop for RuntimeGuard {
+            fn drop(&mut self) {
+                let _ = self.0.stop_child();
+            }
+        }
         let scratch =
             std::env::temp_dir().join(format!("sail-turn-temp-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&scratch).unwrap();
+        let identity = crate::worktree_directory_identity(&scratch).unwrap();
+        let _scratch = OwnedTempDir(scratch.clone(), identity);
         let worktree = scratch.join("plain-folder");
         std::fs::create_dir(&worktree).unwrap();
         let cache = scratch.join("cache");
@@ -7855,7 +7901,7 @@ mod session_config_tests {
         command
             .args([
                 "-c",
-                "sleep 30 & worker=$!; read signal; kill \"$worker\"; wait \"$worker\" 2>/dev/null; exec sleep 10",
+                "exec 3<&0; (read -r release <&3) & wait; read -r release <&3",
             ])
             .stdin(Stdio::piped());
         unsafe {
@@ -7876,6 +7922,7 @@ mod session_config_tests {
             child,
         );
         Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        let _runtime = RuntimeGuard(runtime.clone());
         let root = runtime.child.lock().unwrap().id();
         for _ in 0..100 {
             if runtime_has_live_children(root, None) {
@@ -7887,7 +7934,12 @@ mod session_config_tests {
         start_temp_cleanup_watcher(&runtime).unwrap();
         runtime.clear_idle_temp(true).unwrap();
         assert!(artifact.exists());
-        runtime.input.lock().unwrap().write_all(b"\n").unwrap();
+        runtime
+            .input
+            .lock()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
 
         for _ in 0..100 {
             if !artifact.exists() {
@@ -7901,15 +7953,22 @@ mod session_config_tests {
         );
         runtime.stop_child().unwrap();
         drop(runtime);
-        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn temporary_cleanup_preserves_orphaned_worker() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
         let scratch =
             std::env::temp_dir().join(format!("sail-orphan-temp-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&scratch).unwrap();
+        let _scratch = Scratch(scratch.clone());
         let worktree = scratch.join("plain-folder");
         std::fs::create_dir(&worktree).unwrap();
         let (_, lease) =
@@ -7918,17 +7977,19 @@ mod session_config_tests {
         let temp = lease.temp_directory().to_path_buf();
         let artifact = temp.join("artifact");
         let ready = scratch.join("ready");
-        let code = r#"import os,sys,time
+        let code = r#"import os,sys
 p=os.fork()
 if p==0:
     p2=os.fork()
     if p2>0: os._exit(0)
-    open(sys.argv[1], 'w').write('live')
+    artifact=open(sys.argv[1], 'w')
+    artifact.write('live')
+    artifact.flush()
     open(sys.argv[2], 'w').write(str(os.getpid()))
-    time.sleep(10)
+    sys.stdin.buffer.read()
     os._exit(0)
 os.waitpid(p, 0)
-time.sleep(10)
+sys.stdin.buffer.read()
 "#;
         let mut command = Command::new("python3");
         command
@@ -7968,7 +8029,6 @@ time.sleep(10)
         assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
         runtime.stop_child().unwrap();
         drop(runtime);
-        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[cfg(unix)]

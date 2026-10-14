@@ -3908,6 +3908,13 @@ pub(crate) struct FileLock {
     file: File,
 }
 
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Forked children can retain the descriptor before exec closes it.
+        let _ = self.unlock();
+    }
+}
+
 impl FileLock {
     pub(crate) fn acquire(path: &Path, exclusive: bool) -> Result<Self, String> {
         Self::acquire_mode(path, exclusive, false)
@@ -4034,6 +4041,36 @@ fn lock_file(_file: &File, _exclusive: bool, _nonblocking: bool) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_lease_releases_lock_with_inherited_descriptor() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.mark_started();
+        let inherited = lease._lease_lock.file.try_clone().unwrap();
+        let path = lock_path(&fixture.cache, "lease", &directory).unwrap();
+
+        drop(lease);
+
+        assert!(FileLock::try_acquire(&path, true).is_ok());
+        assert!(inherited.metadata().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_lock_preserves_independently_held_lease() {
+        let fixture = GitFixture::new();
+        let path = fixture.cache.join("independent.lock");
+        let released = FileLock::acquire(&path, false).unwrap();
+        let independent = FileLock::acquire(&path, false).unwrap();
+
+        drop(released);
+
+        assert!(FileLock::try_acquire(&path, true).is_err());
+        drop(independent);
+        assert!(FileLock::try_acquire(&path, true).is_ok());
+    }
 
     struct GitFixture {
         root: PathBuf,
@@ -4183,10 +4220,9 @@ mod tests {
 
     fn write_expired_temp_owner_with_header(temp: &Path, data_directory: &Path, header: &str) {
         let pid = std::process::id();
-        let started_at = sysinfo::System::new_all()
-            .process(sysinfo::Pid::from_u32(pid))
-            .unwrap()
-            .start_time();
+        let owner = read_temp_owner(temp, data_directory).expect("registered temporary owner");
+        assert_eq!(owner.pid, pid);
+        let started_at = owner.started_at.expect("registered owner process start");
         fs::write(
             temp.join(TEMP_OWNER_FILE),
             format!(
@@ -5000,50 +5036,51 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn removed_worktree_retains_temp_used_by_detached_worker() {
+        struct Worker(std::process::Child);
+        impl Drop for Worker {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
         let fixture = GitFixture::new();
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
         let artifact = temp.join("artifact");
-        let ready = fixture.root.join("detached-worker-ready");
+        let ready = fixture.root.join("worker-ready");
         fs::write(&artifact, "live").unwrap();
-        let mut worker = std::process::Command::new("python3")
+        let mut worker = Worker(std::process::Command::new("python3")
             .arg("-c")
-            .arg("import os,sys,time; os.chdir(sys.argv[2]); open(sys.argv[1]).read(); open(sys.argv[3], 'w').write('ready'); time.sleep(30)")
+            .arg("import sys; file=open(sys.argv[1]); open(sys.argv[2], 'w').write('ready'); sys.stdin.buffer.read()")
             .arg(&artifact)
-            .arg(&temp)
             .arg(&ready)
             .env("TMPDIR", &temp)
+            .stdin(std::process::Stdio::piped())
             .spawn()
-            .unwrap();
+            .unwrap());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
+        let mut detected = false;
+        while std::time::Instant::now() < deadline {
+            if ready.exists() && temp_directory_in_use(&temp) {
+                detected = true;
+                break;
+            }
+            if worker.0.try_wait().unwrap().is_some() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let worker_status = worker.0.try_wait().unwrap();
         let worker_ready = ready.exists();
-        let observed = if worker_ready {
-            let detection_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                if temp_directory_in_use(&temp) {
-                    break true;
-                }
-                if std::time::Instant::now() >= detection_deadline {
-                    break false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        } else {
-            false
-        };
-        if !worker_ready || !observed {
-            if worker.try_wait().unwrap().is_none() {
-                worker.kill().unwrap();
-            }
-            worker.wait().unwrap();
+        if !detected {
+            let _ = worker.0.kill();
+            let _ = worker.0.wait();
         }
-        assert!(worker_ready, "detached worker did not open temporary data");
         assert!(
-            observed,
-            "detached worker was not visible to temporary process detection"
+            detected,
+            "Detached worker {}: ready={worker_ready}, exit={worker_status:?}",
+            worker.0.id()
         );
 
         lease.mark_started();
@@ -5057,8 +5094,8 @@ mod tests {
         reconcile(&fixture.cache);
         assert_eq!(fs::read_to_string(&artifact).unwrap(), "live");
 
-        worker.kill().unwrap();
-        worker.wait().unwrap();
+        drop(worker.0.stdin.take());
+        assert!(worker.0.wait().unwrap().success());
         lease.release_clean().unwrap();
         drop(lease);
         assert_storage_reclaimed_after_retry(&fixture.cache, &directory);
