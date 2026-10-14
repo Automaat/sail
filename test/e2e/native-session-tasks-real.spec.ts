@@ -58,7 +58,21 @@ suite(`real native child Tasks (${provider ?? 'requires explicit provider enviro
     );
     if (provider === 'opencode') {
       await expect(panel).toHaveText(expect.stringContaining('Child task identity'));
-      await expect($('.agent-conversation')).toHaveText(expect.stringContaining('different turn'));
+      await browser.execute(() => {
+        for (const item of document.querySelectorAll<HTMLDetailsElement>(
+          '.agent-conversation details.tool-activity',
+        ))
+          item.open = true;
+      });
+      await browser.waitUntil(() =>
+        browser.execute(() =>
+          [...document.querySelectorAll('.agent-conversation [data-tool-id]')].some(
+            (item) =>
+              item.textContent?.includes('stale-child-turn') &&
+              item.textContent.includes('different turn'),
+          ),
+        ),
+      );
       const child = saved.find((item: { snapshot: { tasks: { id: string }[] } }) =>
         item.snapshot.tasks.some((task) => task.id === 'child-only'),
       );
