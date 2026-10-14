@@ -891,9 +891,6 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             continue;
         }
         reclaim_verified_unstarted_temp(cache_directory, &data_directory);
-        for item in temp_directory_status(cache_directory, &data_directory) {
-            report_pending(&data_directory, &item.reason);
-        }
         // An active sibling shares the repository lock but has a separate lease. Check
         // its lease first so skipping that sibling cannot hold the repository lock
         // while a removed worktree from the same repository is reconciled.

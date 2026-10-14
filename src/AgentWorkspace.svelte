@@ -1471,16 +1471,18 @@
           }
         };
         const needsReplay = restoreMode === 'load';
-        const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
-        if (current !== generation) return;
-        attachedCodexSession =
-          agent === 'codex' && runtime?.alive === true && runtime.sessions.includes(id);
-        const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
+        const [activity, reservation] = await Promise.all([
+          acp.activity(directory).catch(() => null),
+          acp.beginRestore(agent, directory, id, activeCapabilityProfile),
+        ]);
+        const runtime = activity?.[agent];
         if (current !== generation) {
           if (reservation.restoreToken)
             await acp.endRestore(agent, directory, id, reservation.restoreToken);
           return;
         }
+        attachedCodexSession =
+          agent === 'codex' && runtime?.alive === true && runtime.sessions.includes(id);
         if (reservation.liveTurn) {
           await showLiveTurn(reservation.liveTurn, reservation);
         } else if (liveView && attachedCodexSession) {
@@ -1536,18 +1538,18 @@
             updateSkills(session.availableCommands);
           if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
         }
-        const waiting = await fencedAcpPermissionInventory(
-          () => acp.pendingPermissions(agent, directory, id),
-          () => permissionInventoryRevision,
-          () => current === generation && activeSessionId === id,
-        );
-        if (waiting) for (const request of waiting) queuePermission(request);
-        const pendingElicitations = await acp
-          .pendingElicitations(agent, directory, id, activeCapabilityProfile)
-          .then(
+        const [waiting, pendingElicitations] = await Promise.all([
+          fencedAcpPermissionInventory(
+            () => acp.pendingPermissions(agent, directory, id),
+            () => permissionInventoryRevision,
+            () => current === generation && activeSessionId === id,
+          ),
+          acp.pendingElicitations(agent, directory, id, activeCapabilityProfile).then(
             (requests) => ({ requests, available: true }),
             () => ({ requests: [], available: false }),
-          );
+          ),
+        ]);
+        if (waiting) for (const request of waiting) queuePermission(request);
         if (current === generation && activeSessionId === id && pendingElicitations.available) {
           const pendingIDs = new Set(
             pendingElicitations.requests.flatMap((request) =>
