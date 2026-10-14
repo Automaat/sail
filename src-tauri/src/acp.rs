@@ -4528,13 +4528,6 @@ fn codex_native_activity_update(message: &Value, owner: Option<&str>) -> Option<
         .pointer("/params/sessionId")
         .and_then(Value::as_str)?;
     let update = message.pointer("/params/update")?;
-    if !update
-        .get("subagent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return None;
-    }
     let input = update.get("rawInput").or_else(|| update.get("input"))?;
     let activity = input.get("activityKind").and_then(Value::as_str)?;
     let wire_child = input.get("agentThreadId").and_then(Value::as_str)?;
@@ -4550,6 +4543,25 @@ fn codex_native_activity_update(message: &Value, owner: Option<&str>) -> Option<
         .and_then(|path| path.split('/').rfind(|part| !part.is_empty()))
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("Subagent");
+    let adapter_title = match activity {
+        "started" => format!("Start subagent {name}"),
+        "interacted" => format!("Interact with subagent {name}"),
+        "interrupted" => format!("Interrupt subagent {name}"),
+        "completed" => format!("Complete subagent {name}"),
+        _ => return None,
+    };
+    let trusted = match update.get("subagent") {
+        Some(marker) => marker.as_bool() == Some(true),
+        None => {
+            matches!(
+                update.get("sessionUpdate").and_then(Value::as_str),
+                Some("tool_call" | "tool_call_update")
+            ) && update.get("title").and_then(Value::as_str) == Some(adapter_title.as_str())
+        }
+    };
+    if !trusted {
+        return None;
+    }
     let update = match activity {
         "started" | "interacted" => json!({
             "sessionUpdate":"subagent_spawned",
@@ -10946,6 +10958,63 @@ mod capability_profile_tests {
     }
 
     #[test]
+    fn codex_activity_standard_client_keeps_trusted_child_lifecycle() {
+        let activity = |kind: &str, tool_call_id: &str, title: &str| {
+            json!({
+                "method":"session/update",
+                "params":{"sessionId":"01a13b13-ed9a-79d0-99ed-87e62f1d1ab4","update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":tool_call_id,
+                    "title":title,
+                    "status":"completed",
+                    "rawInput":{
+                        "activityKind":kind,
+                        "agentPath":"/root/native_child_identity",
+                        "agentThreadId":"01a13b14-8984-79c1-9f54-795b4ced3e11"
+                    }
+                }}
+            })
+        };
+
+        let started = codex_native_activity_update(
+            &activity(
+                "started",
+                "call_d70a5f1945ba4b44ad8c0cfcfa112f74",
+                "Start subagent native_child_identity",
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            started.pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_spawned",
+                "subagentSessionId":"01a13b14-8984-79c1-9f54-795b4ced3e11",
+                "name":"native_child_identity",
+                "task":"native_child_identity"
+            }))
+        );
+
+        let completed = codex_native_activity_update(
+            &activity(
+                "completed",
+                "subagent-completed-01a13b14-89cd-7b21-99ac-38cd34441410",
+                "Complete subagent native_child_identity",
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            completed.pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_state_update",
+                "subagentSessionId":"01a13b14-8984-79c1-9f54-795b4ced3e11",
+                "state":"completed"
+            }))
+        );
+    }
+
+    #[test]
     fn codex_activity_requires_adapter_subagent_provenance_and_scopes_owned_children() {
         let owner = "0d66d3a1-5c47-45d1-8c3d-4a789f129001";
         let mut message = json!({
@@ -10970,7 +11039,16 @@ mod capability_profile_tests {
         );
         message["params"]["update"]["subagent"] = json!(false);
         assert!(codex_native_activity_update(&message, Some(owner)).is_none());
-        message["params"]["update"]["subagent"] = json!(true);
+        message["params"]["update"]["subagent"] = json!("true");
+        assert!(codex_native_activity_update(&message, Some(owner)).is_none());
+        message["params"]["update"]
+            .as_object_mut()
+            .unwrap()
+            .remove("subagent");
+        message["params"]["update"]["title"] = json!("Generic tool");
+        assert!(codex_native_activity_update(&message, Some(owner)).is_none());
+        message["params"]["update"]["title"] = json!("Start subagent child");
+        assert!(codex_native_activity_update(&message, Some(owner)).is_some());
         message["params"]["update"]["rawInput"]["agentThreadId"] = Value::Null;
         assert!(codex_native_activity_update(&message, Some(owner)).is_none());
     }
