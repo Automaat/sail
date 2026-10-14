@@ -2632,6 +2632,13 @@ struct PromptState {
     retired_tool_turns: HashMap<String, VecDeque<(String, String)>>,
 }
 
+struct CancellationPlan {
+    turn_id: Option<String>,
+    cleanup_current: bool,
+    await_settlement: bool,
+    track_prompt: bool,
+}
+
 impl PromptState {
     const ACTIVE_TOOL_TURN_LIMIT: usize = 512;
     const RETIRED_TOOL_TURN_LIMIT: usize = 4096;
@@ -2781,19 +2788,65 @@ impl PromptState {
         Some(turn_id)
     }
 
-    fn cancellation_turn(&self, session_id: &str, turn_id: Option<String>) -> Option<String> {
-        turn_id
-            .or_else(|| {
-                self.active
-                    .get(session_id)
-                    .map(|prompt| prompt.turn_id.clone())
-            })
-            .or_else(|| {
-                self.finished
-                    .get(session_id)
-                    .map(|prompt| prompt.turn_id.clone())
-            })
+    fn cancellation_plan(
+        &self,
+        session_id: &str,
+        requested_turn: Option<String>,
+    ) -> CancellationPlan {
+        let active = self.active.get(session_id);
+        let finished = self.finished.get(session_id);
+        let turn_id = requested_turn.or_else(|| {
+            active
+                .map(|prompt| prompt.turn_id.clone())
+                .or_else(|| finished.map(|prompt| prompt.turn_id.clone()))
+        });
+        let cleanup_current = turn_id
+            .as_deref()
+            .zip(active)
+            .is_some_and(|(turn_id, prompt)| prompt.turn_id == turn_id);
+        let await_settlement = turn_id.as_deref().is_some_and(|turn_id| {
+            active.is_some_and(|prompt| prompt.turn_id == turn_id && prompt.dispatched)
+                || finished.is_some_and(|prompt| prompt.turn_id == turn_id)
+        });
+        let track_prompt = cleanup_current
+            || (turn_id.is_some()
+                && active.is_none()
+                && !turn_id
+                    .as_deref()
+                    .zip(finished)
+                    .is_some_and(|(turn_id, prompt)| prompt.turn_id == turn_id));
+        CancellationPlan {
+            turn_id,
+            cleanup_current,
+            await_settlement,
+            track_prompt,
+        }
     }
+}
+
+fn prepare_session_cancellation(
+    prompts: &mut PromptState,
+    cancelled_prompts: &mut HashSet<String>,
+    permissions: &mut PermissionState,
+    session_id: &str,
+    requested_turn: Option<String>,
+) -> CancellationPlan {
+    let plan = prompts.cancellation_plan(session_id, requested_turn);
+    if plan.cleanup_current || plan.await_settlement {
+        let turn_id = plan.turn_id.as_deref().expect("matched cancellation turn");
+        prompts.retire_turn(session_id, turn_id);
+    }
+    if plan.cleanup_current {
+        prompts.finishing.insert(session_id.to_string());
+    }
+    if plan.track_prompt {
+        let turn_id = plan.turn_id.as_ref().expect("tracked cancellation turn");
+        cancelled_prompts.insert(turn_id.clone());
+    }
+    if plan.await_settlement {
+        permissions.begin_cancel(session_id, plan.turn_id.as_deref());
+    }
+    plan
 }
 
 fn append_connection_activity(
@@ -2843,6 +2896,7 @@ fn append_connection_activity(
 struct ActivePrompt {
     turn_id: String,
     text: String,
+    dispatched: bool,
     memory_capture: crate::memory_capture::TurnCapture,
     last_agent_message: String,
     agent_message_open: bool,
@@ -2970,6 +3024,7 @@ mod interruption_report_tests {
         ActivePrompt {
             turn_id: "turn".into(),
             text: "task".into(),
+            dispatched: false,
             memory_capture: crate::memory_capture::TurnCapture::default(),
             last_agent_message: String::new(),
             agent_message_open: false,
@@ -3544,6 +3599,103 @@ mod interruption_report_tests {
     }
 
     #[test]
+    fn cancelling_before_prompt_dispatch_does_not_wait_for_settlement() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let mut cancelled = HashSet::new();
+        let mut permissions = PermissionState::default();
+
+        let plan = prepare_session_cancellation(
+            &mut prompts,
+            &mut cancelled,
+            &mut permissions,
+            "target",
+            Some("turn".into()),
+        );
+
+        assert_eq!(plan.turn_id.as_deref(), Some("turn"));
+        assert!(plan.cleanup_current);
+        assert!(!plan.await_settlement);
+        assert!(plan.track_prompt);
+        assert!(prompts.finishing.contains("target"));
+        assert!(cancelled.contains("turn"));
+        assert!(permissions.begin_turn("target", 0));
+    }
+
+    #[test]
+    fn cancelling_before_prompt_registration_does_not_wait_for_settlement() {
+        let mut prompts = PromptState::default();
+        let mut cancelled = HashSet::new();
+        let mut permissions = PermissionState::default();
+
+        let plan = prepare_session_cancellation(
+            &mut prompts,
+            &mut cancelled,
+            &mut permissions,
+            "target",
+            Some("turn".into()),
+        );
+
+        assert_eq!(plan.turn_id.as_deref(), Some("turn"));
+        assert!(!plan.cleanup_current);
+        assert!(!plan.await_settlement);
+        assert!(plan.track_prompt);
+        assert!(cancelled.contains("turn"));
+        assert!(permissions.begin_turn("target", 0));
+    }
+
+    #[test]
+    fn cancelling_a_dispatched_prompt_waits_for_its_response() {
+        let mut prompts = PromptState::default();
+        let mut active = prompt();
+        active.dispatched = true;
+        prompts.active.insert("target".into(), active);
+        let mut cancelled = HashSet::new();
+        let mut permissions = PermissionState::default();
+
+        let plan = prepare_session_cancellation(
+            &mut prompts,
+            &mut cancelled,
+            &mut permissions,
+            "target",
+            Some("turn".into()),
+        );
+
+        assert_eq!(plan.turn_id.as_deref(), Some("turn"));
+        assert!(plan.cleanup_current);
+        assert!(plan.await_settlement);
+        assert!(plan.track_prompt);
+        assert!(!permissions.begin_turn("target", 0));
+    }
+
+    #[test]
+    fn stale_turn_cancellation_does_not_cancel_the_replacement() {
+        let mut prompts = PromptState::default();
+        let mut active = prompt();
+        active.turn_id = "replacement".into();
+        active.dispatched = true;
+        prompts.active.insert("target".into(), active);
+        let mut cancelled = HashSet::new();
+        let mut permissions = PermissionState::default();
+
+        let plan = prepare_session_cancellation(
+            &mut prompts,
+            &mut cancelled,
+            &mut permissions,
+            "target",
+            Some("stale".into()),
+        );
+
+        assert_eq!(plan.turn_id.as_deref(), Some("stale"));
+        assert!(!plan.cleanup_current);
+        assert!(!plan.await_settlement);
+        assert!(!plan.track_prompt);
+        assert!(!prompts.finishing.contains("target"));
+        assert!(!cancelled.contains("stale"));
+        assert!(permissions.begin_turn("target", 0));
+    }
+
+    #[test]
     fn idle_cancellation_does_not_discard_an_existing_late_permission_guard() {
         let mut state = PermissionState::default();
         state.begin_cancel("target", Some("turn-one"));
@@ -3586,7 +3738,10 @@ mod interruption_report_tests {
         );
         let mut state = PermissionState::default();
         state.acknowledge_prompt_settlement("target", "turn-one", 4);
-        let cancelled_turn = prompts.cancellation_turn("target", None);
+        let plan = prompts.cancellation_plan("target", None);
+        assert!(plan.await_settlement);
+        assert!(!plan.track_prompt);
+        let cancelled_turn = plan.turn_id;
         state.begin_cancel("target", cancelled_turn.as_deref());
         let permission =
             json!({"id":11,"params":{"sessionId":"target","toolCall":{"toolCallId":"old-tool"}}});
@@ -6555,6 +6710,7 @@ mod task_reporting_tests {
             ActivePrompt {
                 turn_id: "turn".into(),
                 text: "task".into(),
+                dispatched: true,
                 memory_capture: crate::memory_capture::TurnCapture::default(),
                 last_agent_message: String::new(),
                 agent_message_open: false,
@@ -6647,6 +6803,14 @@ pub async fn acp_prompt(
             .lock()
             .map_err(|error| error.to_string())?;
         prompts.ensure_prompt_available(&preflight_session)?;
+        if preflight_runtime
+            .cancelled_prompts
+            .lock()
+            .map_err(|error| error.to_string())?
+            .remove(&preflight_turn)
+        {
+            return Err("Agent turn was cancelled.".into());
+        }
         if prompts.active.contains_key(&preflight_session)
             || prompts.finishing.contains(&preflight_session)
         {
@@ -6667,6 +6831,7 @@ pub async fn acp_prompt(
             ActivePrompt {
                 turn_id: preflight_turn,
                 text: preflight_text,
+                dispatched: false,
                 memory_capture: crate::memory_capture::TurnCapture::default(),
                 last_agent_message: String::new(),
                 agent_message_open: false,
@@ -6767,7 +6932,18 @@ pub async fn acp_prompt(
                                     )
                                 })?;
                                 uncertain_phase.store(1, Ordering::Release);
-                                writer.write(message)
+                                writer.write(message)?;
+                                let mut prompts = writer
+                                    .prompt_state
+                                    .lock()
+                                    .map_err(|error| error.to_string())?;
+                                let prompt = prompts
+                                    .active
+                                    .get_mut(&dispatch_session)
+                                    .filter(|prompt| prompt.turn_id == dispatch_turn)
+                                    .ok_or("This agent turn is no longer active.")?;
+                                prompt.dispatched = true;
+                                Ok(())
                             },
                         )
                     },
@@ -7551,54 +7727,52 @@ fn cancel_session_after_dispatch(
 ) -> Result<(), String> {
     let session_id = session_id.to_string();
     let agent = agent.to_string();
-    let (cancelled_turn, cleanup_current) = {
+    let (plan, mut permission_state) = {
         let mut prompts = runtime
             .prompt_state
             .lock()
             .map_err(|error| error.to_string())?;
-        let cancelled_turn = prompts.cancellation_turn(&session_id, turn_id);
-        let cleanup_current = cancelled_turn.as_deref().is_some_and(|turn_id| {
-            prompts
-                .active
-                .get(&session_id)
-                .is_some_and(|prompt| prompt.turn_id == turn_id)
-        });
-        if let Some(turn_id) = cancelled_turn.as_deref() {
-            prompts.retire_turn(&session_id, turn_id);
-        }
-        if cleanup_current {
-            prompts.finishing.insert(session_id.clone());
-        }
-        (cancelled_turn, cleanup_current)
+        let mut cancelled_prompts = runtime
+            .cancelled_prompts
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let mut permission_state = runtime
+            .permission_state
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let plan = prepare_session_cancellation(
+            &mut prompts,
+            &mut cancelled_prompts,
+            &mut permission_state,
+            &session_id,
+            turn_id,
+        );
+        drop(cancelled_prompts);
+        drop(prompts);
+        (plan, permission_state)
     };
     crate::diagnostics::record(
         "cancel_requested",
         json!({
-            "agent":agent,"sessionId":session_id,"turnId":cancelled_turn
+            "agent":agent,"sessionId":session_id,"turnId":plan.turn_id,
+            "awaitSettlement":plan.await_settlement
         }),
     );
-    if let Some(turn_id) = cancelled_turn.as_ref() {
-        runtime
-            .cancelled_prompts
-            .lock()
-            .map_err(|error| error.to_string())?
-            .insert(turn_id.clone());
-    }
-    let mut permission_state = runtime
-        .permission_state
-        .lock()
-        .map_err(|error| error.to_string())?;
-    permission_state.begin_cancel(&session_id, cancelled_turn.as_deref());
-    let result = runtime.notify("session/cancel", json!({"sessionId":session_id}));
+    let result = if plan.await_settlement {
+        runtime.notify("session/cancel", json!({"sessionId":session_id}))
+    } else {
+        Ok(())
+    };
     if result.is_err() {
         permission_state.canceling_sessions.remove(&session_id);
         drop(permission_state);
-        if cleanup_current {
+        if plan.cleanup_current {
             if let Ok(mut prompts) = runtime.prompt_state.lock() {
                 prompts.finishing.remove(&session_id);
             }
         }
-        if let Some(turn_id) = cancelled_turn.as_ref() {
+        if plan.track_prompt {
+            let turn_id = plan.turn_id.as_ref().expect("tracked cancellation turn");
             runtime
                 .cancelled_prompts
                 .lock()
@@ -7607,7 +7781,7 @@ fn cancel_session_after_dispatch(
         }
         return result;
     }
-    if cleanup_current {
+    if plan.cleanup_current {
         let clean = cleanup_session_processes(app, runtime, &agent, &session_id);
         if let Err(error) = runtime.record_process_cleanup(&session_id, clean) {
             if let Some(lease) = &runtime._storage_lease {
@@ -7619,32 +7793,35 @@ fn cancel_session_after_dispatch(
             );
         }
     }
-    resolve_session_permissions(
-        &mut permission_state.pending,
-        &session_id,
-        |request_id, pending| {
-            runtime.write(&json!({
-                "jsonrpc":"2.0",
-                "id":request_id,
-                "result":{"outcome":{"outcome":"cancelled"}}
-            }))?;
-            let _ = app.emit(
-                "acp-event",
-                AgentEvent {
-                    agent: agent.clone(),
-                    directory: session_directory(runtime, &session_id),
-                    worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
-                    message: json!({"method":"sail/permission_resolved","params":{
-                        "sessionId":session_id,"requestId":request_id,
-                        "sailPermissionGeneration":pending.generation,
-                        "sailPermissionFingerprint":pending.fingerprint,
-                        "sailPermissionOutcome":"cancelled"
-                    }}),
-                },
-            );
-            Ok(())
-        },
-    )
+    if plan.cleanup_current || plan.await_settlement {
+        resolve_session_permissions(
+            &mut permission_state.pending,
+            &session_id,
+            |request_id, pending| {
+                runtime.write(&json!({
+                    "jsonrpc":"2.0",
+                    "id":request_id,
+                    "result":{"outcome":{"outcome":"cancelled"}}
+                }))?;
+                let _ = app.emit(
+                    "acp-event",
+                    AgentEvent {
+                        agent: agent.clone(),
+                        directory: session_directory(runtime, &session_id),
+                        worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+                        message: json!({"method":"sail/permission_resolved","params":{
+                            "sessionId":session_id,"requestId":request_id,
+                            "sailPermissionGeneration":pending.generation,
+                            "sailPermissionFingerprint":pending.fingerprint,
+                            "sailPermissionOutcome":"cancelled"
+                        }}),
+                    },
+                );
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -7790,6 +7967,7 @@ mod session_config_tests {
         let prompt = |turn_id: &str| ActivePrompt {
             turn_id: turn_id.into(),
             text: String::new(),
+            dispatched: false,
             memory_capture: crate::memory_capture::TurnCapture::default(),
             last_agent_message: String::new(),
             agent_message_open: false,
@@ -8384,6 +8562,7 @@ time.sleep(10)
                 ActivePrompt {
                     turn_id: "new-turn".into(),
                     text: "hello".into(),
+                    dispatched: false,
                     memory_capture: crate::memory_capture::TurnCapture::default(),
                     last_agent_message: String::new(),
                     agent_message_open: false,
@@ -8927,6 +9106,7 @@ time.sleep(10)
             ActivePrompt {
                 turn_id: "turn-1".into(),
                 text: "first request".into(),
+                dispatched: false,
                 memory_capture: crate::memory_capture::TurnCapture::default(),
                 last_agent_message: String::new(),
                 agent_message_open: false,
@@ -8946,6 +9126,7 @@ time.sleep(10)
             ActivePrompt {
                 turn_id: "turn-2".into(),
                 text: "follow-up request".into(),
+                dispatched: false,
                 memory_capture: crate::memory_capture::TurnCapture::default(),
                 last_agent_message: String::new(),
                 agent_message_open: false,
@@ -9914,6 +10095,7 @@ mod native_subagent_fence_tests {
             ActivePrompt {
                 turn_id: "turn".into(),
                 text: "task".into(),
+                dispatched: false,
                 memory_capture: crate::memory_capture::TurnCapture::default(),
                 last_agent_message: String::new(),
                 agent_message_open: false,
