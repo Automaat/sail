@@ -9553,11 +9553,17 @@ time.sleep(10)
         let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
         let rules = config["configOverrides"][2].as_str().unwrap();
         let canonical_assigned = dunce::canonicalize(&assigned).unwrap();
+        let assigned_key = serde_json::to_string(canonical_assigned.to_str().unwrap()).unwrap();
+        let owned_key =
+            serde_json::to_string(dunce::canonicalize(&owned).unwrap().to_str().unwrap()).unwrap();
+        let sibling_key =
+            serde_json::to_string(dunce::canonicalize(&sibling).unwrap().to_str().unwrap())
+                .unwrap();
         assert!(rules.contains("extends=\":read-only\""));
         assert!(!rules.contains(":workspace"));
-        assert!(rules.contains(canonical_assigned.to_str().unwrap()));
-        assert!(rules.contains(owned.to_str().unwrap()));
-        assert!(!rules.contains(sibling.to_str().unwrap()));
+        assert!(rules.contains(&assigned_key));
+        assert!(rules.contains(&owned_key));
+        assert!(!rules.contains(&sibling_key));
         assert!(!rules.contains(":tmpdir"));
         #[cfg(unix)]
         {
@@ -9749,10 +9755,12 @@ time.sleep(10)
         )
         .unwrap();
         let overrides = profile["configOverrides"].as_array().unwrap();
+        let linked_key =
+            serde_json::to_string(dunce::canonicalize(&linked).unwrap().to_str().unwrap()).unwrap();
         assert!(overrides.iter().any(|value| {
-            value.as_str().is_some_and(|value| {
-                value.contains(dunce::canonicalize(&linked).unwrap().to_str().unwrap())
-            })
+            value
+                .as_str()
+                .is_some_and(|value| value.contains(&linked_key))
         }));
         assert!(overrides.iter().all(|value| !value
             .as_str()
