@@ -28,9 +28,16 @@
   import Markdown from './Markdown.svelte';
   import PlanPanel from './PlanPanel.svelte';
   import TasksPanel from './TasksPanel.svelte';
+  import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
   import { sessionTasks, TASK_TOOLS } from './lib/session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
-  import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
+  import {
+    acpPlanBackend,
+    acpPlans,
+    planKey,
+    type PlanChange,
+    type PlanScope,
+  } from './lib/acp-plans';
   import { updateReplayingAgentSessions } from './lib/agent-replay';
   import { isPlanTool } from './lib/plan-engine';
   import { openCodeSessionId, sameThreadId } from './lib/thread-id';
@@ -1489,7 +1496,7 @@
   let diffError = $state('');
   let selectedFilePath = $state<string | null>(null);
   type SideTab = 'tasks' | 'plan' | 'planhistory' | 'changes' | 'history' | 'ship';
-  let sideTab = $state<SideTab>('plan');
+  let sideTab = $state<SideTab>('tasks');
   let detailsOpen = $state(true);
   let diffRefresh = 0;
   let diffRevision = '';
@@ -1581,6 +1588,7 @@
       }
     }
     if (acpAgent && focusedPane === 'main') {
+      if (view === 'details' && !agentChangesOpen) sideTab = 'tasks';
       agentChangesOpen = view === 'details';
       if (agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
     }
@@ -1611,12 +1619,22 @@
     if (tab === 'changes' && acpAgent) void refreshAgentDiff();
   }
 
-  function revealMainPlan(scope: PlanScope, reason: string) {
+  function revealMainPlan(scope: PlanScope, reason: PlanChange['reason']) {
     if (!acpPlanScope || planKey(scope) !== planKey(acpPlanScope)) return;
-    if (!['proposed', 'questions', 'amended', 'checkpoint', 'done'].includes(reason)) return;
+    if (!revealsPlanReview(reason)) return;
     sideTab = 'plan';
     agentChangesOpen = true;
     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
+  }
+
+  function setSplitDetails(id: string, open: boolean) {
+    changesPanes = open
+      ? changesPanes.includes(id)
+        ? changesPanes
+        : [...changesPanes, id]
+      : changesPanes.filter((item) => item !== id);
+    if (id === focusedPane && window.matchMedia('(max-width: 850px)').matches)
+      mobileView = open ? 'details' : 'chat';
   }
 
   async function toggleChanges() {
@@ -1626,9 +1644,7 @@
         showShipRuns();
         return;
       }
-      changesPanes = changesPanes.includes(focusedPane)
-        ? changesPanes.filter((id) => id !== focusedPane)
-        : [...changesPanes, focusedPane];
+      setSplitDetails(focusedPane, !changesPanes.includes(focusedPane));
       return;
     }
     if (mainShipFallback) {
@@ -1636,15 +1652,10 @@
       return;
     }
     if (acpAgent) {
-      if (agentChangesOpen && activeSideTab === 'ship') {
-        sideTab = 'changes';
-        void refreshAgentDiff();
-        return;
-      }
+      if (!agentChangesOpen) sideTab = 'tasks';
       agentChangesOpen = !agentChangesOpen;
       if (window.matchMedia('(max-width: 850px)').matches)
         mobileView = agentChangesOpen ? 'details' : 'chat';
-      if (agentChangesOpen) void refreshAgentDiff();
       return;
     }
     toggleShipRuns();
@@ -13975,7 +13986,12 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
-                onnativeplan={(plan) => {
+                onnativeplan={(plan, live) => {
+                  if (revealsNativePlanReview(plan, nativePlan, live ?? false)) {
+                    sideTab = 'plan';
+                    agentChangesOpen = true;
+                    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
+                  }
                   nativePlan = plan;
                   if (!plan) {
                     nativePlanFeedback = '';
@@ -14163,9 +14179,7 @@
         activityReady={acpActivityReady}
         onstatus={updateAgentThreadStatus}
         onreplaychange={setAgentReplay}
-        onchanges={(id) => {
-          changesPanes = changesPanes.filter((item) => item !== id);
-        }}
+        onchanges={(id) => setSplitDetails(id, false)}
         {pendingCommands}
         oncommandstarted={(id) => {
           const next = { ...pendingCommands };
@@ -14255,7 +14269,7 @@
             class:active={activeSideTab === 'changes'}
             role="tab"
             aria-selected={activeSideTab === 'changes'}
-            onclick={toggleChanges}>Changes ({diffs.length})</button
+            onclick={() => switchSideTab('changes')}>Changes ({diffs.length})</button
           >{/if}{#if acpAgent && acpPlanHistory.length}<button
             class:active={activeSideTab === 'planhistory'}
             aria-current={activeSideTab === 'planhistory' ? 'page' : undefined}
