@@ -187,6 +187,12 @@ struct GuardedSession {
 #[derive(Clone, Default)]
 pub struct AgentWorktreeFence(Arc<Mutex<WorktreeFenceState>>);
 
+#[derive(Clone, Copy)]
+enum WorktreeFenceOperation {
+    Cleanup { stop_agents: bool },
+    Promotion,
+}
+
 impl AgentWorktreeFence {
     #[cfg(test)]
     fn record_native_update(&self, directory: &Path) -> Result<(), String> {
@@ -363,6 +369,42 @@ impl AgentWorktreeFence {
         stop_agents: bool,
         cleanup: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
+        self.with_operation(
+            agents,
+            directory,
+            expected_generation,
+            WorktreeFenceOperation::Cleanup { stop_agents },
+            cleanup,
+        )
+    }
+
+    fn promote<T>(
+        &self,
+        agents: &AgentManager,
+        directory: &Path,
+        promote: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_operation(
+            agents,
+            directory,
+            None,
+            WorktreeFenceOperation::Promotion,
+            promote,
+        )
+    }
+
+    fn with_operation<T>(
+        &self,
+        agents: &AgentManager,
+        directory: &Path,
+        expected_generation: Option<u64>,
+        operation: WorktreeFenceOperation,
+        cleanup: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let stop_agents = matches!(
+            operation,
+            WorktreeFenceOperation::Cleanup { stop_agents: true }
+        );
         let mut state = self.0.lock().map_err(|error| error.to_string())?;
         let generation = state
             .generations
@@ -382,10 +424,15 @@ impl AgentWorktreeFence {
         {
             return Err("An agent session is starting in this worktree.".into());
         }
-        let active = agents.sessions_blocking_cleanup_in(directory)?;
+        let (active, session_kind) = match operation {
+            WorktreeFenceOperation::Cleanup { .. } => {
+                (agents.sessions_blocking_cleanup_in(directory)?, "connected")
+            }
+            WorktreeFenceOperation::Promotion => (agents.active_sessions_in(directory)?, "active"),
+        };
         if !stop_agents && !active.is_empty() {
             return Err(format!(
-                "Worktree has connected agent sessions: {}.",
+                "Worktree has {session_kind} agent sessions: {}.",
                 active
                     .iter()
                     .map(|(agent, _, session)| format!("{agent}:{session}"))
@@ -437,7 +484,7 @@ pub(crate) fn promote_idle_worktree(app: &AppHandle, worktree: &Path) -> Result<
             }
             let fence = app.state::<AgentWorktreeFence>();
             let agents = app.state::<AgentManager>();
-            fence.cleanup(&agents, worktree, None, false, || {
+            fence.promote(&agents, worktree, || {
                 let cache = app
                     .path()
                     .app_cache_dir()
@@ -9052,6 +9099,18 @@ mod native_subagent_fence_tests {
             error,
             "Worktree has connected agent sessions: opencode:ses_open."
         );
+        let mut promoted = false;
+        let error = AgentWorktreeFence::default()
+            .promote(&agents, &directory, || {
+                promoted = true;
+                Ok(())
+            })
+            .expect_err("an active turn must also block promotion");
+        assert_eq!(
+            error,
+            "Worktree has active agent sessions: opencode:ses_open."
+        );
+        assert!(!promoted);
         assert!(!cleaned);
         assert_eq!(
             fs::read(&marker).expect("active worktree must remain"),
@@ -9090,6 +9149,14 @@ mod native_subagent_fence_tests {
                 .len(),
             1
         );
+        let mut promoted = false;
+        AgentWorktreeFence::default()
+            .promote(&agents, &directory, || {
+                promoted = true;
+                Ok(())
+            })
+            .expect("idle connected session must allow promotion");
+        assert!(promoted);
         let error = AgentWorktreeFence::default()
             .cleanup(&agents, &directory, None, false, || {
                 std::fs::remove_dir_all(&directory).expect("remove selected worktree");
@@ -9190,6 +9257,16 @@ mod native_subagent_fence_tests {
             cleanup_error,
             "An agent session is starting in this worktree."
         );
+        let mut promoted = false;
+        let error = fence
+            .promote(&agents, &directory, || {
+                promoted = true;
+                Ok(())
+            })
+            .expect_err("a starting session must also block promotion");
+        assert_eq!(error, "An agent session is starting in this worktree.");
+        assert!(!promoted);
+
         fence
             .record_native_update(&directory)
             .expect("late retired-parent spawn should advance the generation");
