@@ -131,3 +131,44 @@ await test('late pre-disconnect snapshots cannot restore the old child turn or f
   assert.equal(tasks.snapshot(scope).turnId, null);
   assert.equal(tasks.snapshot(scope).focus, null);
 });
+
+await test('new complete snapshots finish omitted children without changing other scopes', async () => {
+  const tasks = store();
+  const reconcile = createNativeTaskReconciler(tasks);
+  const sibling = { ...scope, sessionId: 'sibling' };
+  const foreign = { ...scope, directory: '/other', sessionId: 'foreign' };
+  await tasks.start(parent, 'parent-turn');
+  await reconcile('/repo', set(10, child(), child({ ...sibling, taskTurnId: 'sibling-turn' })));
+  await reconcile('/other', set(20, child({ ...foreign, taskTurnId: 'foreign-turn' })));
+  await Promise.all(
+    [parent, scope, sibling, foreign].map(async (target) => {
+      const snapshot = tasks.snapshot(target);
+      await tasks.report(target, {
+        turnId: snapshot.turnId,
+        expectedRevision: snapshot.revision,
+        tasks: [{ id: 'review', title: 'Review', status: 'in_progress' }],
+        focus: 'review',
+      });
+    }),
+  );
+  const retained = [parent, sibling, foreign].map((target) => tasks.snapshot(target));
+  const childTasks = tasks.snapshot(scope).tasks;
+  assert.equal(await reconcile('/repo', set(9)), false);
+  assert.equal(tasks.snapshot(scope).focus, 'review');
+  await reconcile('/repo', set(11, child({ ...sibling, taskTurnId: 'sibling-turn' })));
+  await tasks.reconcile(scope, null, tasks.snapshot(scope).revision);
+  assert.equal(tasks.snapshot(scope).turnId, null);
+  assert.equal(tasks.snapshot(scope).focus, null);
+  assert.deepEqual(tasks.snapshot(scope).tasks, childTasks);
+  assert.deepEqual(
+    [parent, sibling, foreign].map((target) => tasks.snapshot(target)),
+    retained,
+  );
+  assert.equal(await reconcile('/repo', set(10, child())), false);
+  assert.equal(tasks.snapshot(scope).turnId, null);
+  await reconcile('/repo', set(12));
+  assert.equal(tasks.snapshot(sibling).turnId, null);
+  assert.equal(tasks.snapshot(sibling).focus, null);
+  assert.deepEqual(tasks.snapshot(parent), retained[0]);
+  assert.deepEqual(tasks.snapshot(foreign), retained[2]);
+});

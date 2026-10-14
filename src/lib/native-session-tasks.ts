@@ -11,12 +11,30 @@ type NativeTaskStore = Pick<TaskStore, 'snapshot' | 'start'> & {
 
 export function createNativeTaskReconciler(store: NativeTaskStore) {
   const generations = new Map<string, number>();
+  const scopes = new Map<string, Map<string, TaskScope>>();
   let pending: Promise<unknown> = Promise.resolve();
   return (directory: string, observed: NativeSubagentSnapshotSet) => {
     const operation = pending
       .catch(() => undefined)
       .then(async () => {
         if (observed.generation < (generations.get(directory) ?? -1)) return false;
+        const current = new Map(
+          observed.subagents.map((child) => {
+            const scope = {
+              agent: child.agent,
+              directory: child.directory,
+              sessionId: child.sessionId,
+            };
+            return [JSON.stringify(scope), scope] as const;
+          }),
+        );
+        await Promise.all(
+          [...(scopes.get(directory)?.entries() ?? [])].map(async ([key, scope]) => {
+            if (current.has(key)) return;
+            const before = store.snapshot(scope);
+            if (before.turnId) await store.finish(scope, before.turnId, 'interrupted');
+          }),
+        );
         await Promise.all(
           observed.subagents.map(async (child) => {
             const scope = {
@@ -39,6 +57,7 @@ export function createNativeTaskReconciler(store: NativeTaskStore) {
             if (turn) await store.start(scope, turn);
           }),
         );
+        scopes.set(directory, current);
         generations.set(directory, observed.generation);
         return true;
       });
