@@ -122,22 +122,26 @@ impl NativeSubagentRegistry {
         session_id: &str,
         directory: PathBuf,
         can_cancel: bool,
-    ) {
-        self.0
-            .entry(session_id.to_string())
-            .and_modify(|entry| {
-                entry.parent_session_id = parent_session_id.to_string();
-                entry.directory = directory.clone();
-                entry.can_cancel |= can_cancel;
-            })
-            .or_insert_with(|| NativeSubagentState {
-                parent_session_id: parent_session_id.to_string(),
-                directory,
-                outcome: "working".into(),
-                can_cancel,
-                task_verified: false,
-                task_turn_id: None,
-            });
+    ) -> Result<(), String> {
+        if let Some(entry) = self.0.get_mut(session_id) {
+            if entry.parent_session_id != parent_session_id || entry.directory != directory {
+                return Err("Native child is already bound to another parent or directory.".into());
+            }
+            entry.can_cancel |= can_cancel;
+        } else {
+            self.0.insert(
+                session_id.to_string(),
+                NativeSubagentState {
+                    parent_session_id: parent_session_id.to_string(),
+                    directory,
+                    outcome: "working".into(),
+                    can_cancel,
+                    task_verified: false,
+                    task_turn_id: None,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn cancellation_eligible(&self, session_id: &str) -> Option<bool> {
@@ -162,10 +166,19 @@ impl NativeSubagentRegistry {
         }
     }
 
-    fn update(&mut self, session_id: &str, outcome: &str) {
-        let Some(entry) = self.0.get_mut(session_id) else {
-            return;
-        };
+    fn update(
+        &mut self,
+        parent_session_id: &str,
+        session_id: &str,
+        outcome: &str,
+    ) -> Result<(), String> {
+        let entry = self
+            .0
+            .get_mut(session_id)
+            .ok_or("Native child state was not registered.")?;
+        if entry.parent_session_id != parent_session_id {
+            return Err("Native child state came from a different parent.".into());
+        }
         entry.outcome = match outcome {
             "completed" | "failed" | "working" => outcome,
             "cancelled" => "interrupted",
@@ -175,6 +188,7 @@ impl NativeSubagentRegistry {
         if entry.outcome != "working" {
             entry.task_turn_id = None;
         }
+        Ok(())
     }
 
     fn active_in(&self, directory: &Path) -> Vec<String> {
@@ -1533,6 +1547,26 @@ impl PermissionState {
                 settlement_generation,
             },
         );
+    }
+
+    fn begin_native_cancel(&mut self, session_id: &str) {
+        self.canceling_sessions.insert(
+            session_id.to_string(),
+            CancelingSession {
+                turn_id: None,
+                settlement_generation: None,
+            },
+        );
+    }
+
+    fn end_native_cancel(&mut self, session_id: &str) {
+        if self
+            .canceling_sessions
+            .get(session_id)
+            .is_some_and(|canceling| canceling.turn_id.is_none())
+        {
+            self.canceling_sessions.remove(session_id);
+        }
     }
 
     fn acknowledge_prompt_settlement(&mut self, session_id: &str, turn_id: &str, generation: u64) {
@@ -3807,6 +3841,56 @@ mod interruption_report_tests {
     }
 
     #[test]
+    fn native_cancel_without_turn_fences_only_target_until_terminal() {
+        let mut state = PermissionState::default();
+        state.begin_native_cancel("target");
+        let mut resolved = Vec::new();
+
+        state
+            .record(
+                json!({"id":1,"params":{"sessionId":"target"}}),
+                1,
+                None,
+                |request_id| {
+                    resolved.push(request_id.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        state
+            .record(
+                json!({"id":2,"params":{"sessionId":"sibling"}}),
+                2,
+                None,
+                |request_id| {
+                    resolved.push(request_id.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resolved, [json!(1)]);
+        assert!(!state.pending.contains_key("1"));
+        assert!(state.pending.contains_key("2"));
+
+        state.end_native_cancel("target");
+        state
+            .record(
+                json!({"id":3,"params":{"sessionId":"target"}}),
+                3,
+                None,
+                |request_id| {
+                    resolved.push(request_id.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resolved, [json!(1)]);
+        assert!(state.pending.contains_key("3"));
+    }
+
+    #[test]
     fn first_seen_replacement_permission_is_assigned_to_the_active_turn() {
         let mut state = PermissionState::default();
         state.begin_cancel("target", Some("turn-one"));
@@ -4669,6 +4753,23 @@ fn register_native_task_connections(
     Ok(())
 }
 
+fn bind_session_directory(
+    directories: &mut HashMap<String, PathBuf>,
+    session_id: &str,
+    directory: PathBuf,
+) -> Result<(), String> {
+    if directories
+        .get(session_id)
+        .is_some_and(|existing| existing != &directory)
+    {
+        return Err("Agent session is already bound to another directory.".into());
+    }
+    directories
+        .entry(session_id.to_string())
+        .or_insert(directory);
+    Ok(())
+}
+
 fn register_session(
     manager: &AgentManager,
     agent: &str,
@@ -4708,11 +4809,12 @@ fn register_session(
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".to_string())?;
-    runtime
+    let mut directories = runtime
         .session_directories
         .lock()
-        .map_err(|error| error.to_string())?
-        .insert(session_id.to_string(), directory);
+        .map_err(|error| error.to_string())?;
+    bind_session_directory(&mut directories, session_id, directory)?;
+    drop(directories);
     runtime
         .session_profiles
         .lock()
@@ -4768,7 +4870,7 @@ fn record_native_subagent_update(
                     .0
                     .get(parent_id)
                     .is_some_and(|parent| parent.task_turn_id.is_some());
-            native.spawn(parent_id, child_id, directory.clone(), can_cancel);
+            native.spawn(parent_id, child_id, directory.clone(), can_cancel)?;
             native.task_scope(child_id, agent == "opencode", live);
             let provider_id = (agent == "opencode").then(|| {
                 runtime
@@ -4814,7 +4916,7 @@ fn record_native_subagent_update(
                 .native_subagents
                 .lock()
                 .map_err(|error| error.to_string())?;
-            native.update(child_id, outcome);
+            native.update(parent_id, child_id, outcome)?;
             if outcome == "working" {
                 let live = native.0.get(child_id).is_some_and(|child| {
                     live_sessions.contains(&child.parent_session_id)
@@ -4825,8 +4927,17 @@ fn record_native_subagent_update(
                 });
                 native.task_scope(child_id, agent == "opencode", live);
             }
-            let generation = fence.generations.entry(directory).or_default();
+            let generation = fence.generations.entry(directory.clone()).or_default();
             *generation = generation.saturating_add(1);
+            if matches!(outcome, "completed" | "failed" | "cancelled") {
+                app.state::<crate::browser_agent::BrowserManager>()
+                    .settle_native_child(agent, &directory, parent_id, child_id);
+                runtime
+                    .permission_state
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .end_native_cancel(child_id);
+            }
             Ok(())
         }
         _ => Ok(()),
@@ -7933,6 +8044,9 @@ fn cancel_session_after_dispatch(
             &session_id,
             turn_id,
         );
+        if native_cancel && !plan.await_settlement {
+            permission_state.begin_native_cancel(&session_id);
+        }
         drop(cancelled_prompts);
         drop(prompts);
         (plan, permission_state)
@@ -9333,7 +9447,8 @@ time.sleep(10)
             .native_subagents
             .lock()
             .unwrap()
-            .spawn(&session, &child, worktree.clone(), false);
+            .spawn(&session, &child, worktree.clone(), false)
+            .unwrap();
         assert_eq!(
             manager.stop_owner(&worktree, owner).unwrap_err(),
             "Agent run still has an active native subagent."
@@ -9343,7 +9458,8 @@ time.sleep(10)
             .native_subagents
             .lock()
             .unwrap()
-            .update(&child, "completed");
+            .update(&session, &child, "completed")
+            .unwrap();
 
         manager.stop_owner(&worktree, owner).unwrap();
 
@@ -10106,7 +10222,9 @@ mod native_subagent_fence_tests {
         let directory = PathBuf::from("/repo");
         let mut state = WorktreeFenceState::default();
         let mut children = NativeSubagentRegistry::default();
-        children.spawn("parent", "child", directory.clone(), false);
+        children
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap();
         children.task_scope("child", true, true);
         let live = children.snapshots("opencode", CapabilityProfile::Build, &directory);
         let before = state.native_snapshot_generation(&directory, &live);
@@ -10127,7 +10245,9 @@ mod native_subagent_fence_tests {
         let fence = AgentWorktreeFence::default();
         let directory = PathBuf::from("/repo");
         let mut children = NativeSubagentRegistry::default();
-        children.spawn("parent", "child", directory.clone(), false);
+        children
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap();
         children.task_scope("child", true, true);
         let native = Mutex::new(children);
         let alive = AtomicBool::new(true);
@@ -10151,7 +10271,9 @@ mod native_subagent_fence_tests {
     #[test]
     fn native_task_turn_is_own_live_scope_and_settles_before_reopening() {
         let mut registry = NativeSubagentRegistry::default();
-        registry.spawn("parent", "child", PathBuf::from("/repo"), false);
+        registry
+            .spawn("parent", "child", PathBuf::from("/repo"), false)
+            .unwrap();
         registry.task_scope("child", true, false);
         assert!(registry.0["child"].task_turn_id.is_none());
         registry.task_scope("child", true, true);
@@ -10161,17 +10283,19 @@ mod native_subagent_fence_tests {
             registry.0["child"].task_turn_id.as_deref(),
             Some(turn.as_str())
         );
-        registry.update("child", "completed");
+        registry.update("parent", "child", "completed").unwrap();
         assert!(registry.0["child"].task_turn_id.is_none());
-        registry.update("child", "working");
+        registry.update("parent", "child", "working").unwrap();
         registry.task_scope("child", true, true);
         assert_ne!(
             registry.0["child"].task_turn_id.as_deref(),
             Some(turn.as_str())
         );
-        registry.update("child", "cancelled");
+        registry.update("parent", "child", "cancelled").unwrap();
         assert!(registry.0["child"].task_turn_id.is_none());
-        registry.spawn("parent", "observed", PathBuf::from("/repo"), false);
+        registry
+            .spawn("parent", "observed", PathBuf::from("/repo"), false)
+            .unwrap();
         registry.task_scope("observed", false, true);
         assert!(registry.0["observed"].task_turn_id.is_none());
     }
@@ -10180,9 +10304,15 @@ mod native_subagent_fence_tests {
     fn null_turn_cancels_only_the_live_registered_capable_child_once() {
         let mut registry = NativeSubagentRegistry::default();
         let directory = PathBuf::from("/repo");
-        registry.spawn("parent", "target", directory.clone(), true);
-        registry.spawn("parent", "sibling", directory.clone(), true);
-        registry.spawn("parent", "observed", directory, false);
+        registry
+            .spawn("parent", "target", directory.clone(), true)
+            .unwrap();
+        registry
+            .spawn("parent", "sibling", directory.clone(), true)
+            .unwrap();
+        registry
+            .spawn("parent", "observed", directory, false)
+            .unwrap();
 
         assert!(native_cancel_eligible(&registry, "target", None).unwrap());
         assert!(!native_cancel_eligible(&registry, "parent", None).unwrap());
@@ -10200,11 +10330,37 @@ mod native_subagent_fence_tests {
         assert_eq!(registry.0["sibling"].outcome, "working");
         assert!(!registry.0.contains_key("parent"));
 
-        registry.update("target", "cancelled");
+        registry.update("parent", "target", "cancelled").unwrap();
         assert_eq!(registry.0["target"].outcome, "interrupted");
         assert!(native_cancel_eligible(&registry, "target", None).is_err());
         assert!(native_cancel_eligible(&registry, "sibling", None).unwrap());
         assert_eq!(registry.0["sibling"].outcome, "working");
+    }
+
+    #[test]
+    fn native_child_binding_rejects_reparenting_and_directory_change() {
+        let directory = PathBuf::from("/repo");
+        let mut registry = NativeSubagentRegistry::default();
+        registry
+            .spawn("parent", "child", directory.clone(), true)
+            .unwrap();
+
+        assert!(registry
+            .spawn("sibling", "child", directory.clone(), true)
+            .is_err());
+        assert!(registry
+            .spawn("parent", "child", PathBuf::from("/elsewhere"), true)
+            .is_err());
+        assert!(registry.update("sibling", "child", "completed").is_err());
+        assert_eq!(registry.0["child"].parent_session_id, "parent");
+        assert_eq!(registry.0["child"].directory, directory);
+        assert_eq!(registry.0["child"].outcome, "working");
+
+        let mut directories = HashMap::from([("child".into(), PathBuf::from("/repo"))]);
+        assert!(
+            bind_session_directory(&mut directories, "child", PathBuf::from("/elsewhere")).is_err()
+        );
+        assert_eq!(directories["child"], PathBuf::from("/repo"));
     }
 
     #[test]
@@ -10215,7 +10371,9 @@ mod native_subagent_fence_tests {
         let nested = outer.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         let mut registry = NativeSubagentRegistry::default();
-        registry.spawn("parent", "child", nested.clone(), false);
+        registry
+            .spawn("parent", "child", nested.clone(), false)
+            .unwrap();
 
         assert_eq!(registry.active_in(&outer), vec!["child"]);
 
@@ -10450,10 +10608,14 @@ mod native_subagent_fence_tests {
         let mut registry = NativeSubagentRegistry::default();
         let directory = PathBuf::from("/worktree");
 
-        registry.spawn("retired", "late-child", directory.clone(), false);
+        registry
+            .spawn("retired", "late-child", directory.clone(), false)
+            .unwrap();
 
         assert_eq!(registry.active_in(&directory), vec!["late-child"]);
-        registry.update("late-child", "completed");
+        registry
+            .update("retired", "late-child", "completed")
+            .unwrap();
         assert!(registry.active_in(&directory).is_empty());
     }
 

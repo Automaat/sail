@@ -314,6 +314,19 @@ impl BrowserManager {
         }
     }
 
+    pub fn settle_native_child(&self, agent: &str, directory: &Path, parent: &str, child: &str) {
+        if let Ok(mut clients) = self.0.clients.lock() {
+            for client in clients.values_mut().filter(|client| {
+                client.agent.as_deref() == Some(agent)
+                    && client.directory == directory
+                    && (client.session.as_deref() == Some(parent)
+                        || client.native_children.contains_key(parent))
+            }) {
+                client.native_children.remove(child);
+            }
+        }
+    }
+
     pub fn set_unattributed_native_activity(
         &self,
         agent: &str,
@@ -2908,6 +2921,52 @@ mod native_task_identity_tests {
             resolve_task_session(&clients["source"], None).unwrap(),
             "parent"
         );
+    }
+
+    #[test]
+    fn native_child_and_activity_lifecycles_reopen_only_the_bound_parent() {
+        let manager = BrowserManager::default();
+        let mut clients = manager.0.clients.lock().unwrap();
+        clients.insert("source".into(), client("claude"));
+        let mut sibling = client("claude");
+        sibling.session = Some("sibling".into());
+        clients.insert("sibling".into(), sibling);
+        clients.insert("other-agent".into(), client("codex"));
+        drop(clients);
+
+        manager.register_native_child("claude", Path::new("/repo"), "parent", "child", None);
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "agent-tool",
+            true,
+        );
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "agent-tool",
+            false,
+        );
+        assert!(resolve_task_session(&manager.0.clients.lock().unwrap()["source"], None).is_err());
+
+        manager.settle_native_child("claude", Path::new("/repo"), "sibling", "child");
+        assert!(resolve_task_session(&manager.0.clients.lock().unwrap()["source"], None).is_err());
+        manager.settle_native_child("claude", Path::new("/repo"), "parent", "child");
+
+        let clients = manager.0.clients.lock().unwrap();
+        assert_eq!(
+            resolve_task_session(&clients["source"], None).unwrap(),
+            "parent"
+        );
+        for key in ["sibling", "other-agent"] {
+            assert!(clients[key].native_children.is_empty());
+            assert_eq!(
+                resolve_task_session(&clients[key], None).unwrap(),
+                clients[key].session.as_deref().unwrap()
+            );
+        }
     }
 
     #[test]
