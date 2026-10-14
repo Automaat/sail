@@ -13,6 +13,7 @@ await test(
   { skip: process.platform === 'win32' },
   async (context) => {
     const root = mkdtempSync(join(tmpdir(), 'sail-owned-command-'));
+    context.after(() => rmSync(root, { recursive: true, force: true }));
     const pidFile = join(root, 'descendant.pid');
     const unrelated = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       stdio: 'ignore',

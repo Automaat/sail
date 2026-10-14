@@ -18,6 +18,15 @@ import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { e2eContextService, e2eIdentity } from './e2e-identity.mjs';
+import { sweepStateRoots } from './e2e-state.mjs';
+import {
+  buildIdentifierKey,
+  listProcessCommands,
+  removeIdleBuildData,
+  removeRunData,
+  sweepRunData,
+  systemRunDataRoots,
+} from './native-app-data.mjs';
 import { runOwnedCommand } from './native-test-process.mjs';
 import {
   artifactKey,
@@ -35,8 +44,9 @@ const cancel = () => {
   cancelled = true;
   cancellation.abort();
 };
-process.once('SIGINT', cancel);
-process.once('SIGTERM', cancel);
+process.on('SIGINT', cancel);
+process.on('SIGTERM', cancel);
+process.on('SIGHUP', cancel);
 
 function command(program, args, options = {}) {
   const result = spawnSync(program, args, { cwd: checkout, encoding: 'utf8', ...options });
@@ -192,6 +202,11 @@ function prepareApp(source, attempt, env) {
     plist,
   ]);
   command('/usr/libexec/PlistBuddy', ['-c', `Set :CFBundleName ${identity.productName}`, plist]);
+  command('/usr/libexec/PlistBuddy', [
+    '-c',
+    `Add :${buildIdentifierKey} string ${identifier(source)}`,
+    plist,
+  ]);
   const template = readFileSync(
     join(checkout, 'src-tauri/macos/dev.smykla.sai-harness.context-supervisor.plist'),
     'utf8',
@@ -316,6 +331,18 @@ async function main() {
     process.exitCode = 1;
     return;
   }
+  const dataRoots = systemRunDataRoots();
+  try {
+    const data = sweepRunData(dataRoots, listProcessCommands);
+    const state = sweepStateRoots(tmpdir());
+    const removed = [...data.removed, ...state.removed];
+    process.stdout.write(`Removed ${removed.length} folders left by earlier native runs\n`);
+    const failed = [...data.failed, ...state.failed];
+    if (failed.length > 0)
+      process.stderr.write(`Could not remove folders left by earlier runs: ${failed.join(', ')}\n`);
+  } catch (error) {
+    process.stderr.write(`Could not remove folders left by earlier runs: ${error.message}\n`);
+  }
   let result = { verdict: 'SETUP_FAILED' };
   const runAttempt = async (index) => {
     if (cancelled || index > limit) return;
@@ -323,10 +350,14 @@ async function main() {
     mkdirSync(attempt);
     const env = nativeEnvironment(attempt, checkout, process.env, await availablePort());
     let phase = 'artifact';
+    let runIdentifier;
+    let buildIdentifier;
     try {
       const built = await artifact(canonical, requirements, attempt);
+      buildIdentifier = identifier(built.app);
       phase = 'signing and identity';
       const { app, identity } = prepareApp(built.app, attempt, env);
+      runIdentifier = identity.identifier;
       const fixtureNames = [
         'TMPDIR',
         'SAIL_E2E_CONFIG_DIR',
@@ -388,7 +419,25 @@ async function main() {
       };
       writeFileSync(join(attempt, 'failure.json'), JSON.stringify(result, null, 2));
     } finally {
-      if (env.SAIL_E2E_BINARY) await stopApp(env.SAIL_E2E_BINARY);
+      try {
+        if (env.SAIL_E2E_BINARY) await stopApp(env.SAIL_E2E_BINARY);
+      } finally {
+        sweepStateRoots(env.TMPDIR);
+        const leftovers = runIdentifier ? await removeRunData(runIdentifier, dataRoots) : [];
+        if (buildIdentifier) {
+          try {
+            leftovers.push(
+              ...(await removeIdleBuildData(buildIdentifier, dataRoots, listProcessCommands)),
+            );
+          } catch (error) {
+            leftovers.push(buildIdentifier);
+            process.stderr.write(`Could not remove build identity data: ${error.message}\n`);
+          }
+        }
+        result.leftovers = leftovers;
+        if (leftovers.length > 0)
+          process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);
+      }
     }
     if (result.verdict === 'SETUP_FAILED') return runAttempt(index + 1);
   };
