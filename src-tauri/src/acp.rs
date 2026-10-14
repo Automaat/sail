@@ -771,8 +771,9 @@ fn mcp_server(config: &crate::browser_agent::McpConfig) -> Value {
 }
 
 fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]) -> Value {
-    let mut params = json!({"cwd":cwd,"mcpServers":servers});
-    if let Some(overlay) = crate::git_overlay::registered_directory(Path::new(cwd)) {
+    let directory = canonical_directory(cwd);
+    let mut params = json!({"cwd":directory.to_string_lossy(),"mcpServers":servers});
+    if let Some(overlay) = crate::git_overlay::registered_directory(&directory) {
         params["additionalDirectories"] = json!([overlay]);
     }
     if let Some(session_id) = session_id {
@@ -980,8 +981,8 @@ impl CodexWorkspaceAccess {
 
     fn profile_config(&self) -> Result<String, String> {
         self.validate(None)?;
-        let mut rules = Vec::new();
-        for directory in &self.directories {
+        let mut rules = vec!["\":workspace_roots\"={\".\"=\"write\"}".to_string()];
+        for directory in self.directories.iter().skip(1) {
             let path = directory
                 .path
                 .to_str()
@@ -1022,9 +1023,7 @@ fn per_load_mcp() -> bool {
 }
 
 fn canonical_directory(cwd: &str) -> PathBuf {
-    PathBuf::from(cwd)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(cwd))
+    dunce::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd))
 }
 
 /// Returns the parameters to send for a restored session, reusing the ones
@@ -9548,7 +9547,10 @@ time.sleep(10)
         let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
         let rules = config["configOverrides"][2].as_str().unwrap();
         assert!(rules.contains("extends=\":read-only\""));
-        assert!(!rules.contains(":workspace"));
+        assert!(rules.contains("\":workspace_roots\"={\".\"=\"write\"}"));
+        assert!(!rules.contains(assigned.to_str().unwrap()));
+        assert!(rules.contains(owned.to_str().unwrap()));
+        assert!(!rules.contains("extends=\":workspace\""));
         assert!(!rules.contains(sibling.to_str().unwrap()));
         assert!(!rules.contains(":tmpdir"));
         #[cfg(unix)]
@@ -9560,6 +9562,10 @@ time.sleep(10)
             assert_eq!(
                 access.profile_config().unwrap(),
                 aliased.profile_config().unwrap()
+            );
+            assert_eq!(
+                session_request_params(alias.to_str().unwrap(), None, &[])["cwd"],
+                json!(assigned.canonicalize().unwrap())
             );
             access.validate(Some(alias.to_str().unwrap())).unwrap();
             assert!(CodexWorkspaceAccess::capture(&assigned, &[alias])
@@ -9733,6 +9739,17 @@ time.sleep(10)
         )
         .unwrap();
         let overrides = profile["configOverrides"].as_array().unwrap();
+        assert!(overrides.iter().any(|value| {
+            value.as_str().is_some_and(|value| {
+                value.contains("\":workspace_roots\"={\".\"=\"write\"}")
+                    && !value.contains(
+                        &serde_json::to_string(
+                            &dunce::canonicalize(&linked).unwrap().to_string_lossy(),
+                        )
+                        .unwrap(),
+                    )
+            })
+        }));
         assert!(overrides.iter().all(|value| !value
             .as_str()
             .is_some_and(|value| value.contains(&common.to_string_lossy().to_string()))));
