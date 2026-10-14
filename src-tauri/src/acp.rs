@@ -4617,7 +4617,9 @@ fn claude_native_activity_update(
             "state":state
         })
     } else {
-        if update.get("subagent").and_then(Value::as_bool) != Some(true) {
+        if update.get("subagent").and_then(Value::as_bool) != Some(true)
+            && !claude_adapter_subagent_signature(update)
+        {
             return None;
         }
         let task = update
@@ -4634,6 +4636,27 @@ fn claude_native_activity_update(
         })
     };
     Some(json!({"method":"session/update","params":{"sessionId":parent,"update":normalized}}))
+}
+
+fn claude_adapter_subagent_signature(update: &Value) -> bool {
+    let name = update.get("name").and_then(Value::as_str);
+    let adapter_name = update
+        .pointer("/_meta/claudeCode/toolName")
+        .and_then(Value::as_str);
+    if name != adapter_name || !matches!(name, Some("Agent" | "Task")) {
+        return false;
+    }
+    let Some(input) = update.get("rawInput").and_then(Value::as_object) else {
+        return false;
+    };
+    input
+        .get("subagent_type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !kind.trim().is_empty())
+        && input
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .is_some()
 }
 
 fn native_activity_fence(update: &Value) -> Option<(&str, bool)> {
@@ -11208,6 +11231,105 @@ mod capability_profile_tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn claude_adapter_agent_signature_becomes_observed_native_child_updates() {
+        let started = json!({
+            "method":"session/update",
+            "params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call",
+                "toolCallId":"toolu_01SP5UF44Tk2e4NNKGFz9Xua",
+                "name":"Agent",
+                "title":"Native child task identity",
+                "status":"pending",
+                "rawInput":{
+                    "description":"Native child task identity",
+                    "subagent_type":"general-purpose",
+                    "run_in_background":false,
+                    "prompt":"Call Sail sail_tasks_read."
+                },
+                "_meta":{"claudeCode":{"toolName":"Agent"}}
+            }}
+        });
+        let child = "parent:claude-subagent:toolu_01SP5UF44Tk2e4NNKGFz9Xua";
+
+        let normalized = claude_native_activity_update(&started, |_, _| false).unwrap();
+        assert_eq!(
+            normalized.pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_spawned",
+                "subagentSessionId":child,
+                "name":"Native child task identity",
+                "task":"Native child task identity"
+            }))
+        );
+
+        let settled = json!({
+            "method":"session/update",
+            "params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call_update",
+                "toolCallId":"toolu_01SP5UF44Tk2e4NNKGFz9Xua",
+                "status":"completed"
+            }}
+        });
+        assert!(
+            claude_native_activity_update(&settled, |parent, candidate| {
+                parent == "parent" && candidate == child
+            })
+            .is_some()
+        );
+        assert!(claude_native_activity_update(&settled, |_, _| false).is_none());
+    }
+
+    #[test]
+    fn claude_adapter_agent_signature_rejects_malformed_and_generic_tools() {
+        let signature = || {
+            json!({
+                "method":"session/update",
+                "params":{"sessionId":"parent","update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":"toolu_child",
+                    "name":"Agent",
+                    "status":"pending",
+                    "rawInput":{
+                        "subagent_type":"general-purpose",
+                        "run_in_background":false
+                    },
+                    "_meta":{"claudeCode":{"toolName":"Agent"}}
+                }}
+            })
+        };
+        let rejects = |message: &Value| {
+            assert!(claude_native_activity_update(message, |_, _| false).is_none())
+        };
+
+        let mut message = signature();
+        message["params"]["update"]["name"] = json!("Bash");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]["_meta"]["claudeCode"]["toolName"] = json!("Bash");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]["rawInput"]["subagent_type"] = json!("");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]["rawInput"]["run_in_background"] = json!("false");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]["toolCallId"] = json!(" ");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]
+            .as_object_mut()
+            .unwrap()
+            .remove("_meta");
+        rejects(&message);
     }
 
     #[test]
