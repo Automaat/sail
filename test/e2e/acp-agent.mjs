@@ -547,6 +547,45 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    const reportingFixture = sessions.get(sessionId);
+    if (text.startsWith('Task reporting fixture:')) {
+      reportingFixture.reportingMode = text.split(': ')[1];
+      const guidance = message.params.prompt.some((part) =>
+        part.text?.startsWith('Sail Tasks: For this turn'),
+      );
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: guidance ? 'Task guidance received.' : 'Task guidance missing.',
+        },
+      });
+      if (reportingFixture.reportingMode === 'interrupted') {
+        send({ id: message.id, result: { stopReason: 'cancelled' } });
+      } else if (reportingFixture.reportingMode === 'failed') {
+        send({ id: message.id, error: { code: -1, message: 'Reporting fixture failed' } });
+      } else {
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }
+      continue;
+    }
+    if (text.startsWith('Sail did not receive a successful task report')) {
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'One task correction received.' },
+      });
+      if (reportingFixture.reportingMode === 'recover') {
+        const server = reportingFixture.mcpServers.find((item) => item.name === 'sail-browser');
+        reportSessionTasks(server, (result) => {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        });
+      } else send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Report session tasks') {
       const server = sessions
         .get(sessionId)
