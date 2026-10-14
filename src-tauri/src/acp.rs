@@ -989,8 +989,8 @@ impl CodexWorkspaceAccess {
 
     fn profile_config(&self) -> Result<String, String> {
         self.validate(None)?;
-        let mut rules = vec!["\":workspace_roots\"={\".\"=\"write\"}".to_string()];
-        for directory in self.directories.iter().skip(1) {
+        let mut rules = Vec::new();
+        for directory in &self.directories {
             let path = directory
                 .path
                 .to_str()
@@ -9553,10 +9553,9 @@ time.sleep(10)
         let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
         let rules = config["configOverrides"][2].as_str().unwrap();
         assert!(rules.contains("extends=\":read-only\""));
-        assert!(rules.contains("\":workspace_roots\"={\".\"=\"write\"}"));
-        assert!(!rules.contains(assigned.to_str().unwrap()));
+        assert!(!rules.contains(":workspace"));
+        assert!(rules.contains(assigned.to_str().unwrap()));
         assert!(rules.contains(owned.to_str().unwrap()));
-        assert!(!rules.contains("extends=\":workspace\""));
         assert!(!rules.contains(sibling.to_str().unwrap()));
         assert!(!rules.contains(":tmpdir"));
         #[cfg(unix)]
@@ -9751,13 +9750,7 @@ time.sleep(10)
         let overrides = profile["configOverrides"].as_array().unwrap();
         assert!(overrides.iter().any(|value| {
             value.as_str().is_some_and(|value| {
-                value.contains("\":workspace_roots\"={\".\"=\"write\"}")
-                    && !value.contains(
-                        &serde_json::to_string(
-                            &dunce::canonicalize(&linked).unwrap().to_string_lossy(),
-                        )
-                        .unwrap(),
-                    )
+                value.contains(linked.canonicalize().unwrap().to_str().unwrap())
             })
         }));
         assert!(overrides.iter().all(|value| !value
