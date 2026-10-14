@@ -9552,9 +9552,10 @@ time.sleep(10)
             .contains("outside"));
         let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
         let rules = config["configOverrides"][2].as_str().unwrap();
+        let canonical_assigned = dunce::canonicalize(&assigned).unwrap();
         assert!(rules.contains("extends=\":read-only\""));
         assert!(!rules.contains(":workspace"));
-        assert!(rules.contains(assigned.to_str().unwrap()));
+        assert!(rules.contains(canonical_assigned.to_str().unwrap()));
         assert!(rules.contains(owned.to_str().unwrap()));
         assert!(!rules.contains(sibling.to_str().unwrap()));
         assert!(!rules.contains(":tmpdir"));
@@ -9570,11 +9571,11 @@ time.sleep(10)
             );
             assert_eq!(
                 session_request_params(alias.to_str().unwrap(), None, &[])["cwd"],
-                json!(assigned.canonicalize().unwrap())
+                json!(canonical_assigned)
             );
             assert_eq!(
                 session_list_params(&canonical_directory(alias.to_str().unwrap()), Some("next")),
-                json!({"cwd": assigned.canonicalize().unwrap(), "cursor": "next"})
+                json!({"cwd": canonical_assigned, "cursor": "next"})
             );
             access.validate(Some(alias.to_str().unwrap())).unwrap();
             assert!(CodexWorkspaceAccess::capture(&assigned, &[alias])
@@ -9750,7 +9751,7 @@ time.sleep(10)
         let overrides = profile["configOverrides"].as_array().unwrap();
         assert!(overrides.iter().any(|value| {
             value.as_str().is_some_and(|value| {
-                value.contains(linked.canonicalize().unwrap().to_str().unwrap())
+                value.contains(dunce::canonicalize(&linked).unwrap().to_str().unwrap())
             })
         }));
         assert!(overrides.iter().all(|value| !value
