@@ -198,6 +198,37 @@ impl NativeSubagentRegistry {
         )
     }
 
+    fn task_connections(&self) -> HashMap<String, NativeSubagentState> {
+        let mut connected = self
+            .0
+            .iter()
+            .filter(|(_, entry)| Self::is_live(entry))
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<HashSet<_>>();
+        loop {
+            let previous = connected.len();
+            for session_id in connected.clone() {
+                let Some(parent) = self
+                    .0
+                    .get(&session_id)
+                    .map(|entry| &entry.parent_session_id)
+                    .filter(|parent| self.0.contains_key(*parent))
+                else {
+                    continue;
+                };
+                connected.insert(parent.clone());
+            }
+            if connected.len() == previous {
+                break;
+            }
+        }
+        self.0
+            .iter()
+            .filter(|(session_id, _)| connected.contains(*session_id))
+            .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
+            .collect()
+    }
+
     fn involves_live_work(&self, session_id: &str) -> bool {
         self.0.iter().any(|(id, entry)| {
             Self::is_live(entry) && (id == session_id || entry.parent_session_id == session_id)
@@ -5057,8 +5088,7 @@ fn register_native_task_connections(
         .native_subagents
         .lock()
         .map_err(|error| error.to_string())?
-        .0
-        .clone();
+        .task_connections();
     for _ in 0..children.len() {
         for (child_id, child) in &children {
             let provider_id = (runtime.agent == "opencode").then(|| {
@@ -11587,6 +11617,39 @@ mod native_subagent_fence_tests {
             .unwrap();
         registry.task_scope("observed", false, true);
         assert!(registry.0["observed"].task_turn_id.is_none());
+    }
+
+    #[test]
+    fn settled_children_do_not_restrict_restored_parent_tasks() {
+        for outcome in ["completed", "failed", "cancelled"] {
+            let mut registry = NativeSubagentRegistry::default();
+            registry
+                .spawn("parent", "child", PathBuf::from("/repo"), false)
+                .unwrap();
+            registry.update("parent", "child", outcome).unwrap();
+
+            assert!(registry.task_connections().is_empty(), "{outcome}");
+        }
+    }
+
+    #[test]
+    fn live_nested_child_restores_its_terminal_ancestor() {
+        let mut registry = NativeSubagentRegistry::default();
+        registry
+            .spawn("parent", "child", PathBuf::from("/repo"), false)
+            .unwrap();
+        registry
+            .spawn("child", "nested", PathBuf::from("/repo"), false)
+            .unwrap();
+        registry.update("parent", "child", "completed").unwrap();
+
+        let connected = registry.task_connections();
+        assert_eq!(connected.len(), 2);
+        assert!(connected.contains_key("child"));
+        assert!(connected.contains_key("nested"));
+
+        registry.update("child", "nested", "completed").unwrap();
+        assert!(registry.task_connections().is_empty());
     }
 
     #[test]
