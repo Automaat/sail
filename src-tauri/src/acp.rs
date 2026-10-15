@@ -1893,16 +1893,33 @@ impl Connection {
         if idle && requests_idle && subagents.active_in(&self.worktree).is_empty() {
             let child_id = self.child.lock().map_err(|error| error.to_string())?.id();
             let _pause = PausedAgent::new(child_id)?;
+            #[cfg(unix)]
+            let scratch = self
+                .runtime_scratch
+                .lock()
+                .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            let owned_temp = scratch.as_ref().map(|scratch| scratch.path().join("tmp"));
+            #[cfg(not(unix))]
+            let owned_temp: Option<PathBuf> = None;
             if runtime_has_live_children(
                 child_id,
-                self._storage_lease
-                    .as_ref()
-                    .map(|lease| lease.temp_directory()),
+                owned_temp.as_deref().or_else(|| {
+                    self._storage_lease
+                        .as_ref()
+                        .map(|lease| lease.temp_directory())
+                }),
             ) {
                 return Ok(());
             }
             if let Some(lease) = &self._storage_lease {
                 lease.clear_turn_temp()?;
+            }
+            #[cfg(unix)]
+            if let Some(scratch) = scratch.as_ref() {
+                scratch
+                    .clear_turn_temp()
+                    .map_err(|error| error.to_string())?;
             }
             temp_gate.pending = false;
         }
@@ -2387,6 +2404,8 @@ fn runtime_environment(
     runtime_scratch: Option<&Path>,
     shared_build_directory: Option<&Path>,
 ) -> Vec<(&'static str, PathBuf)> {
+    let owned_temp = runtime_scratch.map(|scratch| scratch.join("tmp"));
+    let temp_directory = owned_temp.as_deref().unwrap_or(temp_directory);
     let mut environment = crate::acp_terminal::terminal_environment(data_directory, temp_directory);
     let shared_download_cache = data_directory
         .parent()
@@ -10056,9 +10075,16 @@ time.sleep(10)
         );
         Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
 
+        let owned = crate::scratch_cleanup::OwnedRuntimeScratch::create().unwrap();
+        let owned_artifact = owned.path().join("tmp/artifact");
+        let build_artifact = owned.path().join("build/artifact");
+        std::fs::write(&owned_artifact, "retain").unwrap();
+        std::fs::write(&build_artifact, "retain").unwrap();
+        *runtime.runtime_scratch.lock().unwrap() = Some(owned);
         runtime.record_process_cleanup("session", false).unwrap();
         runtime.clear_idle_temp(false).unwrap();
         assert!(artifact.exists());
+        assert!(owned_artifact.exists());
         assert!(
             crate::worktree_storage::cleanup_status(&scratch.join("cache"))
                 .iter()
@@ -10068,6 +10094,8 @@ time.sleep(10)
         runtime.record_process_cleanup("session", true).unwrap();
         runtime.clear_idle_temp(false).unwrap();
         assert!(!artifact.exists());
+        assert!(!owned_artifact.exists());
+        assert!(build_artifact.exists());
         runtime.stop_child().unwrap();
         drop(runtime);
         std::fs::remove_dir_all(scratch).unwrap();
@@ -10533,6 +10561,20 @@ time.sleep(10)
     }
 
     #[test]
+    fn runtime_temp_environment_ignores_long_storage_paths() {
+        let data = Path::new("/private/tmp").join("terminal-worktrees".repeat(16));
+        let legacy = data.join("turn-temp/run-long");
+        let scratch = Path::new("/private/tmp/sail-runtime-fixture");
+        let environment = runtime_environment(&data, &legacy, Some(scratch), None);
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            assert!(environment.contains(&(name, scratch.join("tmp"))));
+        }
+        assert!(environment.contains(&("GOTMPDIR", scratch.join("tmp/go-tmp"))));
+        let fallback = runtime_environment(&data, &legacy, None, None);
+        assert!(fallback.contains(&("TMPDIR", legacy)));
+    }
+
+    #[test]
     fn runtime_keys_and_build_caches_are_private_per_worktree() {
         let scratch = scratch("runtime-cache");
         let first = scratch.join("first");
@@ -10589,7 +10631,13 @@ time.sleep(10)
             path(&first_environment, "CARGO_TARGET_DIR"),
             first_scratch.join("build/cargo-target")
         );
-        assert_eq!(path(&first_environment, "TMPDIR"), first_temp);
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            assert_eq!(path(&first_environment, name), first_scratch.join("tmp"));
+        }
+        assert_eq!(
+            path(&first_environment, "GOTMPDIR"),
+            first_scratch.join("tmp/go-tmp")
+        );
         for directory in [
             first_temp.clone(),
             first_data.join("cache"),
