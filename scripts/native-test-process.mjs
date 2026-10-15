@@ -4,10 +4,11 @@ import { realpathSync, writeFileSync } from 'node:fs';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 
-export async function runOwnedCommand(program, args, { cwd, env, log, signal }) {
+export async function runOwnedCommand(program, args, { cwd, env, log, signal, onStart, onExit }) {
   if (signal.aborted) throw new Error('Native run cancelled');
   const output = [];
   const child = spawn(program, args, { cwd, env, detached: true });
+  if (child.pid) onStart?.(child.pid);
   const signalGroup = (value) => {
     if (!child.pid) return false;
     try {
@@ -46,6 +47,7 @@ export async function runOwnedCommand(program, args, { cwd, env, log, signal }) 
       signalGroup('SIGKILL');
     }
     await Promise.race([closed, delay(1000)]);
+    if (child.pid) onExit?.(child.pid);
     writeFileSync(log, Buffer.concat(output));
   }
 }
