@@ -7719,7 +7719,7 @@ fn restore_session_blocking(
                         Ok((forget_generation, params, minted_token))
                     },
                 )?;
-            register_native_task_connections(&runtime, &browser)?;
+            register_native_task_connections(&runtime, browser)?;
             let result = runtime.request(method, params, Duration::from_secs(60));
             if result.is_err() {
                 if let Some(token) = minted_token {
