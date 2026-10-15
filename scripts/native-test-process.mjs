@@ -4,11 +4,19 @@ import { realpathSync, writeFileSync } from 'node:fs';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 
+function notify(hook, pid) {
+  try {
+    hook?.(pid);
+  } catch (error) {
+    process.stderr.write(`Run registry update failed: ${error.message}\n`);
+  }
+}
+
 export async function runOwnedCommand(program, args, { cwd, env, log, signal, onStart, onExit }) {
   if (signal.aborted) throw new Error('Native run cancelled');
   const output = [];
   const child = spawn(program, args, { cwd, env, detached: true });
-  if (child.pid) onStart?.(child.pid);
+  if (child.pid) notify(onStart, child.pid);
   const signalGroup = (value) => {
     if (!child.pid) return false;
     try {
@@ -47,7 +55,7 @@ export async function runOwnedCommand(program, args, { cwd, env, log, signal, on
       signalGroup('SIGKILL');
     }
     await Promise.race([closed, delay(1000)]);
-    if (child.pid) onExit?.(child.pid);
+    if (child.pid) notify(onExit, child.pid);
     writeFileSync(log, Buffer.concat(output));
   }
 }

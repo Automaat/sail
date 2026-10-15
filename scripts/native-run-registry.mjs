@@ -8,7 +8,6 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -30,7 +29,10 @@ export function runRegistryDirectory(env = process.env) {
       throw new Error('SAIL_NATIVE_RUN_REGISTRY must be an absolute directory');
     return configured;
   }
-  return join(userTemporaryDirectory() ?? tmpdir(), 'sail-native-runs');
+  const userTemporary = userTemporaryDirectory();
+  if (!userTemporary)
+    throw new Error('The per-user temporary folder is unknown; set SAIL_NATIVE_RUN_REGISTRY');
+  return join(userTemporary, 'sail-native-runs');
 }
 
 function writeRecord(path, record) {
@@ -74,6 +76,27 @@ export function registerRun(registry, id) {
       rmSync(`${path}.tmp`, { force: true });
     },
   };
+}
+
+const unregistered = {
+  path: null,
+  record: null,
+  setBinary() {},
+  groupHooks: () => ({}),
+  release() {},
+};
+
+/**
+ * Registration is best effort: a registry that cannot be written costs the next run its cleanup of
+ * this run, never this run itself. A failure is reported once and the handle does nothing.
+ */
+export function registerRunIfPossible(resolveRegistry, id, report) {
+  try {
+    return registerRun(resolveRegistry(), id);
+  } catch (error) {
+    report(`Run registry unavailable, a killed runner will leave processes: ${error.message}`);
+    return unregistered;
+  }
 }
 
 function groupMembers() {

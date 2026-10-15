@@ -21,6 +21,7 @@ import { nativeApp } from '../scripts/native-app.mjs';
 import {
   reapDeadRuns,
   registerRun,
+  registerRunIfPossible,
   runRegistryDirectory,
 } from '../scripts/native-run-registry.mjs';
 import { runOwnedCommand } from '../scripts/native-test-process.mjs';
@@ -277,6 +278,64 @@ await test('a registration follows its command groups and ends with release', as
   assert.equal(recordsIn(registry)[0].binary, '/x/Sail E2E.app/Contents/MacOS/sail');
   handle.release();
   assert.deepEqual(readdirSync(registry), []);
+});
+
+await test('an unwritable registry costs only the cleanup, not the run', (context) => {
+  const root = scratch(context);
+  writeFileSync(join(root, 'file'), '');
+  const reports: string[] = [];
+  const handle = registerRunIfPossible(
+    () => join(root, 'file', 'registry'),
+    'x',
+    (message: string) => reports.push(message),
+  );
+  assert.equal(reports.length, 1);
+  assert.doesNotThrow(() => {
+    handle.setBinary('/x');
+    handle.groupHooks();
+    handle.release();
+  });
+  const unknown = registerRunIfPossible(
+    () => {
+      throw new Error('unknown');
+    },
+    'y',
+    (message: string) => reports.push(message),
+  );
+  assert.equal(unknown.path, null);
+  assert.equal(reports.length, 2);
+});
+
+await test('a failing registry update does not orphan the command it follows', async (context) => {
+  const root = scratch(context);
+  const pidFile = join(root, 'descendant.pid');
+  const controller = new AbortController();
+  const running = runOwnedCommand('/bin/sh', ['-c', 'sleep 30 & echo $! > "$0"; wait', pidFile], {
+    cwd: root,
+    env: process.env,
+    log: join(root, 'command.log'),
+    signal: controller.signal,
+    onStart() {
+      throw new Error('registry write failed');
+    },
+    onExit() {
+      throw new Error('registry write failed');
+    },
+  });
+  const waitForPid = async (deadline: number): Promise<number> => {
+    if (existsSync(pidFile) && readFileSync(pidFile, 'utf8').trim())
+      return Number(readFileSync(pidFile, 'utf8'));
+    if (Date.now() >= deadline) throw new Error('descendant did not start');
+    await delay(20);
+    return waitForPid(deadline);
+  };
+  const descendant = await waitForPid(Date.now() + 5000);
+  stopAtEnd(context, descendant);
+  controller.abort();
+  await running;
+  await delay(200);
+  assert.equal(alive(descendant), false);
+  assert.ok(existsSync(join(root, 'command.log')));
 });
 
 await test('the registry folder can be chosen and must be absolute', () => {

@@ -21,7 +21,11 @@ import {
   systemRunDataRoots,
 } from './native-app-data.mjs';
 import { availablePort, nativeApp, verifySignature } from './native-app.mjs';
-import { reapDeadRuns, registerRun, runRegistryDirectory } from './native-run-registry.mjs';
+import {
+  reapDeadRuns,
+  registerRunIfPossible,
+  runRegistryDirectory,
+} from './native-run-registry.mjs';
 import { runOwnedCommand } from './native-test-process.mjs';
 import {
   artifactKey,
@@ -46,6 +50,10 @@ const { appProcesses, command, identifier, prepareApp, readiness, sign, stopApp 
   checkout,
   isCancelled: () => cancelled,
 });
+
+function reportRegistry(message) {
+  process.stderr.write(`${message}\n`);
+}
 
 async function loggedCommand(program, args, env, log, groupHooks) {
   return runOwnedCommand(program, args, {
@@ -173,9 +181,8 @@ async function main() {
     return;
   }
   const dataRoots = systemRunDataRoots();
-  const registry = runRegistryDirectory();
   try {
-    const dead = await reapDeadRuns(registry, { stopApp, appProcesses });
+    const dead = await reapDeadRuns(runRegistryDirectory(), { stopApp, appProcesses });
     process.stdout.write(`Stopped ${dead.reaped.length} runs left by killed runners\n`);
     if (dead.failed.length > 0)
       process.stderr.write(`Could not stop leftovers of runs: ${dead.failed.join(', ')}\n`);
@@ -202,7 +209,11 @@ async function main() {
     let phase = 'artifact';
     let runIdentifier;
     let buildIdentifier;
-    const registration = registerRun(registry, `${process.pid}-${Date.now()}-${index}`);
+    const registration = registerRunIfPossible(
+      runRegistryDirectory,
+      `${process.pid}-${Date.now()}-${index}`,
+      reportRegistry,
+    );
     const groupHooks = registration.groupHooks();
     try {
       const built = await artifact(canonical, requirements, attempt, groupHooks);
