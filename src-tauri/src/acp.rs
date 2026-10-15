@@ -5615,7 +5615,7 @@ impl Connection {
             || app
                 .state::<crate::terminal::TerminalManager>()
                 .owner_has_running(&owner);
-        let (profile, directory) = {
+        let (profile, directory, deleted) = {
             let restores = self.restores.lock().map_err(|error| error.to_string())?;
             let prompts = self
                 .prompt_state
@@ -5650,7 +5650,7 @@ impl Connection {
                 .lock()
                 .map_err(|error| error.to_string())?
                 .begin_close(session_id);
-            (profile, directory)
+            (profile, directory, prompts.forgotten.contains(session_id))
         };
         let closed = self.request(
             "session/close",
@@ -5660,6 +5660,10 @@ impl Connection {
         let end_close = || {
             if let Ok(mut idle) = self.idle.lock() {
                 idle.end_close(session_id);
+                // A deleted thread must stay gone, so it is not marked closed for a reattach.
+                if deleted {
+                    idle.forget(session_id);
+                }
             }
         };
         match closed {
@@ -7607,19 +7611,43 @@ pub async fn acp_forget_session(
                 return Err(error.to_string());
             }
         }
-        if let Err(error) = runtime
+        let restoring = match runtime
             .restores
             .lock()
             .map(|mut claims| claims.remove(&session_id))
         {
+            Ok(claim) => claim.is_some(),
+            Err(error) => {
+                runtime
+                    .prompt_state
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(&session_id, false);
+                return Err(error.to_string());
+            }
+        };
+        runtime.restore_ready.notify_all();
+        // A restore reservation registered the thread; a deleted thread must not stay registered.
+        let cleared = runtime
+            .idle
+            .lock()
+            .map(|mut idle| idle.forget(&session_id))
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                if restoring {
+                    unregister_session(&runtime, &session_id)
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = cleared {
             runtime
                 .prompt_state
                 .lock()
                 .map_err(|cause| cause.to_string())?
                 .finish_forget(&session_id, false);
-            return Err(error.to_string());
+            return Err(error);
         }
-        runtime.restore_ready.notify_all();
         let mut configs = match runtime.session_configs.lock() {
             Ok(configs) => configs,
             Err(error) => {
@@ -7711,6 +7739,8 @@ pub async fn acp_begin_session_restore(
             if let Some(token) = result.get("restoreToken").and_then(Value::as_str) {
                 runtime.release_restore(&session_id, token)?;
             }
+            // The delete landed after the reservation registered the thread.
+            unregister_session(&runtime, &session_id)?;
             return Err(error);
         }
         Ok(result)
@@ -7954,7 +7984,8 @@ fn restore_session_blocking(
                 )
             },
         )?;
-        with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
+        let loaded = std::cell::Cell::new(false);
+        let outcome = with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
             // A reattach already holds the claim for the thread it resumes.
             let mut resume = if resume_claimed {
                 None
@@ -8039,18 +8070,10 @@ fn restore_session_blocking(
                         browser.release(token)
                     });
                 }
-                runtime
-                    .session_directories
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .remove(&session_id);
-                runtime
-                    .session_profiles
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .remove(&session_id);
+                unregister_session(&runtime, &session_id)?;
             }
             let result = result?;
+            loaded.set(true);
             complete_restore_if_current(
                 manager,
                 &runtime.prompt_state,
@@ -8074,8 +8097,56 @@ fn restore_session_blocking(
                 resume.resumed = true;
             }
             Ok(restored)
-        })
+        });
+        // A delete that lands during the restore leaves nothing registered for the thread.
+        if outcome.is_err()
+            && unregister_if_deleted(&runtime, &session_id)?
+            && loaded.get()
+            && runtime.supports_session_close()
+        {
+            // The idle sweep no longer sees the thread, so release what the resume loaded.
+            if let Err(error) = runtime.request(
+                "session/close",
+                json!({"sessionId":session_id}),
+                Duration::from_secs(30),
+            ) {
+                crate::diagnostics::record(
+                    "deleted_session_close_failed",
+                    json!({"agent":agent,"sessionId":session_id,"error":error}),
+                );
+            }
+        }
+        outcome
     }
+}
+
+/// Unregisters a thread whose delete is committed or in progress, whether it began before or
+/// during the failed restore. An aborted delete clears its fence, so a live thread stays registered.
+fn unregister_if_deleted(runtime: &Connection, session_id: &str) -> Result<bool, String> {
+    let forgotten = runtime
+        .prompt_state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .forgotten
+        .contains(session_id);
+    if forgotten {
+        unregister_session(runtime, session_id)?;
+    }
+    Ok(forgotten)
+}
+
+fn unregister_session(runtime: &Connection, session_id: &str) -> Result<(), String> {
+    runtime
+        .session_directories
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(session_id);
+    runtime
+        .session_profiles
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(session_id);
+    Ok(())
 }
 
 fn prompt_content(
@@ -13677,6 +13748,57 @@ mod idle_close_tests {
             .unwrap()
             .is_none());
         assert!(!runtime.idle.lock().unwrap().is_closed("ses_ui_loaded"));
+    }
+
+    #[test]
+    fn deleting_a_thread_during_its_restore_leaves_nothing_registered() {
+        for agent in ["codex", "claude"] {
+            let session = format!("ses_delete_{agent}");
+            let runtime = closed_runtime(agent, &session);
+            let claim = runtime.begin_attaching_restore(&session).unwrap();
+            assert!(claim.is_some(), "{agent}");
+            assert!(runtime
+                .session_profiles
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            assert!(runtime
+                .session_directories
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            // The delete drops the idle state while the resume is still in flight.
+            runtime.idle.lock().unwrap().forget(&session);
+            // An aborted delete leaves the thread live and clears its fence.
+            assert!(!unregister_if_deleted(&runtime, &session).unwrap());
+            assert!(runtime
+                .session_profiles
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            runtime
+                .prompt_state
+                .lock()
+                .unwrap()
+                .mark_forgotten(&session);
+            assert!(unregister_if_deleted(&runtime, &session).unwrap());
+            drop(claim);
+            assert!(!runtime
+                .session_profiles
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            assert!(!runtime
+                .session_directories
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            let idle = runtime.idle.lock().unwrap();
+            assert!(!idle.is_closed(&session), "{agent}: no closed marker");
+            assert!(!idle.is_resuming(&session), "{agent}: claim released");
+            drop(idle);
+            assert_eq!(runtime.reattach_closed(&session, || Ok(())), Ok(None));
+        }
     }
 
     #[test]
