@@ -341,5 +341,6 @@ await test('a failing registry update does not orphan the command it follows', a
 await test('the registry folder can be chosen and must be absolute', () => {
   assert.equal(runRegistryDirectory({ SAIL_NATIVE_RUN_REGISTRY: '/tmp/x' }), '/tmp/x');
   assert.throws(() => runRegistryDirectory({ SAIL_NATIVE_RUN_REGISTRY: 'relative' }), /absolute/);
-  assert.match(runRegistryDirectory({}), /sail-native-runs$/);
+  if (darwin) assert.match(runRegistryDirectory({}), /sail-native-runs$/);
+  else assert.throws(() => runRegistryDirectory({}), /SAIL_NATIVE_RUN_REGISTRY/);
 });
