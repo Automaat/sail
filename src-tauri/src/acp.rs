@@ -687,6 +687,10 @@ struct Connection {
     #[cfg(unix)]
     shared_build_directory: Option<PathBuf>,
     codex_workspace_access: Option<CodexWorkspaceAccess>,
+    /// PATH and identity given to the agent; terminal commands reuse them so a gate sees
+    /// one environment on every surface.
+    runtime_path: std::ffi::OsString,
+    environment_id: String,
     _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(unix)]
@@ -2380,7 +2384,8 @@ fn runtime_environment(
     environment
 }
 
-fn configured_tool_paths(
+/// Directories Sail may put ahead of the inherited PATH, whether or not they exist yet.
+fn configured_tool_candidates(
     home: Option<&Path>,
     local_app_data: Option<&Path>,
     windows: bool,
@@ -2396,7 +2401,18 @@ fn configured_tool_paths(
     if let Some(home) = home {
         paths.extend([home.join(".local/bin"), home.join(".cargo/bin")]);
     }
-    paths.into_iter().filter(|path| path.is_dir()).collect()
+    paths
+}
+
+fn configured_tool_paths(
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    configured_tool_candidates(home, local_app_data, windows)
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
@@ -2406,6 +2422,33 @@ fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
         .file_type()
         .is_dir()
         .then_some(directory)
+}
+
+/// Identity of the tool environment every agent-owned surface of a worktree shares. It hashes
+/// the candidate tool directories, not only the existing ones, so creating `~/.local/bin`
+/// mid-gate does not change the identity of a worktree.
+pub(crate) fn tool_environment_id(data_directory: &Path) -> String {
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    environment_id_for(
+        data_directory,
+        home.as_deref(),
+        local_app_data.as_deref(),
+        cfg!(windows),
+    )
+}
+
+fn environment_id_for(
+    data_directory: &Path,
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    windows: bool,
+) -> String {
+    crate::acp_terminal::environment_identity(
+        data_directory,
+        &configured_tool_candidates(home, local_app_data, windows),
+    )
 }
 
 fn agent_path(
@@ -6307,9 +6350,12 @@ fn connect_blocking_inner(
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
+    let runtime_path = agent_path(paths, data_directory.join("bin"), &original_path)?;
+    command.env("PATH", &runtime_path);
+    let environment_id = tool_environment_id(&data_directory);
     command.env(
-        "PATH",
-        agent_path(paths, data_directory.join("bin"), &original_path)?,
+        crate::acp_terminal::ENVIRONMENT_ID_VARIABLE,
+        &environment_id,
     );
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
@@ -6451,6 +6497,8 @@ fn connect_blocking_inner(
         #[cfg(unix)]
         shared_build_directory,
         codex_workspace_access,
+        runtime_path,
+        environment_id,
         _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
         #[cfg(unix)]
@@ -6750,6 +6798,8 @@ fn connect_blocking_inner(
                                             directory,
                                             scratch_owner,
                                             build_directory: build_directory.as_deref(),
+                                            runtime_path: Some(runtime.runtime_path.as_os_str()),
+                                            environment_id: Some(runtime.environment_id.as_str()),
                                         },
                                     )
                                 };
@@ -10005,6 +10055,8 @@ time.sleep(10)
             #[cfg(unix)]
             shared_build_directory: build_directory,
             codex_workspace_access: None,
+            runtime_path: std::ffi::OsString::new(),
+            environment_id: String::new(),
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
@@ -10371,6 +10423,23 @@ time.sleep(10)
     }
 
     #[test]
+    fn environment_id_ignores_tool_directories_created_later() {
+        let root = scratch("environment-id-late-tools");
+        let data = root.join("agent-data");
+        let before = environment_id_for(&data, Some(&root), None, false);
+
+        std::fs::create_dir_all(root.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(root.join(".cargo/bin")).unwrap();
+
+        assert_eq!(before, environment_id_for(&data, Some(&root), None, false));
+        assert_ne!(
+            before,
+            environment_id_for(&root.join("other-data"), Some(&root), None, false)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn configured_tool_paths_prefer_repository_tool_shims() {
         let root = scratch("configured-tool-paths");
         let shims = root.join(".local/share/mise/shims");
@@ -10592,6 +10661,8 @@ time.sleep(10)
                 #[cfg(unix)]
                 shared_build_directory: None,
                 codex_workspace_access: None,
+                runtime_path: std::ffi::OsString::new(),
+                environment_id: String::new(),
                 _storage_lease: None,
                 child: Mutex::new(child),
                 scratch_owner: None,
@@ -11998,6 +12069,8 @@ mod native_subagent_fence_tests {
             #[cfg(unix)]
             shared_build_directory: None,
             codex_workspace_access: None,
+            runtime_path: std::ffi::OsString::new(),
+            environment_id: String::new(),
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
