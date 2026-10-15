@@ -1,6 +1,13 @@
 import { browser, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,6 +17,10 @@ type Provider = 'codex' | 'claude' | 'opencode';
 
 function closedSessions(): string[] {
   return existsSync(closeLog) ? readFileSync(closeLog, 'utf8').split('\n').filter(Boolean) : [];
+}
+
+function closeCount(sessionId: string): number {
+  return closedSessions().filter((id) => id === sessionId).length;
 }
 
 async function newSessions(provider: Provider, directory: string, count: number) {
@@ -196,6 +207,118 @@ describe('idle session close', () => {
         interval: 1000,
         timeoutMsg: 'the long turn thread never closed after it finished',
       });
+    });
+  }
+
+  for (const provider of ['codex', 'claude'] as const) {
+    it(`reattaches a closed ${provider} thread once for concurrent calls and retries a failed resume`, async () => {
+      const directory = realpathSync(repository);
+      const [id] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [id]);
+      await browser.tauri.execute(async ({ core }) => {
+        await core.invoke('acp_set_idle_close_timeout', { seconds: 2 });
+      });
+      await browser.waitUntil(async () => closeCount(id) >= 1, {
+        timeout: 20_000,
+        interval: 500,
+        timeoutMsg: 'the finished thread was never closed',
+      });
+      expect(await attached(provider, directory)).not.toContain(id);
+
+      const slowResume = join(directory, 'idle-slow-resume.txt');
+      writeFileSync(slowResume, 'slow');
+      const concurrent = await browser.tauri.execute(
+        async ({ core }, agent, path, session) => {
+          // A thread allows one turn at a time, so the second concurrent command is a config change.
+          const outcomes = await Promise.allSettled([
+            core.invoke('acp_set_config', {
+              agent,
+              directory: path,
+              sessionId: session,
+              configId: 'effort',
+              value: 'high',
+            }),
+            core.invoke<{ stopReason?: string }>('acp_prompt', {
+              params: {
+                agent,
+                directory: path,
+                sessionId: session,
+                text: 'Task reporting fixture: done',
+                turnId: 'idle-race',
+                imagePaths: [],
+              },
+            }),
+            core.invoke('acp_set_config', {
+              agent,
+              directory: path,
+              sessionId: session,
+              configId: 'mode',
+              value: 'plan',
+            }),
+          ]);
+          const [effort, prompt, mode] = outcomes.map((outcome) =>
+            outcome.status === 'fulfilled'
+              ? { value: outcome.value }
+              : { error: String(outcome.reason) },
+          );
+          return { effort, prompt, mode };
+        },
+        provider,
+        directory,
+        id,
+      );
+      rmSync(slowResume, { force: true });
+      expect(concurrent.effort).not.toHaveProperty('error');
+      expect(concurrent.prompt).not.toHaveProperty('error');
+      expect(concurrent.mode).not.toHaveProperty('error');
+      expect(await attached(provider, directory)).toContain(id);
+
+      const closes = closeCount(id);
+      await browser.waitUntil(async () => closeCount(id) > closes, {
+        timeout: 20_000,
+        interval: 500,
+        timeoutMsg: 'the reattached thread never closed again',
+      });
+      writeFileSync(join(directory, 'idle-fail-next-resume.txt'), 'fail');
+      const failed = await browser.tauri.execute(
+        async ({ core }, agent, path, session) =>
+          core
+            .invoke('acp_set_config', {
+              agent,
+              directory: path,
+              sessionId: session,
+              configId: 'effort',
+              value: 'low',
+            })
+            .then(
+              () => 'resumed',
+              (error) => String(error),
+            ),
+        provider,
+        directory,
+        id,
+      );
+      expect(failed).toContain('Injected resume failure');
+      expect(await attached(provider, directory)).not.toContain(id);
+
+      const retried = await browser.tauri.execute(
+        async ({ core }, agent, path, session) =>
+          core.invoke<{ stopReason?: string }>('acp_prompt', {
+            params: {
+              agent,
+              directory: path,
+              sessionId: session,
+              text: 'Task reporting fixture: done',
+              turnId: 'idle-retry',
+              imagePaths: [],
+            },
+          }),
+        provider,
+        directory,
+        id,
+      );
+      expect(retried.stopReason).toBe('end_turn');
+      expect(await attached(provider, directory)).toContain(id);
     });
   }
 
