@@ -12100,6 +12100,7 @@
   function createAgentThread(thread: AgentThread) {
     saveAgentThread(thread);
     rememberRecentThread(thread);
+    refreshCreatedThreadInventory(thread);
     if (acpAgent === thread.agent && directory === thread.directory && !acpThread) {
       migrateDiffComments(
         diffCommentKey('main'),
@@ -12594,6 +12595,13 @@
     savePaneLayout(updatePane(paneLayout, id, { ratio }));
   }
 
+  function refreshCreatedThreadInventory(thread: AgentThread) {
+    if (thread.agent !== 'opencode') return;
+    if (!(JSON.parse(sidebarDirectoryKey) as string[]).includes(thread.directory))
+      sidebarInventoryOutside.add(thread.directory);
+    scheduleSidebarInventoryRefresh(250, [thread.directory]);
+  }
+
   function createPaneThread(id: string, thread: AgentThread) {
     invalidatePaneSelection(id);
     const sessionKey = `acp:${thread.agent}:${thread.sessionId}`;
@@ -12601,9 +12609,7 @@
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
       rememberRecentThread(thread);
-      if (!(JSON.parse(sidebarDirectoryKey) as string[]).includes(thread.directory))
-        sidebarInventoryOutside.add(thread.directory);
-      scheduleSidebarInventoryRefresh(250, [thread.directory]);
+      refreshCreatedThreadInventory(thread);
       return;
     }
     saveAgentThread(thread);
