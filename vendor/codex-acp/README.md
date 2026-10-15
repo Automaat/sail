@@ -10,7 +10,9 @@ to version 2.0.0 and preserve it across Codex process restarts and ACP forks.
 
 The distribution is licensed under Apache-2.0; see `LICENSE`. Sail changed
 the upstream distribution to select launch-provided permission profiles and to
-keep the selected profile through session lifecycle operations.
+keep the selected profile through session lifecycle operations. The advertised
+`workspace-write` mode selects the same trusted filesystem profile as `agent`
+while retaining its own approval policy.
 For Sail permission profiles, turns inherit the globally configured approval
 reviewer instead of applying the ACP mode reviewer preset. The mode approval
 policy and explicit filesystem profile remain enforced. Legacy adapter sessions
@@ -32,4 +34,4 @@ cp dist/index.js /path/to/sail/vendor/codex-acp/dist/index.js.txt
 ```
 
 The committed bundle's SHA-256 is
-`87474ec40d66c3e2dac0e513e86a1f2f65cdcdd9c455fdda2f56cbdb252bcc02`.
+`6f9ff3d56a417b16eb8de8f7d809b7801bce9f9aa9248f50f6071e2cf0779b82`.
