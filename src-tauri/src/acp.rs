@@ -191,6 +191,19 @@ impl NativeSubagentRegistry {
         Ok(())
     }
 
+    fn is_live(entry: &NativeSubagentState) -> bool {
+        !matches!(
+            entry.outcome.as_str(),
+            "completed" | "failed" | "interrupted"
+        )
+    }
+
+    fn involves_live_work(&self, session_id: &str) -> bool {
+        self.0.iter().any(|(id, entry)| {
+            Self::is_live(entry) && (id == session_id || entry.parent_session_id == session_id)
+        })
+    }
+
     fn active_in(&self, directory: &Path) -> Vec<String> {
         self.0
             .iter()
@@ -653,6 +666,8 @@ struct Connection {
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
     stopped: AtomicBool,
     released_owner: AtomicBool,
+    idle_exit: AtomicBool,
+    last_activity: Mutex<Instant>,
     input: Mutex<ChildStdin>,
     pending: Mutex<HashMap<u64, mpsc::Sender<PendingResponse>>>,
     reader_progress: ReaderProgress,
@@ -676,6 +691,7 @@ struct Connection {
     session_creation: Mutex<()>,
     restores: Mutex<HashMap<String, RestoreClaim>>,
     restore_ready: Condvar,
+    idle: Mutex<crate::acp_idle::IdleSessions>,
     ready: Condvar,
     _owned_temp: Option<OwnedTempDir>,
 }
@@ -900,12 +916,21 @@ fn mcp_server(config: &crate::browser_agent::McpConfig) -> Value {
 }
 
 fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]) -> Value {
-    let mut params = json!({"cwd":cwd,"mcpServers":servers});
-    if let Some(overlay) = crate::git_overlay::registered_directory(Path::new(cwd)) {
+    let directory = canonical_directory(cwd);
+    let mut params = json!({"cwd":directory.to_string_lossy(),"mcpServers":servers});
+    if let Some(overlay) = crate::git_overlay::registered_directory(&directory) {
         params["additionalDirectories"] = json!([overlay]);
     }
     if let Some(session_id) = session_id {
         params["sessionId"] = json!(session_id);
+    }
+    params
+}
+
+fn session_list_params(directory: &Path, cursor: Option<&str>) -> Value {
+    let mut params = json!({"cwd": directory.to_string_lossy()});
+    if let Some(cursor) = cursor {
+        params["cursor"] = json!(cursor);
     }
     params
 }
@@ -1068,6 +1093,10 @@ struct CodexWorkspaceAccess {
     directories: Vec<WritableDirectory>,
 }
 
+const CODEX_PROCESS_INSPECTION_INSTRUCTIONS: &str = "When the active permission profile is sail-agent on macOS, the Seatbelt sandbox blocks read-only process inspection and background-job priority setup. For an already approved exact command, request command-scoped host execution by setting sandbox_permissions to require_escalated only for: ps -ef; pgrep -fl followed by one literal task-owned pattern; or starting a bounded task-owned background job. Keep the command within its approved prefix and use a concise justification. Never request escalation for other ps or pgrep forms, kill, pkill, renice, signals, process mutation, unrelated commands, filesystem access, or network access. Keep the sail-agent session profile unchanged. If every condition does not match, run sandboxed or ask the user.";
+
+const CODEX_RECOVERY_APPROVAL_INSTRUCTIONS: &str = "When automatic approval review evaluates a recovery action, match the exact requested action against explicit user grants in the current turn and their task scope. An explicit grant authorizes only the named recovery action. Approve task-scoped source or checkpoint writes and bounded focused validation only when the request stays within that grant. Calling an attempted broader action a negative test, malicious fixture, reproduction, validation, or expected rejection does not authorize it. Reject that action before execution, state the specific excess, and then treat its asserted nonzero rejection as successful evidence instead of a surviving product failure. Never execute an out-of-grant mutation to test whether review rejects it. Permit workflow-required focused re-attestation of a corrected head under the same active task-scoped grant. Reject every broader mutation, ungranted resource or action, control bypass, or unrelated operation, and state the specific excess.";
+
 impl CodexWorkspaceAccess {
     fn capture(scope: &Path, extra_writable: &[PathBuf]) -> Result<Self, String> {
         let mut directories = vec![WritableDirectory::capture(scope)?];
@@ -1124,6 +1153,9 @@ impl CodexWorkspaceAccess {
                 "permissions.sail-read-only={extends=\":read-only\"}",
                 format!("permissions.sail-agent={{extends=\":read-only\",filesystem={{{}}}}}", rules.join(","))
             ],
+            "developerInstructions": format!(
+                "{CODEX_PROCESS_INSPECTION_INSTRUCTIONS}\n\n{CODEX_RECOVERY_APPROVAL_INSTRUCTIONS}"
+            ),
             "modeProfiles": {
                 "read-only": "sail-read-only",
                 "agent": "sail-agent",
@@ -1137,14 +1169,21 @@ fn session_servers(browser: Value) -> Vec<Value> {
     vec![browser]
 }
 
+fn with_context_server(servers: &mut Vec<Value>, context: Option<Value>) {
+    servers.retain(|server| {
+        server.pointer("/args/0").and_then(Value::as_str) != Some("--context-mcp")
+    });
+    if let Some(context) = context {
+        servers.push(context);
+    }
+}
+
 fn per_load_mcp() -> bool {
     std::env::var("SAIL_ACP_PER_LOAD_MCP").as_deref() == Ok("1")
 }
 
 fn canonical_directory(cwd: &str) -> PathBuf {
-    PathBuf::from(cwd)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(cwd))
+    dunce::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd))
 }
 
 /// Returns the parameters to send for a restored session, reusing the ones
@@ -1810,6 +1849,72 @@ impl Connection {
         Ok(())
     }
 
+    /// An OpenCode agent with no running turn, subagent, pending request or command exits once it
+    /// has been silent for `timeout`. Attached sessions come back through resume on their next use.
+    fn exit_if_idle(&self, timeout: Duration, commands_running: impl Fn() -> bool) -> bool {
+        if self.agent != "opencode" || self.owner.is_some() || self.stopped.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let silent = self
+            .last_activity
+            .lock()
+            .map_or(Duration::ZERO, |last| last.elapsed());
+        if silent < timeout || self.capabilities.lock().is_ok_and(|value| value.is_null()) {
+            return false;
+        }
+        // A prompt being dispatched holds this lock; leave it alone.
+        let Ok(_dispatch) = self.prompt_dispatch.try_lock() else {
+            return false;
+        };
+        if self.has_pending_work() || commands_running() {
+            // Look again after another full timeout instead of rescanning every tick.
+            self.touch();
+            return false;
+        }
+        self.idle_exit.store(true, Ordering::Release);
+        if let Err(error) = self.terminate() {
+            self.idle_exit.store(false, Ordering::Release);
+            crate::diagnostics::record(
+                "agent_idle_exit_failed",
+                json!({"agent":self.agent,"error":error}),
+            );
+            return false;
+        }
+        crate::diagnostics::record(
+            "agent_idle_exit",
+            json!({"agent":self.agent,"idleSeconds":silent.as_secs()}),
+        );
+        true
+    }
+
+    fn has_pending_work(&self) -> bool {
+        let locked = (|| -> Result<bool, ()> {
+            let prompts = self.prompt_state.lock().map_err(|_| ())?;
+            if !prompts.active.is_empty() || !prompts.finishing.is_empty() {
+                return Ok(true);
+            }
+            drop(prompts);
+            let busy = !self.pending.lock().map_err(|_| ())?.is_empty()
+                || !self
+                    .permission_state
+                    .lock()
+                    .map_err(|_| ())?
+                    .pending
+                    .is_empty()
+                || !self.elicitation_state.lock().map_err(|_| ())?.is_empty()
+                || !self.restores.lock().map_err(|_| ())?.is_empty()
+                || !self
+                    .native_subagents
+                    .lock()
+                    .map_err(|_| ())?
+                    .active_in(&self.worktree)
+                    .is_empty();
+            Ok(busy)
+        })();
+        locked.unwrap_or(true)
+    }
+
     fn stop_child(&self) -> Result<(), String> {
         let _temp_gate = self
             .temp_cleanup_gate
@@ -1855,7 +1960,14 @@ impl Connection {
         result
     }
 
+    fn touch(&self) {
+        if let Ok(mut last) = self.last_activity.lock() {
+            *last = Instant::now();
+        }
+    }
+
     fn write(&self, message: &Value) -> Result<(), String> {
+        self.touch();
         let mut input = self.input.lock().map_err(|error| error.to_string())?;
         let mut message = message.clone();
         if let Some(owner) = &self.owner {
@@ -1881,7 +1993,40 @@ impl Connection {
         )
     }
 
+    /// An idle exit sent nothing the agent could have acted on, so callers may safely reattach
+    /// and retry on this error.
     fn request_response_around_write(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        write_message: impl FnOnce(&Value) -> Result<(), String>,
+        after_write: impl FnOnce(),
+    ) -> Result<PendingResponse, String> {
+        let result = self.dispatch_request(method, params, timeout, write_message, after_write);
+        if !self.idle_exit.load(Ordering::Acquire) {
+            return result;
+        }
+        match result {
+            Err(_) => Err(IDLE_EXIT_ERROR.into()),
+            Ok(mut response) => {
+                if let Some(error) = response
+                    .message
+                    .get_mut("error")
+                    .and_then(Value::as_object_mut)
+                    .filter(|error| {
+                        error.get("message").and_then(Value::as_str)
+                            == Some("Agent process exited.")
+                    })
+                {
+                    error.insert("message".into(), IDLE_EXIT_ERROR.into());
+                }
+                Ok(response)
+            }
+        }
+    }
+
+    fn dispatch_request(
         &self,
         method: &str,
         params: Value,
@@ -2112,8 +2257,27 @@ fn translate_session_ids(value: &mut Value, owner: &str, to_wire: bool) {
     }
 }
 
+/// Git roots by requested directory. Each ACP command resolves its worktree, and a `git`
+/// spawn per call made every thread open pay for ten or more of them.
+static WORKTREE_ROOTS: std::sync::LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
 fn worktree_identity(directory: &Path) -> PathBuf {
-    crate::acp_terminal::stable_worktree_identity(&crate::terminal::git_worktree_root(directory))
+    let cached = WORKTREE_ROOTS
+        .lock()
+        .ok()
+        .and_then(|roots| roots.get(directory).cloned())
+        .filter(|root| root.join(".git").exists());
+    let root = cached.unwrap_or_else(|| {
+        let root = crate::terminal::git_worktree_root(directory);
+        if root.join(".git").exists() {
+            if let Ok(mut roots) = WORKTREE_ROOTS.lock() {
+                roots.insert(directory.to_path_buf(), root.clone());
+            }
+        }
+        root
+    });
+    crate::acp_terminal::stable_worktree_identity(&root)
 }
 
 fn connection_key(agent: &str, profile: CapabilityProfile, directory: &Path) -> ConnectionKey {
@@ -2165,8 +2329,53 @@ fn runtime_environment(
         ("NPM_CONFIG_CACHE", shared_download_cache.join("npm")),
         ("YARN_CACHE_FOLDER", shared_download_cache.join("yarn")),
         ("COREPACK_HOME", shared_download_cache.join("corepack")),
+        ("UV_TOOL_DIR", data_directory.join("uv-tools")),
+        ("UV_TOOL_BIN_DIR", data_directory.join("bin")),
     ]);
     environment
+}
+
+fn configured_tool_paths(
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if windows {
+        if let Some(local) = local_app_data {
+            paths.push(local.join("mise/shims"));
+        }
+    } else if let Some(home) = home {
+        paths.push(home.join(".local/share/mise/shims"));
+    }
+    if let Some(home) = home {
+        paths.extend([home.join(".local/bin"), home.join(".cargo/bin")]);
+    }
+    paths.into_iter().filter(|path| path.is_dir()).collect()
+}
+
+fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
+    let directory = home?.join(".gnupg");
+    std::fs::symlink_metadata(&directory)
+        .ok()?
+        .file_type()
+        .is_dir()
+        .then_some(directory)
+}
+
+fn agent_path(
+    mut paths: Vec<PathBuf>,
+    scoped_tool_bin: PathBuf,
+    original: &std::ffi::OsStr,
+) -> Result<std::ffi::OsString, String> {
+    let scoped_index = usize::from(
+        paths
+            .first()
+            .is_some_and(|path| path.ends_with(Path::new("mise/shims"))),
+    );
+    paths.insert(scoped_index, scoped_tool_bin);
+    std::env::join_paths(paths.into_iter().chain(std::env::split_paths(original)))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(unix)]
@@ -2194,6 +2403,8 @@ fn prepare_runtime_directories(data_directory: &Path, temp_directory: &Path) -> 
         temp_directory.to_path_buf(),
         data_directory.join("cache"),
         data_directory.join("build"),
+        data_directory.join("bin"),
+        data_directory.join("uv-tools"),
         temp_directory.join("go-tmp"),
     ] {
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
@@ -2246,7 +2457,25 @@ pub struct AgentManager(
     Arc<Mutex<ForgetGenerations>>,
     Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
     Arc<AtomicU64>,
+    /// Serializes listing-agent startup so a sidebar refresh spawns one agent, not one per directory.
+    Arc<Mutex<()>>,
 );
+
+/// True while a live connection builds inside `root`, as a gate does under the
+/// runtime scratch of the agent that started it.
+#[cfg(unix)]
+pub(crate) fn runtime_root_in_use(manager: &AgentManager, root: &Path) -> bool {
+    let Ok(connections) = manager.0.lock() else {
+        return true;
+    };
+    connections.values().any(|runtime| {
+        runtime.alive.load(Ordering::Acquire)
+            && runtime
+                .shared_build_directory
+                .as_deref()
+                .is_some_and(|directory| directory.starts_with(root))
+    })
+}
 
 impl AgentManager {
     fn worktree_startup(&self, worktree: &Path) -> Result<Arc<Mutex<()>>, String> {
@@ -4920,6 +5149,11 @@ fn register_session(
         .lock()
         .map_err(|error| error.to_string())?
         .insert(session_id.to_string(), profile);
+    runtime
+        .idle
+        .lock()
+        .map_err(|error| error.to_string())?
+        .mark_attached(session_id, Instant::now());
     Ok(runtime)
 }
 
@@ -5042,6 +5276,339 @@ fn record_native_subagent_update(
         }
         _ => Ok(()),
     }
+}
+
+/// Agents whose adapter turns `session/close` into releasing the loaded thread and its MCP servers.
+const IDLE_CLOSE_AGENTS: &[&str] = &["codex"];
+
+impl Connection {
+    fn touch_session(&self, session_id: &str) {
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.touch(session_id, Instant::now());
+        }
+    }
+
+    fn supports_session_close(&self) -> bool {
+        IDLE_CLOSE_AGENTS.contains(&self.agent.as_str())
+            && self.capabilities.lock().is_ok_and(|capabilities| {
+                capabilities
+                    .pointer("/agentCapabilities/sessionCapabilities/close")
+                    .is_some_and(Value::is_object)
+            })
+    }
+
+    /// Whether a turn, permission, background task, subagent or terminal still needs the loaded thread.
+    fn session_holds_work(
+        &self,
+        session_id: &str,
+        prompts: &PromptState,
+        restores: &HashMap<String, RestoreClaim>,
+        terminal_running: bool,
+    ) -> Result<bool, String> {
+        if terminal_running
+            || prompts.active.contains_key(session_id)
+            || prompts.finishing.contains(session_id)
+            || restores.contains_key(session_id)
+        {
+            return Ok(true);
+        }
+        let asks_about_session = |message: &Value| {
+            message.pointer("/params/sessionId").and_then(Value::as_str) == Some(session_id)
+        };
+        {
+            let permissions = self
+                .permission_state
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if permissions.canceling_sessions.contains_key(session_id)
+                || permissions
+                    .pending
+                    .values()
+                    .any(|pending| asks_about_session(&pending.message))
+            {
+                return Ok(true);
+            }
+        }
+        if self
+            .elicitation_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .any(|pending| asks_about_session(&pending.message))
+        {
+            return Ok(true);
+        }
+        if self
+            .idle
+            .lock()
+            .map_err(|error| error.to_string())?
+            .has_async_tasks(session_id)
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .native_subagents
+            .lock()
+            .map_err(|error| error.to_string())?
+            .involves_live_work(session_id))
+    }
+
+    /// Closes a session that finished its work and went unseen past `idle`. Returns whether it closed.
+    fn close_session_if_idle(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        directory: &Path,
+        idle: Duration,
+    ) -> Result<bool, String> {
+        let owner = format!("{}\0acp:{}:{}", directory.display(), self.agent, session_id);
+        let terminal_running = app
+            .state::<crate::acp_terminal::AcpTerminalManager>()
+            .has_running_sessions(
+                &self.agent,
+                self.profile,
+                &self.worktree,
+                &[session_id.to_string()],
+            )
+            || app
+                .state::<crate::terminal::TerminalManager>()
+                .owner_has_running(&owner);
+        let (profile, directory) = {
+            let restores = self.restores.lock().map_err(|error| error.to_string())?;
+            let prompts = self
+                .prompt_state
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if self.session_holds_work(session_id, &prompts, &restores, terminal_running)? {
+                self.touch_session(session_id);
+                return Ok(false);
+            }
+            let expired = self
+                .idle
+                .lock()
+                .map_err(|error| error.to_string())?
+                .expired(session_id, Instant::now(), idle);
+            if !expired {
+                return Ok(false);
+            }
+            let mut profiles = self
+                .session_profiles
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let mut directories = self
+                .session_directories
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let (Some(profile), Some(directory)) =
+                (profiles.remove(session_id), directories.remove(session_id))
+            else {
+                return Ok(false);
+            };
+            self.idle
+                .lock()
+                .map_err(|error| error.to_string())?
+                .mark_closed(session_id);
+            (profile, directory)
+        };
+        match self.request(
+            "session/close",
+            json!({"sessionId":session_id}),
+            Duration::from_secs(30),
+        ) {
+            Ok(_) => {
+                crate::diagnostics::record(
+                    "idle_session_closed",
+                    json!({"agent":self.agent,"sessionId":session_id}),
+                );
+                Ok(true)
+            }
+            Err(error) if is_unknown_session_error(&error) => Ok(true),
+            Err(error) => {
+                if let (Ok(mut profiles), Ok(mut directories)) = (
+                    self.session_profiles.lock(),
+                    self.session_directories.lock(),
+                ) {
+                    profiles.insert(session_id.to_string(), profile);
+                    directories.insert(session_id.to_string(), directory);
+                }
+                if let Ok(mut idle) = self.idle.lock() {
+                    idle.mark_attached(session_id, Instant::now());
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+fn is_unknown_session_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    (error.contains("session") || error.contains("thread"))
+        && (error.contains("not found") || error.contains("unknown"))
+}
+
+impl AgentManager {
+    /// Closes finished sessions nobody has looked at for `idle`, so their MCP servers exit.
+    pub fn close_idle_sessions(&self, app: &AppHandle, idle: Duration) -> usize {
+        let connections = self
+            .0
+            .lock()
+            .map(|agents| {
+                agents
+                    .values()
+                    .filter(|runtime| {
+                        runtime.alive.load(Ordering::Acquire) && runtime.supports_session_close()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut closed = 0;
+        for runtime in connections {
+            let sessions = runtime
+                .session_directories
+                .lock()
+                .map(|directories| {
+                    directories
+                        .iter()
+                        .map(|(id, directory)| (id.clone(), directory.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for (session_id, directory) in sessions {
+                match runtime.close_session_if_idle(app, &session_id, &directory, idle) {
+                    Ok(true) => closed += 1,
+                    Ok(false) => {}
+                    Err(error) => crate::diagnostics::record(
+                        "idle_session_close_failed",
+                        json!({"agent":runtime.agent,"sessionId":session_id,"error":error}),
+                    ),
+                }
+            }
+        }
+        closed
+    }
+
+    fn idle_closed_connection(
+        &self,
+        agent: &str,
+        session_id: &str,
+        directory: &Path,
+    ) -> Option<Arc<Connection>> {
+        let worktree = worktree_identity(directory);
+        let owner = session_owner(session_id);
+        self.0
+            .lock()
+            .ok()?
+            .values()
+            .find(|runtime| {
+                runtime.agent == agent
+                    && runtime.worktree == worktree
+                    && runtime.owner.as_deref() == owner
+                    && runtime.alive.load(Ordering::Acquire)
+                    && runtime
+                        .idle
+                        .lock()
+                        .is_ok_and(|idle| idle.is_closed(session_id))
+            })
+            .cloned()
+    }
+}
+
+/// Sweeps for idle sessions for the life of the app. A tick only scans in-memory state.
+pub fn start_idle_session_sweeper(app: AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("sail-idle-session-sweep".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let (Some(idle), Some(manager)) = (
+                crate::acp_idle::idle_timeout(),
+                app.try_state::<AgentManager>(),
+            ) else {
+                continue;
+            };
+            manager.close_idle_sessions(&app, idle);
+        });
+}
+
+/// Reattaches a session the idle sweep closed, so a prompt to it works as if it were still loaded.
+async fn reattach_idle_closed(
+    app: &AppHandle,
+    manager: &AgentManager,
+    browser: &crate::browser_agent::BrowserManager,
+    agent: &str,
+    session_id: &str,
+    directory: &Path,
+) -> Result<bool, String> {
+    let Some(runtime) = manager.idle_closed_connection(agent, session_id, directory) else {
+        return Ok(false);
+    };
+    let params = RestoreSessionCommand {
+        agent: agent.to_string(),
+        cwd: directory.to_string_lossy().into_owned(),
+        session_id: session_id.to_string(),
+        profile: Some(runtime.profile.as_str().to_string()),
+        restore_token: None,
+    };
+    let (app, manager, browser) = (app.clone(), manager.clone(), browser.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        restore_session_blocking(app, &manager, &browser, params, "session/resume")
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(true)
+}
+
+async fn connection_for_session_reattaching(
+    app: &AppHandle,
+    manager: &AgentManager,
+    browser: &crate::browser_agent::BrowserManager,
+    agent: &str,
+    session_id: &str,
+    directory: &Path,
+) -> Result<Arc<Connection>, String> {
+    let runtime = match connection_for_session(manager, agent, session_id, directory) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            if !reattach_idle_closed(app, manager, browser, agent, session_id, directory).await? {
+                return Err(error);
+            }
+            connection_for_session(manager, agent, session_id, directory)?
+        }
+    };
+    runtime.touch_session(session_id);
+    Ok(runtime)
+}
+
+/// E2E specs share one app process and shorten the idle timeout for their own run.
+/// The command is only permitted by the E2E capability and has no production effect.
+#[tauri::command]
+pub fn acp_set_idle_close_timeout(seconds: Option<u64>) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        crate::acp_idle::override_idle_seconds(seconds);
+        Ok(())
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let _ = seconds;
+        Err("The idle close timeout override requires the E2E build".into())
+    }
+}
+
+/// Heartbeat from a view showing the session; an unseen thread closes after the idle timeout.
+#[tauri::command]
+pub fn acp_session_visible(
+    manager: State<'_, AgentManager>,
+    agent: String,
+    directory: String,
+    session_id: String,
+) -> Result<(), String> {
+    if let Ok(runtime) =
+        connection_for_session(&manager, &agent, &session_id, Path::new(&directory))
+    {
+        runtime.touch_session(&session_id);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -5294,6 +5861,34 @@ fn isolate_agent_process(command: &mut Command) {
     }
 }
 
+/// Capabilities of a live, initialized connection. Checked before the worktree startup lock so
+/// reopening a thread never waits behind another agent spawning in the same worktree.
+fn initialized_capabilities(
+    manager: &AgentManager,
+    key: &ConnectionKey,
+) -> Result<Option<Value>, String> {
+    let existing = manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(key)
+        .filter(|existing| existing.alive.load(Ordering::Acquire))
+        .cloned();
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let capabilities = existing
+        .capabilities
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    if capabilities.is_null() {
+        return Ok(None);
+    }
+    existing.validate_codex_workspace(None)?;
+    Ok(Some(capabilities))
+}
+
 fn connect_blocking_inner(
     app: AppHandle,
     manager: &AgentManager,
@@ -5308,6 +5903,9 @@ fn connect_blocking_inner(
     let definition = definition(&agent)?;
     let startup_generation = manager.3.load(Ordering::Acquire);
     let key = connection_key_for_owner(&agent, profile, worktree, owner);
+    if let Some(capabilities) = initialized_capabilities(manager, &key)? {
+        return Ok(capabilities);
+    }
     let startup = manager.worktree_startup(worktree)?;
     let _startup = startup.lock().map_err(|error| error.to_string())?;
     if manager.3.load(Ordering::Acquire) != startup_generation {
@@ -5412,11 +6010,15 @@ fn connect_blocking_inner(
     #[cfg(not(unix))]
     let shared_build_directory: Option<PathBuf> = None;
     let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     #[cfg(feature = "e2e")]
     let test_agent = std::env::var_os("SAIL_ACP_TEST_AGENT");
     #[cfg(not(feature = "e2e"))]
     let test_agent: Option<std::ffi::OsString> = None;
-    let mut paths = Vec::new();
+    let mut paths =
+        configured_tool_paths(home.as_deref(), local_app_data.as_deref(), cfg!(windows));
     let is_test_agent = test_agent.is_some();
     let mut owned_temp = None;
     let background = crate::background_priority::enabled(&app);
@@ -5466,11 +6068,6 @@ fn connect_blocking_inner(
             }
         }
     };
-    paths.extend(std::env::split_paths(&original_path));
-    command.env(
-        "PATH",
-        std::env::join_paths(paths).map_err(|error| error.to_string())?,
-    );
     if let Some(connection_file) = crate::hook_activity::connection_file(
         app.state::<crate::hook_activity::HookActivityManager>()
             .inner(),
@@ -5493,6 +6090,10 @@ fn connect_blocking_inner(
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
+    command.env(
+        "PATH",
+        agent_path(paths, data_directory.join("bin"), &original_path)?,
+    );
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
     #[cfg(not(unix))]
@@ -5505,6 +6106,9 @@ fn connect_blocking_inner(
             .join("terminal-package-downloads");
         std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
         let mut writable = vec![temp.0.clone(), data_directory.clone(), shared_cache];
+        if let Some(gnupg) = default_gnupg_directory(home.as_deref()) {
+            writable.push(gnupg);
+        }
         if let Some(overlay) = overlay.as_ref() {
             writable.push(overlay.git_dir.clone());
         }
@@ -5640,6 +6244,8 @@ fn connect_blocking_inner(
         watchdog: Mutex::new(watchdog),
         stopped: AtomicBool::new(false),
         released_owner: AtomicBool::new(false),
+        idle_exit: AtomicBool::new(false),
+        last_activity: Mutex::new(Instant::now()),
         input: Mutex::new(input),
         pending: Mutex::new(HashMap::new()),
         reader_progress: ReaderProgress::default(),
@@ -5663,10 +6269,12 @@ fn connect_blocking_inner(
         session_creation: Mutex::new(()),
         restores: Mutex::new(HashMap::new()),
         restore_ready: Condvar::new(),
+        idle: Mutex::new(crate::acp_idle::IdleSessions::default()),
         ready: Condvar::new(),
         _owned_temp: owned_temp,
     });
     start_temp_cleanup_watcher(&runtime)?;
+    start_idle_exit_watcher(&runtime, app.clone())?;
     let reader = Arc::clone(&runtime);
     let reader_manager = manager.clone();
     let agent_id = agent.clone();
@@ -5674,6 +6282,7 @@ fn connect_blocking_inner(
     std::thread::spawn(move || {
         for line in BufReader::new(output).lines() {
             let Ok(line) = line else { break };
+            reader.touch();
             let Ok(mut message) = serde_json::from_str::<Value>(&line) else {
                 crate::diagnostics::record(
                     "acp_invalid_json",
@@ -5800,6 +6409,9 @@ fn connect_blocking_inner(
                 {
                     if let Ok(mut prompts) = reader.prompt_state.lock() {
                         prompts.observe_update(session_id, update);
+                    }
+                    if let Ok(mut idle) = reader.idle.lock() {
+                        idle.observe_update(session_id, update);
                     }
                     if let Err(error) = reader.remember_session_ui(session_id, update) {
                         crate::diagnostics::record(
@@ -6129,7 +6741,8 @@ fn connect_blocking_inner(
                 message: json!({"method":"sail/disconnected","params":{
                     "profile":profile.as_str(),"sessionIds":session_ids,
                     "sessionDirectories":session_directories,
-                    "releasedOwner":reader.released_owner.load(Ordering::Acquire)
+                    "releasedOwner":reader.released_owner.load(Ordering::Acquire),
+                    "idle":reader.idle_exit.load(Ordering::Acquire)
                 }}),
             },
         );
@@ -6386,7 +6999,11 @@ pub async fn acp_new_session(
             Some(profile.as_str()),
             crate::background_priority::enabled(&app),
         )?;
-        let servers = session_servers(mcp_server(&config));
+        let mut servers = session_servers(mcp_server(&config));
+        with_context_server(
+            &mut servers,
+            crate::context::provider_mcp_server(&app, Path::new(&cwd)),
+        );
         let _serial = runtime
             .session_creation
             .lock()
@@ -6843,6 +7460,54 @@ pub async fn acp_resume_session(
     restore_session(manager, app, browser, params, "session/resume").await
 }
 
+/// OpenCode lists any directory's sessions from one agent, so the sidebar shares a single explore
+/// agent instead of starting one per repository and worktree.
+fn listing_connection(
+    app: &AppHandle,
+    manager: &AgentManager,
+    agent: &str,
+    profile: CapabilityProfile,
+    cwd: &Path,
+) -> Result<(Arc<Connection>, Value), String> {
+    let shared = agent == "opencode" && profile == CapabilityProfile::Explore;
+    let _gate = if shared {
+        Some(manager.4.lock().map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
+    if shared {
+        let existing = manager
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .find(|runtime| {
+                runtime.agent == agent
+                    && runtime.profile == profile
+                    && runtime.owner.is_none()
+                    && runtime.alive.load(Ordering::Acquire)
+                    && !runtime.stopped.load(Ordering::Acquire)
+                    && runtime
+                        .capabilities
+                        .lock()
+                        .is_ok_and(|capabilities| !capabilities.is_null())
+            })
+            .cloned();
+        if let Some(runtime) = existing {
+            runtime.touch();
+            let capabilities = runtime
+                .capabilities
+                .lock()
+                .map_err(|error| error.to_string())?
+                .clone();
+            return Ok((runtime, capabilities));
+        }
+    }
+    let capabilities = connect_blocking(app.clone(), manager, agent.to_string(), profile, cwd)?;
+    let runtime = connection_for_profile(manager, agent, profile, cwd)?;
+    Ok((runtime, capabilities))
+}
+
 /// One page of the agent's own session history for a working directory.
 #[tauri::command]
 pub async fn acp_list_sessions(
@@ -6856,20 +7521,27 @@ pub async fn acp_list_sessions(
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let capabilities =
-            connect_blocking(app, &manager, agent.clone(), profile, Path::new(&cwd))?;
-        if capabilities
-            .pointer("/agentCapabilities/sessionCapabilities/list")
-            .is_none()
-        {
-            return Ok(json!({"sessions": []}));
+        let directory = canonical_directory(&cwd);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let (runtime, capabilities) =
+                listing_connection(&app, &manager, &agent, profile, &directory)?;
+            if capabilities
+                .pointer("/agentCapabilities/sessionCapabilities/list")
+                .is_none()
+            {
+                return Ok(json!({"sessions": []}));
+            }
+            let params = session_list_params(&directory, cursor.as_deref());
+            let result = runtime.request("session/list", params, Duration::from_secs(30));
+            // The shared agent may exit (idle, worktree removal) between lookup and request;
+            // the next lookup respawns it.
+            if result.is_err() && attempts < 2 && !runtime.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            return result;
         }
-        let runtime = connection_for_profile(&manager, &agent, profile, Path::new(&cwd))?;
-        let mut params = json!({"cwd": cwd});
-        if let Some(cursor) = cursor {
-            params["cursor"] = json!(cursor);
-        }
-        runtime.request("session/list", params, Duration::from_secs(30))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -6904,6 +7576,22 @@ async fn restore_session(
     params: RestoreSessionCommand,
     method: &'static str,
 ) -> Result<Value, String> {
+    let manager = manager.inner().clone();
+    let browser = browser.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        restore_session_blocking(app, &manager, &browser, params, method)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn restore_session_blocking(
+    app: AppHandle,
+    manager: &AgentManager,
+    browser: &crate::browser_agent::BrowserManager,
+    params: RestoreSessionCommand,
+    method: &'static str,
+) -> Result<Value, String> {
     let RestoreSessionCommand {
         agent,
         cwd,
@@ -6913,12 +7601,10 @@ async fn restore_session(
     } = params;
     let manager_generation = manager.forget_generation(&agent, &cwd, &session_id)?;
     let profile = parse_profile(profile.as_deref())?;
-    let manager = manager.inner().clone();
-    let browser = browser.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    {
         let capabilities = connect_blocking_owned(
             app.clone(),
-            &manager,
+            manager,
             agent.clone(),
             profile,
             Path::new(&cwd),
@@ -6934,7 +7620,7 @@ async fn restore_session(
             &cwd,
             &session_id,
             manager_generation,
-            || register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd)),
+            || register_session(manager, &agent, profile, &session_id, PathBuf::from(&cwd)),
         )?;
         with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
             // Forget must not finish while this restore mints a browser token.
@@ -6953,7 +7639,7 @@ async fn restore_session(
                             .get(&session_id)
                             .copied()
                             .unwrap_or(0);
-                        let (params, minted_token) = {
+                        let (mut params, minted_token) = {
                             let mut configs = runtime
                                 .session_configs
                                 .lock()
@@ -6989,6 +7675,17 @@ async fn restore_session(
                                 |token| browser.release(token),
                             )?
                         };
+                        let context = crate::context::provider_mcp_server(&app, Path::new(&cwd));
+                        if let Some(servers) =
+                            params.get_mut("mcpServers").and_then(Value::as_array_mut)
+                        {
+                            with_context_server(servers, context);
+                            if let Ok(mut configs) = runtime.session_configs.lock() {
+                                if let Some(config) = configs.get_mut(&session_id) {
+                                    config.servers = servers.clone();
+                                }
+                            }
+                        }
                         Ok((forget_generation, params, minted_token))
                     },
                 )?;
@@ -7017,7 +7714,7 @@ async fn restore_session(
             }
             let result = result?;
             complete_restore_if_current(
-                &manager,
+                manager,
                 &runtime.prompt_state,
                 &agent,
                 &cwd,
@@ -7036,9 +7733,7 @@ async fn restore_session(
                 },
             )
         })
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    }
 }
 
 fn prompt_content(
@@ -7206,6 +7901,7 @@ mod task_reporting_tests {
 pub async fn acp_prompt(
     app: AppHandle,
     manager: State<'_, AgentManager>,
+    browser: State<'_, crate::browser_agent::BrowserManager>,
     params: AcpPromptParams,
 ) -> Result<Value, String> {
     let AcpPromptParams {
@@ -7218,7 +7914,15 @@ pub async fn acp_prompt(
     } = params;
     let mut content = prepare_prompt_content(&app, &text, image_paths).await?;
     content.push(json!({"type":"text","text":TASK_REPORT_GUIDANCE}));
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+    let runtime = connection_for_session_reattaching(
+        &app,
+        &manager,
+        &browser,
+        &agent,
+        &session_id,
+        Path::new(&directory),
+    )
+    .await?;
     let preflight_runtime = Arc::clone(&runtime);
     let preflight_session = session_id.clone();
     let preflight_turn = turn_id.clone();
@@ -7238,6 +7942,14 @@ pub async fn acp_prompt(
             .lock()
             .map_err(|error| error.to_string())?;
         prompts.ensure_prompt_available(&preflight_session)?;
+        if !preflight_runtime
+            .session_profiles
+            .lock()
+            .map_err(|error| error.to_string())?
+            .contains_key(&preflight_session)
+        {
+            return Err("Agent session is not connected in this worktree.".to_string());
+        }
         if preflight_runtime
             .cancelled_prompts
             .lock()
@@ -7796,6 +8508,64 @@ fn runtime_has_live_children(root: u32, temp_directory: Option<&Path>) -> bool {
     })
 }
 
+/// The text `recoverMissingSession` retries on after reattaching the session.
+const IDLE_EXIT_ERROR: &str = "Agent session is not connected in this worktree.";
+
+const OPENCODE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Idle limit for OpenCode agents; `SAIL_OPENCODE_IDLE_TIMEOUT_SECS=0` keeps them until app exit.
+fn opencode_idle_timeout() -> Option<Duration> {
+    match std::env::var("SAIL_OPENCODE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => Some(OPENCODE_IDLE_TIMEOUT),
+    }
+}
+
+fn start_idle_exit_watcher(runtime: &Arc<Connection>, app: AppHandle) -> Result<(), String> {
+    let Some(timeout) = opencode_idle_timeout() else {
+        return Ok(());
+    };
+    if runtime.agent != "opencode" || runtime.owner.is_some() {
+        return Ok(());
+    }
+    let weak = Arc::downgrade(runtime);
+    let tick = (timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    std::thread::Builder::new()
+        .name("sail-agent-idle-exit".into())
+        .spawn(move || loop {
+            std::thread::sleep(tick);
+            let Some(runtime) = weak.upgrade() else {
+                break;
+            };
+            if runtime.stopped.load(Ordering::Acquire) || !runtime.alive.load(Ordering::Acquire) {
+                break;
+            }
+            let exited = runtime.exit_if_idle(timeout, || {
+                let session_ids = runtime
+                    .session_profiles
+                    .lock()
+                    .map(|profiles| profiles.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                app.state::<crate::acp_terminal::AcpTerminalManager>()
+                    .has_running_sessions(
+                        &runtime.agent,
+                        runtime.profile,
+                        &runtime.worktree,
+                        &session_ids,
+                    )
+            });
+            if exited {
+                break;
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Cannot watch agent idle time: {error}"))
+}
+
 fn start_temp_cleanup_watcher(runtime: &Arc<Connection>) -> Result<(), String> {
     let weak = Arc::downgrade(runtime);
     std::thread::Builder::new()
@@ -8339,14 +9109,27 @@ pub async fn acp_permission(
 
 #[tauri::command]
 pub async fn acp_set_config(
-    manager: State<'_, AgentManager>,
+    app: AppHandle,
     agent: String,
     directory: String,
     session_id: String,
     config_id: String,
     value: String,
 ) -> Result<Value, String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+    let manager = app.state::<AgentManager>().inner().clone();
+    let browser = app
+        .state::<crate::browser_agent::BrowserManager>()
+        .inner()
+        .clone();
+    let runtime = connection_for_session_reattaching(
+        &app,
+        &manager,
+        &browser,
+        &agent,
+        &session_id,
+        Path::new(&directory),
+    )
+    .await?;
     tauri::async_runtime::spawn_blocking(move || {
         let result = runtime.request(
             "session/set_config_option",
@@ -8403,6 +9186,20 @@ fn spawn_test_session_process() -> std::process::Child {
 mod session_config_tests {
     use super::*;
     use crate::browser_agent::McpConfig;
+
+    #[test]
+    fn context_server_is_optional_and_registered_once() {
+        let browser = json!({"name":"sail-browser", "args":["--browser-mcp"]});
+        let context = json!({"name":"project-files", "args":["--context-mcp", "/project"]});
+        let mut servers = session_servers(browser.clone());
+        with_context_server(&mut servers, None);
+        assert_eq!(servers, vec![browser.clone()]);
+        with_context_server(&mut servers, Some(context.clone()));
+        with_context_server(&mut servers, Some(context.clone()));
+        assert_eq!(servers, vec![browser.clone(), context]);
+        with_context_server(&mut servers, None);
+        assert_eq!(servers, vec![browser]);
+    }
     use std::collections::BTreeMap;
 
     #[test]
@@ -8478,9 +9275,17 @@ mod session_config_tests {
     #[cfg(unix)]
     #[test]
     fn temporary_cleanup_retries_after_worker_exits() {
+        struct RuntimeGuard(Arc<Connection>);
+        impl Drop for RuntimeGuard {
+            fn drop(&mut self) {
+                let _ = self.0.stop_child();
+            }
+        }
         let scratch =
             std::env::temp_dir().join(format!("sail-turn-temp-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&scratch).unwrap();
+        let identity = crate::worktree_directory_identity(&scratch).unwrap();
+        let _scratch = OwnedTempDir(scratch.clone(), identity);
         let worktree = scratch.join("plain-folder");
         std::fs::create_dir(&worktree).unwrap();
         let cache = scratch.join("cache");
@@ -8493,7 +9298,7 @@ mod session_config_tests {
         command
             .args([
                 "-c",
-                "sleep 30 & worker=$!; read signal; kill \"$worker\"; wait \"$worker\" 2>/dev/null; exec sleep 10",
+                "exec 3<&0; (read -r release <&3) & wait; read -r release <&3",
             ])
             .stdin(Stdio::piped());
         unsafe {
@@ -8514,6 +9319,7 @@ mod session_config_tests {
             child,
         );
         Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        let _runtime = RuntimeGuard(runtime.clone());
         let root = runtime.child.lock().unwrap().id();
         for _ in 0..100 {
             if runtime_has_live_children(root, None) {
@@ -8525,7 +9331,12 @@ mod session_config_tests {
         start_temp_cleanup_watcher(&runtime).unwrap();
         runtime.clear_idle_temp(true).unwrap();
         assert!(artifact.exists());
-        runtime.input.lock().unwrap().write_all(b"\n").unwrap();
+        runtime
+            .input
+            .lock()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
 
         for _ in 0..100 {
             if !artifact.exists() {
@@ -8539,15 +9350,22 @@ mod session_config_tests {
         );
         runtime.stop_child().unwrap();
         drop(runtime);
-        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn temporary_cleanup_preserves_orphaned_worker() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
         let scratch =
             std::env::temp_dir().join(format!("sail-orphan-temp-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&scratch).unwrap();
+        let _scratch = Scratch(scratch.clone());
         let worktree = scratch.join("plain-folder");
         std::fs::create_dir(&worktree).unwrap();
         let (_, lease) =
@@ -8556,17 +9374,19 @@ mod session_config_tests {
         let temp = lease.temp_directory().to_path_buf();
         let artifact = temp.join("artifact");
         let ready = scratch.join("ready");
-        let code = r#"import os,sys,time
+        let code = r#"import os,sys
 p=os.fork()
 if p==0:
     p2=os.fork()
     if p2>0: os._exit(0)
-    open(sys.argv[1], 'w').write('live')
+    artifact=open(sys.argv[1], 'w')
+    artifact.write('live')
+    artifact.flush()
     open(sys.argv[2], 'w').write(str(os.getpid()))
-    time.sleep(10)
+    sys.stdin.buffer.read()
     os._exit(0)
 os.waitpid(p, 0)
-time.sleep(10)
+sys.stdin.buffer.read()
 "#;
         let mut command = Command::new("python3");
         command
@@ -8606,7 +9426,6 @@ time.sleep(10)
         assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
         runtime.stop_child().unwrap();
         drop(runtime);
-        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[cfg(unix)]
@@ -8943,6 +9762,8 @@ time.sleep(10)
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
             released_owner: AtomicBool::new(false),
+            idle_exit: AtomicBool::new(false),
+            last_activity: Mutex::new(Instant::now()),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
@@ -8975,9 +9796,90 @@ time.sleep(10)
             session_creation: Mutex::new(()),
             restores: Mutex::new(HashMap::new()),
             restore_ready: Condvar::new(),
+            idle: Mutex::new(crate::acp_idle::IdleSessions::default()),
             ready: Condvar::new(),
             _owned_temp: None,
         })
+    }
+
+    #[cfg(unix)]
+    fn idle_runtime(agent: &str, owner: Option<&str>) -> Arc<Connection> {
+        let runtime = test_runtime(
+            agent,
+            CapabilityProfile::Explore,
+            Path::new("/worktree"),
+            "session",
+            owner,
+        );
+        runtime.elicitation_state.lock().unwrap().clear();
+        *runtime.capabilities.lock().unwrap() = json!({"agentCapabilities":{}});
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        runtime
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_opencode_agent_exits_and_reports_idleness() {
+        let runtime = idle_runtime("opencode", None);
+
+        assert!(runtime.exit_if_idle(Duration::from_secs(30), || false));
+        assert!(!runtime.alive.load(Ordering::Acquire));
+        assert!(runtime.idle_exit.load(Ordering::Acquire));
+        assert_eq!(
+            runtime
+                .request("session/prompt", json!({}), Duration::from_secs(1))
+                .unwrap_err(),
+            IDLE_EXIT_ERROR,
+            "a request racing the idle exit must be recoverable by reattaching"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_activity_keeps_opencode_agent_alive() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.touch();
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(30), || false));
+        assert!(runtime.alive.load(Ordering::Acquire));
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn busy_opencode_agent_defers_idle_exit_by_a_full_timeout() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.elicitation_state.lock().unwrap().insert(
+            "7".into(),
+            PendingElicitation {
+                message: json!({"method":"elicitation/create","id":7,"params":{"sessionId":"session"}}),
+                received_at: 1,
+            },
+        );
+        assert!(!runtime.exit_if_idle(Duration::from_secs(30), || false));
+        assert!(!runtime.idle_exit.load(Ordering::Acquire));
+        runtime.elicitation_state.lock().unwrap().clear();
+        assert!(
+            !runtime.exit_if_idle(Duration::from_secs(30), || false),
+            "a deferred check must wait out the timeout again"
+        );
+
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        assert!(!runtime.exit_if_idle(Duration::from_secs(30), || true));
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_exit_applies_only_to_unowned_opencode_agents() {
+        for runtime in [
+            idle_runtime("codex", None),
+            idle_runtime("opencode", Some("0b7a7c41-5f3e-4f4a-9f0c-8f6f3f0d9a11")),
+        ] {
+            assert!(!runtime.exit_if_idle(Duration::from_secs(30), || false));
+            assert!(runtime.alive.load(Ordering::Acquire));
+            runtime.terminate().unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -9151,6 +10053,12 @@ time.sleep(10)
             runtime_environment(&first_data, &first_temp, Some(&first_scratch), None);
         let second_environment =
             runtime_environment(&second_data, &second_temp, Some(&second_scratch), None);
+        assert!(
+            first_environment
+                .iter()
+                .all(|(name, _)| *name != "MISE_STATE_DIR"),
+            "agent runtimes must inherit mise's trusted configuration state"
+        );
         let path = |environment: &[(&str, PathBuf)], name| {
             environment
                 .iter()
@@ -9165,6 +10073,8 @@ time.sleep(10)
             "CARGO_TARGET_DIR",
             "GOCACHE",
             "GOTMPDIR",
+            "UV_TOOL_DIR",
+            "UV_TOOL_BIN_DIR",
         ] {
             assert_ne!(
                 path(&first_environment, name),
@@ -9179,9 +10089,13 @@ time.sleep(10)
         for directory in [
             first_temp.clone(),
             first_data.join("cache"),
+            first_data.join("bin"),
+            first_data.join("uv-tools"),
             first_temp.join("go-tmp"),
             second_temp.clone(),
             second_data.join("cache"),
+            second_data.join("bin"),
+            second_data.join("uv-tools"),
             second_temp.join("go-tmp"),
         ] {
             assert!(
@@ -9204,6 +10118,116 @@ time.sleep(10)
             );
         }
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn configured_tool_paths_prefer_repository_tool_shims() {
+        let root = scratch("configured-tool-paths");
+        let shims = root.join(".local/share/mise/shims");
+        let local = root.join(".local/bin");
+        let cargo = root.join(".cargo/bin");
+        let local_app_data = root.join("AppData/Local");
+        let windows_shims = local_app_data.join("mise/shims");
+        for directory in [&shims, &local, &cargo, &windows_shims] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        assert_eq!(
+            configured_tool_paths(Some(&root), None, false),
+            vec![shims.clone(), local.clone(), cargo.clone()]
+        );
+        assert_eq!(
+            configured_tool_paths(Some(&root), Some(&local_app_data), true),
+            vec![windows_shims.clone(), local, cargo]
+        );
+        assert_eq!(
+            configured_tool_paths(None, Some(&local_app_data), true),
+            vec![windows_shims.clone()]
+        );
+        assert!(configured_tool_paths(None, None, false).is_empty());
+
+        let scoped_bin = root.join("agent-data/bin");
+        let inherited =
+            std::env::join_paths([root.join("system/bin"), root.join("usr/bin")]).unwrap();
+        let joined = agent_path(
+            configured_tool_paths(Some(&root), None, false),
+            scoped_bin.clone(),
+            &inherited,
+        )
+        .unwrap();
+        assert_eq!(
+            std::env::split_paths(&joined).collect::<Vec<_>>(),
+            vec![
+                shims,
+                scoped_bin.clone(),
+                root.join(".local/bin"),
+                root.join(".cargo/bin"),
+                root.join("system/bin"),
+                root.join("usr/bin")
+            ]
+        );
+        let windows_joined = agent_path(
+            configured_tool_paths(Some(&root), Some(&local_app_data), true),
+            scoped_bin,
+            &inherited,
+        )
+        .unwrap();
+        assert_eq!(
+            std::env::split_paths(&windows_joined).collect::<Vec<_>>(),
+            vec![
+                windows_shims,
+                root.join("agent-data/bin"),
+                root.join(".local/bin"),
+                root.join(".cargo/bin"),
+                root.join("system/bin"),
+                root.join("usr/bin")
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_gnupg_access_is_limited_to_the_existing_directory() {
+        let root = scratch("default-gnupg");
+        let home = root.join("home");
+        let assigned = root.join("assigned");
+        let gnupg = home.join(".gnupg");
+        let sibling = home.join(".ssh");
+        for directory in [&assigned, &gnupg, &sibling] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        assert_eq!(default_gnupg_directory(Some(&home)), Some(gnupg.clone()));
+        assert!(default_gnupg_directory(Some(&root.join("missing-home"))).is_none());
+        assert!(default_gnupg_directory(None).is_none());
+
+        let access = CodexWorkspaceAccess::capture(
+            &assigned,
+            std::slice::from_ref(&default_gnupg_directory(Some(&home)).unwrap()),
+        )
+        .unwrap();
+        let rules = serde_json::from_str::<Value>(&access.profile_config().unwrap()).unwrap()
+            ["configOverrides"][2]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let writable_rule = |path: &Path| {
+            format!(
+                "{}=\"write\"",
+                serde_json::to_string(path.to_str().unwrap()).unwrap()
+            )
+        };
+        assert!(rules.contains(&writable_rule(&dunce::canonicalize(&gnupg).unwrap())));
+        assert!(!rules.contains(&writable_rule(&dunce::canonicalize(&home).unwrap())));
+        assert!(!rules.contains(&writable_rule(&dunce::canonicalize(&sibling).unwrap())));
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&gnupg).unwrap();
+            std::os::unix::fs::symlink(&sibling, &gnupg).unwrap();
+            assert!(default_gnupg_directory(Some(&home)).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -9325,6 +10349,8 @@ time.sleep(10)
                 watchdog: Mutex::new(watchdog),
                 stopped: AtomicBool::new(false),
                 released_owner: AtomicBool::new(false),
+                idle_exit: AtomicBool::new(false),
+                last_activity: Mutex::new(Instant::now()),
                 input: Mutex::new(input),
                 pending: Mutex::new(HashMap::new()),
                 reader_progress: ReaderProgress::default(),
@@ -9348,6 +10374,7 @@ time.sleep(10)
                 session_creation: Mutex::new(()),
                 restores: Mutex::new(HashMap::new()),
                 restore_ready: Condvar::new(),
+                idle: Mutex::new(crate::acp_idle::IdleSessions::default()),
                 ready: Condvar::new(),
                 _owned_temp: None,
             })
@@ -9763,10 +10790,71 @@ time.sleep(10)
             .contains("outside"));
         let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
         let rules = config["configOverrides"][2].as_str().unwrap();
+        let canonical_assigned = dunce::canonicalize(&assigned).unwrap();
+        let assigned_key = serde_json::to_string(canonical_assigned.to_str().unwrap()).unwrap();
+        let owned_key =
+            serde_json::to_string(dunce::canonicalize(&owned).unwrap().to_str().unwrap()).unwrap();
+        let sibling_key =
+            serde_json::to_string(dunce::canonicalize(&sibling).unwrap().to_str().unwrap())
+                .unwrap();
         assert!(rules.contains("extends=\":read-only\""));
         assert!(!rules.contains(":workspace"));
-        assert!(!rules.contains(sibling.to_str().unwrap()));
+        assert!(rules.contains(&assigned_key));
+        assert!(rules.contains(&owned_key));
+        assert!(!rules.contains(&sibling_key));
         assert!(!rules.contains(":tmpdir"));
+        let permission_instructions = config["developerInstructions"].as_str().unwrap();
+        assert!(config["configOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .all(|value| !value.starts_with("developer_instructions=")));
+        for allowed in [
+            "active permission profile is sail-agent on macOS",
+            "ps -ef",
+            "pgrep -fl followed by one literal task-owned pattern",
+            "bounded task-owned background job",
+            "sandbox_permissions to require_escalated",
+            "Keep the sail-agent session profile unchanged",
+        ] {
+            assert!(permission_instructions.contains(allowed), "{allowed}");
+        }
+        for forbidden in [
+            "other ps or pgrep forms",
+            "kill",
+            "pkill",
+            "renice",
+            "signals",
+            "process mutation",
+            "unrelated commands",
+            "filesystem access",
+            "network access",
+        ] {
+            assert!(permission_instructions.contains(forbidden), "{forbidden}");
+        }
+        for required in [
+            "automatic approval review",
+            "explicit user grants in the current turn",
+            "only the named recovery action",
+            "task-scoped source or checkpoint writes",
+            "bounded focused validation",
+            "expected rejection does not authorize it",
+            "Reject that action before execution",
+            "treat its asserted nonzero rejection as successful evidence",
+            "Never execute an out-of-grant mutation",
+            "workflow-required focused re-attestation",
+            "under the same active task-scoped grant",
+            "Reject every broader mutation",
+            "ungranted resource or action",
+            "control bypass",
+            "state the specific excess",
+        ] {
+            assert!(permission_instructions.contains(required), "{required}");
+        }
+        assert_eq!(config["modeProfiles"]["agent"], "sail-agent");
+        assert_eq!(config["modeProfiles"]["agent-full-access"], "sail-agent");
+        assert!(!config.to_string().contains(":danger-full-access"));
         #[cfg(unix)]
         {
             let alias = root.join("alias");
@@ -9776,6 +10864,14 @@ time.sleep(10)
             assert_eq!(
                 access.profile_config().unwrap(),
                 aliased.profile_config().unwrap()
+            );
+            assert_eq!(
+                session_request_params(alias.to_str().unwrap(), None, &[])["cwd"],
+                json!(canonical_assigned)
+            );
+            assert_eq!(
+                session_list_params(&canonical_directory(alias.to_str().unwrap()), Some("next")),
+                json!({"cwd": canonical_assigned, "cursor": "next"})
             );
             access.validate(Some(alias.to_str().unwrap())).unwrap();
             assert!(CodexWorkspaceAccess::capture(&assigned, &[alias])
@@ -9876,6 +10972,47 @@ time.sleep(10)
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_workspace_access_runs_gpg_without_granting_home() {
+        let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") else {
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let gnupg = default_gnupg_directory(Some(&home)).unwrap();
+        let gpg = find_executable("gpg").unwrap();
+        let assigned = scratch("codex-gpg-access");
+        std::fs::create_dir_all(&assigned).unwrap();
+        let access =
+            CodexWorkspaceAccess::capture(&assigned, std::slice::from_ref(&gnupg)).unwrap();
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let run = |arguments: &[&str]| {
+            let mut command = Command::new(&codex);
+            command
+                .arg("sandbox")
+                .args(["-P", "sail-agent", "-C"])
+                .arg(&assigned);
+            for value in config["configOverrides"].as_array().unwrap() {
+                command.arg("-c").arg(value.as_str().unwrap());
+            }
+            command.arg("--").args(arguments).output().unwrap()
+        };
+
+        let trustdb = run(&[gpg.to_str().unwrap(), "--check-trustdb"]);
+        assert!(
+            trustdb.status.success(),
+            "{}",
+            String::from_utf8_lossy(&trustdb.stderr)
+        );
+
+        let denied = home.join(format!(".sail-codex-gpg-denied-{}", std::process::id()));
+        assert!(!denied.exists());
+        let denied_write = run(&["/usr/bin/touch", denied.to_str().unwrap()]);
+        assert!(!denied_write.status.success());
+        assert!(!denied.exists());
+        std::fs::remove_dir_all(assigned).unwrap();
+    }
+
     #[test]
     fn linked_worktree_session_grants_only_its_private_git_overlay() {
         let root = scratch("linked-git");
@@ -9949,6 +11086,13 @@ time.sleep(10)
         )
         .unwrap();
         let overrides = profile["configOverrides"].as_array().unwrap();
+        let linked_key =
+            serde_json::to_string(dunce::canonicalize(&linked).unwrap().to_str().unwrap()).unwrap();
+        assert!(overrides.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value.contains(&linked_key))
+        }));
         assert!(overrides.iter().all(|value| !value
             .as_str()
             .is_some_and(|value| value.contains(&common.to_string_lossy().to_string()))));
@@ -10578,6 +11722,8 @@ mod native_subagent_fence_tests {
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
             released_owner: AtomicBool::new(false),
+            idle_exit: AtomicBool::new(false),
+            last_activity: Mutex::new(Instant::now()),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
@@ -10601,6 +11747,7 @@ mod native_subagent_fence_tests {
             session_creation: Mutex::new(()),
             restores: Mutex::new(HashMap::new()),
             restore_ready: Condvar::new(),
+            idle: Mutex::new(crate::acp_idle::IdleSessions::default()),
             ready: Condvar::new(),
             _owned_temp: None,
         });
@@ -11713,5 +12860,144 @@ mod native_agent_tests {
                 .collect();
         assert_eq!(ids, ["claude", "codex", "opencode"]);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod idle_close_tests {
+    use super::*;
+
+    fn runtime(session: &str) -> Arc<Connection> {
+        let directory = std::env::temp_dir();
+        let runtime = super::session_config_tests::test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &directory,
+            session,
+            None,
+        );
+        runtime.elicitation_state.lock().unwrap().clear();
+        runtime.permission_state.lock().unwrap().pending.clear();
+        runtime
+    }
+
+    #[test]
+    fn pending_question_keeps_the_session_loaded() {
+        let runtime = runtime("ses_question");
+        runtime.elicitation_state.lock().unwrap().insert(
+            "1".into(),
+            PendingElicitation {
+                message: json!({"method":"elicitation/create","id":1,"params":{"sessionId":"ses_question"}}),
+                received_at: 1,
+            },
+        );
+        assert!(holds_work(&runtime, "ses_question", false));
+    }
+
+    fn holds_work(runtime: &Connection, session: &str, terminal_running: bool) -> bool {
+        let restores = runtime.restores.lock().unwrap();
+        let prompts = runtime.prompt_state.lock().unwrap();
+        runtime
+            .session_holds_work(session, &prompts, &restores, terminal_running)
+            .unwrap()
+    }
+
+    fn active_prompt() -> ActivePrompt {
+        ActivePrompt {
+            turn_id: "turn".into(),
+            text: "task".into(),
+            dispatched: true,
+            memory_capture: crate::memory_capture::TurnCapture::default(),
+            last_agent_message: String::new(),
+            agent_message_open: false,
+            agent_message_overflow: false,
+            known_tool_calls: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn finished_session_without_work_may_close() {
+        let runtime = runtime("ses_done");
+        assert!(!holds_work(&runtime, "ses_done", false));
+    }
+
+    #[test]
+    fn running_turn_keeps_the_session_loaded() {
+        let runtime = runtime("ses_turn");
+        runtime
+            .prompt_state
+            .lock()
+            .unwrap()
+            .active
+            .insert("ses_turn".into(), active_prompt());
+        assert!(holds_work(&runtime, "ses_turn", false));
+    }
+
+    #[test]
+    fn running_terminal_keeps_the_session_loaded() {
+        let runtime = runtime("ses_terminal");
+        assert!(holds_work(&runtime, "ses_terminal", true));
+    }
+
+    #[test]
+    fn background_task_keeps_the_session_loaded_until_it_ends() {
+        let runtime = runtime("ses_task");
+        let update = |value: Value| {
+            runtime
+                .idle
+                .lock()
+                .unwrap()
+                .observe_update("ses_task", &value)
+        };
+        update(json!({"sessionUpdate":"async_task_spawned","asyncTaskId":"shell"}));
+        assert!(holds_work(&runtime, "ses_task", false));
+        update(
+            json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"shell","state":"completed"}),
+        );
+        assert!(!holds_work(&runtime, "ses_task", false));
+    }
+
+    #[test]
+    fn live_subagent_keeps_its_parent_loaded_until_it_ends() {
+        let runtime = runtime("ses_parent");
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .spawn("ses_parent", "ses_child", std::env::temp_dir(), false)
+            .unwrap();
+        assert!(holds_work(&runtime, "ses_parent", false));
+        assert!(holds_work(&runtime, "ses_child", false));
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .update("ses_parent", "ses_child", "completed")
+            .unwrap();
+        assert!(!holds_work(&runtime, "ses_parent", false));
+        assert!(!holds_work(&runtime, "ses_child", false));
+    }
+
+    #[test]
+    fn restoring_session_keeps_it_loaded() {
+        let runtime = runtime("ses_restore");
+        runtime.begin_restore("ses_restore").unwrap();
+        assert!(holds_work(&runtime, "ses_restore", false));
+    }
+
+    #[test]
+    fn close_support_requires_a_codex_adapter_that_advertises_it() {
+        let runtime = runtime("ses_caps");
+        assert!(!runtime.supports_session_close());
+        *runtime.capabilities.lock().unwrap() =
+            json!({"agentCapabilities":{"sessionCapabilities":{"close":{}}}});
+        assert!(runtime.supports_session_close());
+    }
+
+    #[test]
+    fn unknown_session_close_errors_count_as_closed() {
+        assert!(is_unknown_session_error("Session not found"));
+        assert!(is_unknown_session_error("unknown thread abc"));
+        assert!(!is_unknown_session_error("request timed out"));
     }
 }

@@ -150,6 +150,79 @@ function callWorktreeList(server, callback) {
   request(2, 'tools/call', { name: 'worktree_list', arguments: {} });
 }
 
+function callContextProvider(server, callback) {
+  const child = spawn(server.command, server.args ?? [], {
+    env: {
+      ...process.env,
+      ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])),
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let stderr = '';
+  let settled = false;
+  let initialized = false;
+  const finish = (result) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    child.kill();
+    callback(result);
+  };
+  let timer = setTimeout(
+    () => finish({ error: 'Context provider initialization timed out' }),
+    30_000,
+  );
+  child.stdout.on('data', (chunk) => {
+    output += chunk;
+    let index;
+    while ((index = output.indexOf('\n')) >= 0) {
+      const line = output.slice(0, index);
+      output = output.slice(index + 1);
+      try {
+        const response = JSON.parse(line);
+        if (response.id === 1 && !initialized) {
+          if (response.error || !response.result?.protocolVersion) {
+            finish({ error: 'Context provider initialization failed' });
+            continue;
+          }
+          initialized = true;
+          clearTimeout(timer);
+          timer = setTimeout(
+            () => finish({ error: 'Context provider tool discovery timed out' }),
+            30_000,
+          );
+          child.stdin.write(
+            `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`,
+          );
+          child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`);
+        }
+        if (response.id === 2) finish(response);
+      } catch {
+        continue;
+      }
+    }
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr = (stderr + chunk).slice(-512);
+  });
+  child.on('error', (error) => finish({ error: error.message }));
+  child.on('exit', (code) => finish({ error: stderr.trim() || `Context bridge exited ${code}` }));
+  child.stdin.on('error', (error) => finish({ error: error.message }));
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'sail-acp-fixture', version: '1.0' },
+      },
+    })}\n`,
+  );
+}
+
 function reportSessionTasks(server, callback, focusDuration = 1500, onFocus = () => {}, identity) {
   const child = spawn(server.command, server.args ?? [], {
     env: {
@@ -367,6 +440,7 @@ for await (const line of createInterface({ input: process.stdin })) {
           sessionCapabilities: {
             resume: {},
             subagents: {},
+            ...(agent === 'codex' ? { close: {} } : {}),
             ...(agent === 'opencode' ? { list: {} } : {}),
           },
         },
@@ -410,6 +484,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         }),
       delayWorktreeDeleteSession ? 10_000 : delayFirstAttentionSession ? 3000 : 1000,
     );
+  } else if (message.method === 'session/close') {
+    const closing = sessions.get(message.params.sessionId);
+    if (closing) closing.evicted = true;
+    if (process.env.SAIL_E2E_ACP_CLOSE_LOG)
+      appendFileSync(process.env.SAIL_E2E_ACP_CLOSE_LOG, `${message.params.sessionId}\n`);
+    send({ id: message.id, result: {} });
   } else if (message.method === 'session/list') {
     const pageSize = 2;
     const cwd = message.params.cwd;
@@ -1290,6 +1370,28 @@ for await (const line of createInterface({ input: process.stdin })) {
         clearTimeout(timer);
         clearInterval(stream);
       });
+      continue;
+    }
+    if (text === 'Check context provider') {
+      const servers = sessions.get(sessionId).mcpServers;
+      const context = servers.filter((server) => server.args?.[0] === '--context-mcp');
+      const report = (response) => {
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: JSON.stringify({
+              agent,
+              context: context.map(({ name, command, args }) => ({ name, command, args })),
+              browserCount: servers.filter((server) => server.name === 'sail-browser').length,
+              response,
+            }),
+          },
+        });
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      };
+      if (context.length === 1) callContextProvider(context[0], report);
+      else report({ error: `Expected one context server; received ${context.length}` });
       continue;
     }
     if (text === 'Check tools') {

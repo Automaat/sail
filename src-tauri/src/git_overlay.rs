@@ -100,10 +100,11 @@ fn register(worktree: &Path, git_dir: &Path, source_git_dir: &Path) {
 
 pub(crate) fn registered_paths(directory: &Path) -> Option<(PathBuf, PathBuf)> {
     let directory = dunce::canonicalize(directory).ok()?;
-    ACTIVE
-        .get()?
-        .lock()
-        .ok()?
+    let registered = ACTIVE
+        .get()
+        .and_then(|entries| entries.lock().ok().map(|entries| entries.clone()))
+        .unwrap_or_default();
+    if let Some(paths) = registered
         .iter()
         .filter(|(root, git_dir, source_git_dir)| {
             directory.starts_with(root)
@@ -114,6 +115,13 @@ pub(crate) fn registered_paths(directory: &Path) -> Option<(PathBuf, PathBuf)> {
         })
         .max_by_key(|(root, _, _)| root.components().count())
         .map(|(root, git_dir, _)| (root.clone(), git_dir.clone()))
+    {
+        return Some(paths);
+    }
+    let cache = CACHE.get()?;
+    let worktree = known_worktree_in_cache(cache, &directory)?;
+    let overlay = GitOverlay::existing(cache, &worktree).ok().flatten()?;
+    Some((overlay.worktree, overlay.git_dir))
 }
 
 pub(crate) fn registered_directory(directory: &Path) -> Option<PathBuf> {
@@ -126,7 +134,9 @@ pub(crate) fn index_differs(directory: &Path) -> Option<bool> {
     let (_, private, source) = entries
         .iter()
         .filter(|(root, _, _)| directory.starts_with(root))
-        .max_by_key(|(root, _, _)| root.components().count())?;
+        .max_by_key(|(root, _, _)| root.components().count())?
+        .clone();
+    drop(entries);
     let private_index = fs::read(private.join("index")).ok();
     let source_index = fs::read(source.join("index")).ok();
     Some(private_index != source_index)
@@ -159,8 +169,11 @@ fn known_worktree_in_cache(cache: &Path, directory: &Path) -> Option<PathBuf> {
     })
 }
 
-pub(crate) fn initialize(cache: &Path) {
+pub(crate) fn configure(cache: &Path) {
     let _ = CACHE.set(cache.to_path_buf());
+}
+
+pub(crate) fn restore_registered(cache: &Path) {
     let directory = cache.join("git-overlay-manifests");
     let Ok(entries) = fs::read_dir(directory) else {
         return;
@@ -1210,7 +1223,18 @@ fn process_uses_overlay(process: &sysinfo::Process, worktree: &Path, git_dir: &P
     {
         windows_process_is_alive(process.pid().as_u32())
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        // Process metadata can outlive its writer while cwd is being read.
+        !matches!(
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(process.pid().as_u32() as i32),
+                None
+            ),
+            Err(nix::errno::Errno::ESRCH)
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         true
     }
@@ -2220,6 +2244,78 @@ mod tests {
                 "Relative Git target must retain its writer: {arguments:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_unix_git_snapshot_does_not_block_overlay_recovery() {
+        use std::io::{BufRead, BufReader};
+
+        struct OwnedWriter(std::process::Child);
+        impl Drop for OwnedWriter {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let mut command = git_command();
+        overlay.apply(&mut command);
+        let mut writer = OwnedWriter(
+            command
+                .args(["update-ref", "--stdin"])
+                .current_dir(&fixture.task)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        writer
+            .0
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"start\n")
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(writer.0.stdout.take().unwrap())
+            .read_line(&mut response)
+            .unwrap();
+        assert_eq!(response.trim(), "start: ok");
+
+        let pid = sysinfo::Pid::from_u32(writer.0.id());
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            false,
+            sysinfo::ProcessRefreshKind::everything(),
+        );
+        let snapshot = system.process(pid).unwrap();
+        assert!(process_uses_overlay(
+            snapshot,
+            &fixture.task,
+            &overlay.git_dir
+        ));
+
+        writer.0.kill().unwrap();
+        writer.0.wait().unwrap();
+        assert!(process_context_uses_overlay(
+            snapshot.cwd(),
+            snapshot.name(),
+            snapshot.cmd(),
+            snapshot.environ(),
+            &fixture.task,
+            &overlay.git_dir,
+        ));
+        assert!(!process_uses_overlay(
+            snapshot,
+            &fixture.task,
+            &overlay.git_dir
+        ));
     }
 
     #[cfg(windows)]

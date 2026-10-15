@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
@@ -8,6 +8,8 @@ import {
   artifactKey,
   artifactMatches,
   nativeEnvironment,
+  nativeFailurePhase,
+  nativePreconditionFailure,
   nativeVerdict,
   setupAttemptLimit,
 } from '../scripts/native-test-policy.mjs';
@@ -17,6 +19,41 @@ await test('setup attempts are finite and reject malformed limits', () => {
   assert.equal(setupAttemptLimit('5'), 5);
   for (const invalid of ['0', '6', '-1', '1.5', 'Infinity', '', '01'])
     assert.throws(() => setupAttemptLimit(invalid), /must be 1–5/);
+});
+
+await test('setup failure diagnostics name the failed precondition', () => {
+  assert.equal(
+    nativeFailurePhase({ status: 'failed', precondition: 'post-test agent request cleanup' }),
+    'post-test agent request cleanup',
+  );
+  assert.equal(nativeFailurePhase({ status: 'ready' }), null);
+  assert.equal(nativeFailurePhase({ status: 'failed' }), null);
+});
+
+await test('post-test cleanup preserves an existing product failure', () => {
+  const setup = nativePreconditionFailure('post-test agent request cleanup', 'still pending', true);
+
+  assert.deepEqual(setup, {
+    status: 'ready',
+    cleanupFailure: {
+      precondition: 'post-test agent request cleanup',
+      detail: 'still pending',
+    },
+  });
+  assert.equal(nativeVerdict(1, setup), 'FAIL');
+  assert.equal(nativeFailurePhase(setup), null);
+});
+
+await test('post-test cleanup after a passing test remains a failed precondition', () => {
+  const setup = nativePreconditionFailure('post-test agent request cleanup', 'still pending');
+
+  assert.deepEqual(setup, {
+    status: 'failed',
+    precondition: 'post-test agent request cleanup',
+    detail: 'still pending',
+  });
+  assert.equal(nativeVerdict(1, setup), 'SETUP_FAILED');
+  assert.equal(nativeFailurePhase(setup), 'post-test agent request cleanup');
 });
 
 await test('exit success cannot produce PASS before every native precondition passes', () => {
@@ -48,8 +85,9 @@ await test('artifact reuse rejects source, toolchain, signature, identity and bi
   assert.equal(artifactMatches(manifest, requirements, 'binary', 'dev.smykla.sail', true), false);
 });
 
-await test('sequential runs canonicalize aliases and isolate every fixture path', () => {
+await test('sequential runs canonicalize aliases and isolate every fixture path', (context) => {
   const root = mkdtempSync(join(tmpdir(), 'sail-native-policy-'));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
   const alias = join(root, 'alias');
   symlinkSync(realpathSync(root), alias, 'dir');
   const inherited = {

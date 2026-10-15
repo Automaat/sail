@@ -8,7 +8,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const OWNER_FILE: &str = "worktree-owner-v2";
 const OWNER_HEADER: &str = "sail-terminal-worktree-owner-v2";
@@ -891,9 +892,6 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             continue;
         }
         reclaim_verified_unstarted_temp(cache_directory, &data_directory);
-        for item in temp_directory_status(cache_directory, &data_directory) {
-            report_pending(&data_directory, &item.reason);
-        }
         // An active sibling shares the repository lock but has a separate lease. Check
         // its lease first so skipping that sibling cannot hold the repository lock
         // while a removed worktree from the same repository is reconciled.
@@ -1193,10 +1191,12 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
         }
     }
     pending.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
+    forget_vanished_pending();
     pending
 }
 
 pub(crate) fn retry_cleanup(cache_directory: &Path) -> Vec<CleanupPending> {
+    forget_reported_pending();
     reconcile(cache_directory);
     cleanup_status(cache_directory)
 }
@@ -3095,6 +3095,7 @@ pub(crate) fn retry_selected_removed_worktree_storage(
     if !valid_cache_key(selected_cache_key) {
         return Err("Invalid selected private storage key.".into());
     }
+    forget_reported_pending();
     let data_directory = cache_directory
         .join("terminal-worktrees")
         .join(selected_cache_key);
@@ -3778,8 +3779,82 @@ fn remove_quarantine_with_identity(
     }
 }
 
+struct ReportedPending {
+    at: Instant,
+    path: PathBuf,
+}
+
+// One record per (key, reason): a path can carry several reasons in a pass.
+type ReportedMap = BTreeMap<(String, String), ReportedPending>;
+
+static REPORTED_PENDING: OnceLock<Mutex<ReportedMap>> = OnceLock::new();
+const REPORT_REPEAT_AFTER: Duration = Duration::from_secs(60 * 60);
+const REPORT_MAP_LIMIT: usize = 256;
+
+// Pollers re-enter the pending paths every second; log a (key, reason)
+// again only when a retry clears the record, the path vanished or an hour
+// passed.
+fn first_report(key: &str, reason: &str, path: &Path) -> bool {
+    let mut reported = REPORTED_PENDING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    note_report(&mut reported, key, reason, path, Instant::now())
+}
+
+fn note_report(
+    reported: &mut ReportedMap,
+    key: &str,
+    reason: &str,
+    path: &Path,
+    now: Instant,
+) -> bool {
+    let fresh = |at: Instant| now.saturating_duration_since(at) < REPORT_REPEAT_AFTER;
+    if reported.len() > REPORT_MAP_LIMIT {
+        reported.retain(|_, entry| fresh(entry.at));
+    }
+    let id = (key.to_string(), reason.to_string());
+    if reported.get(&id).is_some_and(|entry| fresh(entry.at)) {
+        return false;
+    }
+    reported.insert(
+        id,
+        ReportedPending {
+            at: now,
+            path: path.to_path_buf(),
+        },
+    );
+    true
+}
+
+pub(crate) fn forget_reported_pending() {
+    REPORTED_PENDING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+fn forget_vanished_pending() {
+    let mut reported = REPORTED_PENDING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_vanished(&mut reported);
+}
+
+fn prune_vanished(reported: &mut ReportedMap) {
+    reported.retain(|_, entry| {
+        !fs::symlink_metadata(&entry.path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    });
+}
+
 fn report_pending(path: &Path, reason: &str) {
     let key = cache_key(path).unwrap_or_else(|_| "unknown".into());
+    if !first_report(&key, reason, path) {
+        return;
+    }
     crate::diagnostics::record(
         "worktree_storage_cleanup_pending",
         json!({"cacheKey":key,"reason":reason}),
@@ -3911,6 +3986,13 @@ pub(crate) struct FileLock {
     file: File,
 }
 
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Forked children can retain the descriptor before exec closes it.
+        let _ = self.unlock();
+    }
+}
+
 impl FileLock {
     pub(crate) fn acquire(path: &Path, exclusive: bool) -> Result<Self, String> {
         Self::acquire_mode(path, exclusive, false)
@@ -4037,6 +4119,108 @@ fn lock_file(_file: &File, _exclusive: bool, _nonblocking: bool) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_report_repeats_only_on_reason_change_or_expiry() {
+        let mut reported = BTreeMap::new();
+        let path = Path::new("/cache/terminal-worktrees/a");
+        let start = Instant::now();
+        assert!(note_report(&mut reported, "k", "failed", path, start));
+        for second in 1..=5 {
+            let now = start + Duration::from_secs(second);
+            assert!(!note_report(&mut reported, "k", "failed", path, now));
+        }
+        assert!(note_report(&mut reported, "k", "active-use", path, start));
+        assert!(!note_report(&mut reported, "k", "active-use", path, start));
+        assert!(note_report(
+            &mut reported,
+            "other",
+            "active-use",
+            path,
+            start
+        ));
+        let later = start + REPORT_REPEAT_AFTER;
+        assert!(note_report(&mut reported, "k", "active-use", path, later));
+        reported.clear();
+        assert!(note_report(&mut reported, "k", "active-use", path, later));
+    }
+
+    #[test]
+    fn several_reasons_on_one_path_each_log_once() {
+        let mut reported = BTreeMap::new();
+        let path = Path::new("/cache/terminal-worktrees/a");
+        let now = Instant::now();
+        assert!(note_report(&mut reported, "k", "a", path, now));
+        assert!(note_report(&mut reported, "k", "b", path, now));
+        for _ in 0..4 {
+            assert!(!note_report(&mut reported, "k", "a", path, now));
+            assert!(!note_report(&mut reported, "k", "b", path, now));
+        }
+        assert_eq!(reported.len(), 2);
+    }
+
+    #[test]
+    fn vanished_pending_record_is_forgotten_and_repends_log_again() {
+        let fixture = GitFixture::new();
+        let directory = fixture.cache.join("terminal-worktrees").join("ab");
+        fs::create_dir_all(&directory).unwrap();
+        let mut reported = BTreeMap::new();
+        let now = Instant::now();
+        assert!(note_report(
+            &mut reported,
+            "k",
+            "active-use",
+            &directory,
+            now
+        ));
+        prune_vanished(&mut reported);
+        assert!(!note_report(
+            &mut reported,
+            "k",
+            "active-use",
+            &directory,
+            now
+        ));
+        fs::remove_dir_all(&directory).unwrap();
+        prune_vanished(&mut reported);
+        assert!(note_report(
+            &mut reported,
+            "k",
+            "active-use",
+            &directory,
+            now
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_lease_releases_lock_with_inherited_descriptor() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.mark_started();
+        let inherited = lease._lease_lock.file.try_clone().unwrap();
+        let path = lock_path(&fixture.cache, "lease", &directory).unwrap();
+
+        drop(lease);
+
+        assert!(FileLock::try_acquire(&path, true).is_ok());
+        assert!(inherited.metadata().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_lock_preserves_independently_held_lease() {
+        let fixture = GitFixture::new();
+        let path = fixture.cache.join("independent.lock");
+        let released = FileLock::acquire(&path, false).unwrap();
+        let independent = FileLock::acquire(&path, false).unwrap();
+
+        drop(released);
+
+        assert!(FileLock::try_acquire(&path, true).is_err());
+        drop(independent);
+        assert!(FileLock::try_acquire(&path, true).is_ok());
+    }
 
     struct GitFixture {
         root: PathBuf,
@@ -4186,10 +4370,9 @@ mod tests {
 
     fn write_expired_temp_owner_with_header(temp: &Path, data_directory: &Path, header: &str) {
         let pid = std::process::id();
-        let started_at = sysinfo::System::new_all()
-            .process(sysinfo::Pid::from_u32(pid))
-            .unwrap()
-            .start_time();
+        let owner = read_temp_owner(temp, data_directory).expect("registered temporary owner");
+        assert_eq!(owner.pid, pid);
+        let started_at = owner.started_at.expect("registered owner process start");
         fs::write(
             temp.join(TEMP_OWNER_FILE),
             format!(
@@ -5003,50 +5186,51 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn removed_worktree_retains_temp_used_by_detached_worker() {
+        struct Worker(std::process::Child);
+        impl Drop for Worker {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
         let fixture = GitFixture::new();
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
         let artifact = temp.join("artifact");
-        let ready = fixture.root.join("detached-worker-ready");
+        let ready = fixture.root.join("worker-ready");
         fs::write(&artifact, "live").unwrap();
-        let mut worker = std::process::Command::new("python3")
+        let mut worker = Worker(std::process::Command::new("python3")
             .arg("-c")
-            .arg("import os,sys,time; os.chdir(sys.argv[2]); open(sys.argv[1]).read(); open(sys.argv[3], 'w').write('ready'); time.sleep(30)")
+            .arg("import sys; file=open(sys.argv[1]); open(sys.argv[2], 'w').write('ready'); sys.stdin.buffer.read()")
             .arg(&artifact)
-            .arg(&temp)
             .arg(&ready)
             .env("TMPDIR", &temp)
+            .stdin(std::process::Stdio::piped())
             .spawn()
-            .unwrap();
+            .unwrap());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
+        let mut detected = false;
+        while std::time::Instant::now() < deadline {
+            if ready.exists() && temp_directory_in_use(&temp) {
+                detected = true;
+                break;
+            }
+            if worker.0.try_wait().unwrap().is_some() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let worker_status = worker.0.try_wait().unwrap();
         let worker_ready = ready.exists();
-        let observed = if worker_ready {
-            let detection_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                if temp_directory_in_use(&temp) {
-                    break true;
-                }
-                if std::time::Instant::now() >= detection_deadline {
-                    break false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        } else {
-            false
-        };
-        if !worker_ready || !observed {
-            if worker.try_wait().unwrap().is_none() {
-                worker.kill().unwrap();
-            }
-            worker.wait().unwrap();
+        if !detected {
+            let _ = worker.0.kill();
+            let _ = worker.0.wait();
         }
-        assert!(worker_ready, "detached worker did not open temporary data");
         assert!(
-            observed,
-            "detached worker was not visible to temporary process detection"
+            detected,
+            "Detached worker {}: ready={worker_ready}, exit={worker_status:?}",
+            worker.0.id()
         );
 
         lease.mark_started();
@@ -5060,8 +5244,8 @@ mod tests {
         reconcile(&fixture.cache);
         assert_eq!(fs::read_to_string(&artifact).unwrap(), "live");
 
-        worker.kill().unwrap();
-        worker.wait().unwrap();
+        drop(worker.0.stdin.take());
+        assert!(worker.0.wait().unwrap().success());
         lease.release_clean().unwrap();
         drop(lease);
         assert_storage_reclaimed_after_retry(&fixture.cache, &directory);

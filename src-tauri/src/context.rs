@@ -12,6 +12,10 @@ use tauri::Manager;
 
 const CONFIG: &str = ".sail/worktree.json";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "macos")]
+const DEFAULT_PROVIDER_RESPONSE_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "macos")]
+const LARGE_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -527,6 +531,30 @@ pub fn context_provider_status(
     })
 }
 
+#[cfg(target_os = "macos")]
+pub fn provider_mcp_server(app: &tauri::AppHandle, directory: &Path) -> Option<serde_json::Value> {
+    let canonical = dunce::canonicalize(directory).ok()?;
+    let current = locked_store(&store_path(app).ok()?, |store| {
+        Ok((status(&canonical, store), false))
+    })
+    .ok()?;
+    if current.state != "approved" {
+        return None;
+    }
+    let executable = std::env::current_exe().ok()?;
+    Some(serde_json::json!({
+        "name": "sail-context",
+        "command": executable.to_string_lossy(),
+        "args": ["--context-mcp", canonical.to_string_lossy()],
+        "env": []
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn provider_mcp_server(_: &tauri::AppHandle, _: &Path) -> Option<serde_json::Value> {
+    None
+}
+
 #[tauri::command]
 pub fn context_register_provider(
     app: tauri::AppHandle,
@@ -558,10 +586,17 @@ pub fn context_approve_provider(
 
 #[tauri::command]
 pub fn context_revoke_provider(app: tauri::AppHandle, directory: String) -> Result<(), String> {
-    locked_store(&store_path(&app)?, |store| {
+    let removed = locked_store(&store_path(&app)?, |store| {
         let removed = revoke(Path::new(&directory), store)?;
-        Ok(((), removed))
-    })
+        Ok((removed, removed))
+    })?;
+    #[cfg(target_os = "macos")]
+    if removed {
+        stop_revoked_provider(Path::new(&directory))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = removed;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -599,10 +634,30 @@ pub fn prepare_e2e_approval(
 
 #[cfg(all(target_os = "macos", feature = "e2e"))]
 pub fn revoke_e2e_approval(directory: &Path) -> Result<(), String> {
-    locked_store(&service_store_path()?, |store| {
+    let removed = locked_store(&service_store_path()?, |store| {
         let changed = revoke(directory, store)?;
-        Ok(((), changed))
-    })
+        Ok((changed, changed))
+    })?;
+    if removed {
+        stop_revoked_provider(directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_revoked_provider(directory: &Path) -> Result<(), String> {
+    let key = std::ffi::CString::new(project_key(directory)?)
+        .map_err(|_| "Invalid context project key.".to_string())?;
+    let mut error = [0_i8; 512];
+    if unsafe { sail_context_provider_revoke_remote(key.as_ptr(), error.as_mut_ptr(), error.len()) }
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Approval revoked, but provider stop failed: {}",
+            unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -640,7 +695,7 @@ pub unsafe extern "C" fn sail_context_validate_approval(
     let Ok(store_path) = service_store_path() else {
         return false;
     };
-    let Ok(Some((project_key, fingerprint))) = locked_store(&store_path, |store| {
+    let Ok(Some((project_key, fingerprint, provider))) = locked_store(&store_path, |store| {
         let current = status(&directory, store);
         if current.state != "approved"
             || expected.is_some_and(|value| current.fingerprint.as_deref() != Some(value))
@@ -648,7 +703,11 @@ pub unsafe extern "C" fn sail_context_validate_approval(
             return Ok((None, false));
         }
         Ok((
-            Some((project_key(&directory)?, current.fingerprint.unwrap())),
+            Some((
+                project_key(&directory)?,
+                current.fingerprint.clone().unwrap(),
+                current,
+            )),
             false,
         ))
     }) else {
@@ -657,6 +716,8 @@ pub unsafe extern "C" fn sail_context_validate_approval(
     let Ok(serialized) = serde_json::to_vec(&serde_json::json!({
         "projectKey": project_key,
         "fingerprint": fingerprint,
+        "providerId": provider.id,
+        "executable": provider.executable,
     })) else {
         return false;
     };
@@ -684,6 +745,30 @@ unsafe extern "C" {
         error_length: usize,
     ) -> bool;
     fn sail_context_session_close(handle: *mut std::ffi::c_void);
+    fn sail_context_session_request(
+        handle: *mut std::ffi::c_void,
+        request: *const std::ffi::c_char,
+        output: *mut std::ffi::c_char,
+        output_length: usize,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> bool;
+    fn sail_context_session_cancel(
+        handle: *mut std::ffi::c_void,
+        request: *const std::ffi::c_char,
+    ) -> bool;
+    fn sail_context_session_notifications(
+        handle: *mut std::ffi::c_void,
+        output: *mut std::ffi::c_char,
+        output_length: usize,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> bool;
+    fn sail_context_provider_revoke_remote(
+        key: *const std::ffi::c_char,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> bool;
     #[cfg(feature = "e2e")]
     fn sail_context_probe_service_status(output: *mut std::ffi::c_char, length: usize) -> bool;
     #[cfg(feature = "e2e")]
@@ -748,6 +833,13 @@ pub fn probe_e2e_replay(directory: &Path) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 pub struct ContextSession(*mut std::ffi::c_void);
 
+// The immutable XPC session supports concurrent sends; Arc keeps it alive through each reply.
+#[cfg(target_os = "macos")]
+unsafe impl Send for ContextSession {}
+
+#[cfg(target_os = "macos")]
+unsafe impl Sync for ContextSession {}
+
 #[cfg(target_os = "macos")]
 impl ContextSession {
     pub fn open(directory: &Path) -> Result<Self, String> {
@@ -775,6 +867,1872 @@ impl ContextSession {
                 .into_owned())
         }
     }
+
+    pub fn notifications(&self) -> Result<Option<String>, String> {
+        let mut output = vec![0_i8; 1024 * 1024 + 1];
+        let mut error = [0_i8; 512];
+        if !unsafe {
+            sail_context_session_notifications(
+                self.0,
+                output.as_mut_ptr(),
+                output.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        } {
+            return Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        let value = unsafe { std::ffi::CStr::from_ptr(output.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Ok((!value.is_empty()).then_some(value))
+    }
+
+    pub fn request(&self, message: &str) -> Result<Option<String>, String> {
+        let response_limit = serde_json::from_str::<serde_json::Value>(message)
+            .map(|request| provider_response_limit(&request))
+            .unwrap_or(DEFAULT_PROVIDER_RESPONSE_BYTES);
+        let message = std::ffi::CString::new(message)
+            .map_err(|_| "Context MCP request contains a NUL byte.".to_string())?;
+        let mut output = vec![0_i8; response_limit + 1];
+        let mut error = [0_i8; 512];
+        if !unsafe {
+            sail_context_session_request(
+                self.0,
+                message.as_ptr(),
+                output.as_mut_ptr(),
+                output.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        } {
+            return Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        let value = unsafe { std::ffi::CStr::from_ptr(output.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Ok((!value.is_empty()).then_some(value))
+    }
+
+    pub fn cancel(&self, message: &str) -> Result<(), String> {
+        let message = std::ffi::CString::new(message)
+            .map_err(|_| "Context MCP request contains a NUL byte.".to_string())?;
+        if unsafe { sail_context_session_cancel(self.0, message.as_ptr()) } {
+            Ok(())
+        } else {
+            Err("Context cancellation delivery failed.".into())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
+    use crate::context_output_store::{OutputLimits, OutputScope, OutputStore};
+    use std::io::BufRead;
+    enum Event {
+        Input(Result<Option<String>, String>),
+        Response(Result<Option<String>, String>),
+        OutputError(String),
+    }
+    let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
+    let provider = locked_store(&service_store_path()?, |store| {
+        Ok((status(&canonical, store), false))
+    })?;
+    if provider.state != "approved" {
+        return Err("Context provider is not approved.".into());
+    }
+    let provider_id = provider.id.ok_or("Context provider ID is unavailable.")?;
+    let revision = provider
+        .revision
+        .ok_or("Context provider revision is unavailable.")?;
+    let common_dir = String::from_utf8(git(&canonical, &["rev-parse", "--git-common-dir"])?)
+        .map_err(|_| "Context repository path is invalid.")?;
+    let repository = dunce::canonicalize(canonical.join(common_dir.trim()))
+        .map_err(|error| error.to_string())?;
+    let scope = OutputScope {
+        repository: repository.to_string_lossy().into_owned(),
+        worktree: canonical.to_string_lossy().into_owned(),
+        user: unsafe { nix::libc::geteuid() }.to_string(),
+        provider: provider_id.clone(),
+        session: uuid::Uuid::new_v4().to_string(),
+        revision,
+    };
+    #[cfg(feature = "e2e")]
+    let data_root = PathBuf::from(
+        std::env::var_os("SAIL_E2E_CONFIG_DIR")
+            .ok_or("Set SAIL_E2E_CONFIG_DIR for isolated broker data.")?,
+    );
+    #[cfg(not(feature = "e2e"))]
+    let data_root = dirs::data_dir()
+        .ok_or("Cannot locate broker data directory.")?
+        .join("sail");
+    fs::create_dir_all(&data_root).map_err(|error| error.to_string())?;
+    let store = OutputStore::open(data_root.join("context-output"), OutputLimits::default())
+        .map_err(|warning| warning.message().to_owned())?;
+    let broker = crate::context_broker_mcp::BrokerMcp::new(provider_id, scope, store);
+    let provider_state = std::sync::Arc::new(std::sync::Mutex::new((false, 1_u64)));
+    let session = std::sync::Arc::new(ContextSession::open(directory)?);
+    let (send, receive) = std::sync::mpsc::sync_channel(32);
+    let (output, writes) = std::sync::mpsc::sync_channel::<String>(32);
+    let output_errors = send.clone();
+    let writer = std::thread::spawn(move || {
+        let mut stdout = std::io::stdout();
+        let configured = make_provider_stdin_nonblocking(&stdout);
+        if let Err(error) = configured {
+            let _ = output_errors.send(Event::OutputError(error));
+            return;
+        }
+        for message in writes {
+            if let Err(error) = write_provider_request_checked(
+                &mut stdout,
+                &message,
+                std::time::Duration::from_secs(30),
+                |_| Ok(()),
+            ) {
+                let _ = output_errors.send(Event::OutputError(error));
+                break;
+            }
+        }
+    });
+    let emit = |message| {
+        output
+            .try_send(message)
+            .map_err(|_| "Context MCP output exceeded its bounded queue.".to_string())
+    };
+    let inputs = send.clone();
+    std::thread::spawn(move || {
+        let input = std::io::stdin();
+        let mut input = input.lock();
+        loop {
+            let line = (|| {
+                if input
+                    .fill_buf()
+                    .map_err(|error| error.to_string())?
+                    .is_empty()
+                {
+                    return Ok(None);
+                }
+                read_bounded_line(&mut input, 1024 * 1024 + 1)
+                    .map(|line| Some(line.trim_end_matches(['\r', '\n']).to_owned()))
+            })();
+            let done = !matches!(line, Ok(Some(_)));
+            if inputs.send(Event::Input(line)).is_err() || done {
+                break;
+            }
+        }
+    });
+    let mut queued = std::collections::VecDeque::<String>::new();
+    let mut active = false;
+    let mut ended = false;
+    loop {
+        if !active {
+            if let Some(line) = queued.pop_front() {
+                let session = session.clone();
+                let broker = broker.clone();
+                let provider_state = provider_state.clone();
+                let responses = send.clone();
+                active = true;
+                std::thread::spawn(move || {
+                    let response = (|| {
+                        session.check()?;
+                        let response = {
+                            let mut state =
+                                provider_state.lock().map_err(|error| error.to_string())?;
+                            let (initialized, next_id) = &mut *state;
+                            broker.handle(&line, |method, params| {
+                                broker_provider_call(&session, initialized, next_id, method, params)
+                            })
+                        };
+                        session.check()?;
+                        Ok(response.map(|value| value.to_string()))
+                    })();
+                    let _ = responses.send(Event::Response(response));
+                });
+            } else if ended {
+                drop(output);
+                return writer
+                    .join()
+                    .map_err(|_| "Context MCP output worker stopped.".to_string());
+            }
+        }
+        if let Some(notifications) = session.notifications()? {
+            emit(notifications)?;
+        }
+        let event = match receive.recv_timeout(std::time::Duration::from_millis(25)) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        match event {
+            Event::Input(Ok(Some(line))) => {
+                let request = serde_json::from_str::<serde_json::Value>(&line).ok();
+                if request.as_ref().is_some_and(is_cancellation) {
+                    session.cancel(&line)?;
+                } else {
+                    if queued.len() == 32 {
+                        return Err("Too many queued context MCP requests.".into());
+                    }
+                    queued.push_back(line);
+                }
+            }
+            Event::Input(Ok(None)) => ended = true,
+            Event::Input(Err(error)) => return Err(error),
+            Event::Response(response) => {
+                active = false;
+                if let Some(notifications) = session.notifications()? {
+                    emit(notifications)?;
+                }
+                if let Some(response) = response? {
+                    emit(response)?;
+                }
+            }
+            Event::OutputError(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn provider_response_limit(request: &serde_json::Value) -> usize {
+    if request.get("method").and_then(serde_json::Value::as_str) == Some("tools/call")
+        && matches!(
+            request
+                .pointer("/params/name")
+                .and_then(serde_json::Value::as_str),
+            Some("get" | "search")
+        )
+    {
+        LARGE_PROVIDER_RESPONSE_BYTES
+    } else {
+        DEFAULT_PROVIDER_RESPONSE_BYTES
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn broker_provider_call(
+    session: &ContextSession,
+    initialized: &mut bool,
+    next_id: &mut u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, crate::context_broker_mcp::ProviderCallError> {
+    use crate::context_broker_mcp::ProviderCallError;
+    if !*initialized {
+        let response = broker_provider_request(
+            session,
+            next_id,
+            "initialize",
+            serde_json::json!({
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"sail-context","version":env!("CARGO_PKG_VERSION")}
+            }),
+        )?;
+        if response
+            .pointer("/result/protocolVersion")
+            .and_then(serde_json::Value::as_str)
+            != Some("2025-06-18")
+        {
+            return Err(ProviderCallError::Unavailable);
+        }
+        session
+            .request(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .map_err(|_| ProviderCallError::Unavailable)?;
+        *initialized = true;
+    }
+    let response = broker_provider_request(session, next_id, method, params);
+    if matches!(response, Err(ProviderCallError::ResponseTooLarge)) {
+        *initialized = false;
+    }
+    response
+}
+
+#[cfg(target_os = "macos")]
+fn broker_provider_request(
+    session: &ContextSession,
+    next_id: &mut u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, crate::context_broker_mcp::ProviderCallError> {
+    use crate::context_broker_mcp::ProviderCallError;
+    let id = *next_id;
+    *next_id = next_id
+        .checked_add(1)
+        .ok_or(ProviderCallError::Unavailable)?;
+    let request = serde_json::json!({
+        "jsonrpc":"2.0","id":id,"method":method,"params":params
+    });
+    let response = session
+        .request(&request.to_string())
+        .map_err(|error| {
+            if error.starts_with("MCP message exceeds its limit.")
+                || error.starts_with("Provider response exceeds its limit.")
+            {
+                ProviderCallError::ResponseTooLarge
+            } else {
+                ProviderCallError::Unavailable
+            }
+        })?
+        .ok_or(ProviderCallError::Unavailable)?;
+    response
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("id").and_then(serde_json::Value::as_u64) == Some(id))
+        .ok_or(ProviderCallError::Unavailable)
+}
+
+#[cfg(target_os = "macos")]
+fn is_cancellation(request: &serde_json::Value) -> bool {
+    request.get("method").and_then(serde_json::Value::as_str) == Some("notifications/cancelled")
+        && request.get("id").is_none()
+}
+
+#[cfg(target_os = "macos")]
+struct ProviderProcess {
+    fingerprint: String,
+    initialization: Option<serde_json::Value>,
+    initialized_notification_sent: bool,
+    request_sequence: u64,
+    subscriptions: HashSet<String>,
+    child: std::process::Child,
+    stdin: std::sync::Arc<std::sync::Mutex<std::process::ChildStdin>>,
+    stdout: Option<std::io::BufReader<std::process::ChildStdout>>,
+    output: Option<ProviderOutput>,
+    stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    staged_executable: Option<StagedExecutable>,
+}
+
+#[cfg(target_os = "macos")]
+struct StagedExecutable(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for StagedExecutable {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ProviderProcess {
+    fn error(&self, reason: &str) -> String {
+        let tail = self
+            .stderr_tail
+            .lock()
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes.iter().copied().collect::<Vec<_>>()).into_owned()
+            })
+            .unwrap_or_default();
+        if tail.trim().is_empty() {
+            reason.into()
+        } else {
+            format!("{reason} Provider stderr: {}", tail.trim())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ProviderProcess {
+    fn drop(&mut self) {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+        }
+        let _ = self.child.wait();
+        self.staged_executable.take();
+    }
+}
+
+#[cfg(target_os = "macos")]
+type ProviderSlot = std::sync::Arc<std::sync::Mutex<Option<ProviderProcess>>>;
+
+#[cfg(target_os = "macos")]
+static PROVIDERS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<ProviderSlot>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+static PROVIDER_STOPPED: std::sync::Condvar = std::sync::Condvar::new();
+
+#[cfg(target_os = "macos")]
+static ACTIVE_SESSIONS: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<String, Option<SessionInitialization>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct SessionInitialization {
+    project: String,
+    fingerprint: String,
+    request: serde_json::Value,
+    protocol_version: String,
+    initialized: bool,
+    subscriptions: HashSet<String>,
+}
+
+#[cfg(target_os = "macos")]
+struct ProviderCancellation {
+    capability: Option<String>,
+    request_id: serde_json::Value,
+    message: String,
+}
+
+#[cfg(target_os = "macos")]
+type CancellationRegistry = BTreeMap<String, std::collections::VecDeque<ProviderCancellation>>;
+
+#[cfg(target_os = "macos")]
+static CANCELLATIONS: std::sync::OnceLock<std::sync::Mutex<CancellationRegistry>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn cancellation_registry() -> &'static std::sync::Mutex<CancellationRegistry> {
+    CANCELLATIONS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn take_cancellations(
+    key: &str,
+    capability: Option<&str>,
+    request_id: &serde_json::Value,
+) -> Vec<String> {
+    let Ok(mut registry) = cancellation_registry().lock() else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    if let Some(queued) = registry.get_mut(key) {
+        queued.retain(|cancellation| {
+            if cancellation.capability.as_deref() == capability
+                && &cancellation.request_id == request_id
+            {
+                messages.push(cancellation.message.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if queued.is_empty() {
+            registry.remove(key);
+        }
+    }
+    messages
+}
+
+#[cfg(target_os = "macos")]
+fn active_sessions() -> &'static std::sync::Mutex<BTreeMap<String, Option<SessionInitialization>>> {
+    ACTIVE_SESSIONS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn session_is_active(capability: Option<&str>) -> Result<bool, String> {
+    let sessions = active_sessions()
+        .lock()
+        .map_err(|error| error.to_string())?;
+    Ok(capability.is_none_or(|capability| sessions.contains_key(capability)))
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// `capability` must point to a valid NUL-terminated session capability.
+pub unsafe extern "C" fn sail_context_session_activate(
+    capability: *const std::ffi::c_char,
+) -> bool {
+    if capability.is_null() {
+        return false;
+    }
+    let Ok(capability) = unsafe { std::ffi::CStr::from_ptr(capability) }.to_str() else {
+        return false;
+    };
+    if capability.len() != 64 {
+        return false;
+    }
+    active_sessions().lock().is_ok_and(|mut sessions| {
+        if sessions.contains_key(capability) {
+            return false;
+        }
+        sessions.insert(capability.into(), None);
+        true
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// `capability` must point to a valid NUL-terminated session capability.
+pub unsafe extern "C" fn sail_context_session_deactivate(capability: *const std::ffi::c_char) {
+    if capability.is_null() {
+        return;
+    }
+    let Ok(capability) = unsafe { std::ffi::CStr::from_ptr(capability) }.to_str() else {
+        return;
+    };
+    if let Ok(mut sessions) = active_sessions().lock() {
+        sessions.remove(capability);
+    }
+    if let Ok(mut registry) = cancellation_registry().lock() {
+        registry.retain(|_, queued| {
+            queued.retain(|cancellation| cancellation.capability.as_deref() != Some(capability));
+            !queued.is_empty()
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// `key` must point to a valid NUL-terminated project key.
+pub unsafe extern "C" fn sail_context_provider_stop(key: *const std::ffi::c_char) {
+    if key.is_null() {
+        return;
+    }
+    let Ok(key) = unsafe { std::ffi::CStr::from_ptr(key) }.to_str() else {
+        return;
+    };
+    if let Ok(mut registry) = cancellation_registry().lock() {
+        registry.remove(key);
+    }
+    if let Some(providers) = PROVIDERS.get() {
+        if let Ok(mut providers) = providers.lock() {
+            let removed = providers.get_mut(key).and_then(Option::take);
+            drop(providers);
+            if let Some(slot) = removed {
+                let key = key.to_owned();
+                std::thread::spawn(move || {
+                    if let Ok(mut provider) = slot.lock() {
+                        provider.take();
+                    }
+                    if let Some(providers) = PROVIDERS.get() {
+                        if let Ok(mut providers) = providers.lock() {
+                            if providers.get(&key).is_some_and(Option::is_none) {
+                                providers.remove(&key);
+                                PROVIDER_STOPPED.notify_all();
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stop_provider_if_fingerprint(key: &str, expected: &str) -> Option<std::thread::JoinHandle<()>> {
+    let slot = PROVIDERS.get()?.lock().ok()?.get(key)?.as_ref()?.clone();
+    let key = key.to_owned();
+    let expected = expected.to_owned();
+    Some(std::thread::spawn(move || {
+        let Ok(mut provider) = slot.lock() else {
+            return;
+        };
+        if !provider
+            .as_ref()
+            .is_some_and(|process| process.fingerprint == expected)
+        {
+            return;
+        }
+        provider.take();
+        drop(provider);
+        forget_provider(&key, &slot);
+    }))
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// Both pointers must reference valid NUL-terminated strings.
+pub unsafe extern "C" fn sail_context_provider_stop_if_fingerprint(
+    key: *const std::ffi::c_char,
+    expected: *const std::ffi::c_char,
+) {
+    if key.is_null() || expected.is_null() {
+        return;
+    }
+    let (Ok(key), Ok(expected)) = (
+        unsafe { std::ffi::CStr::from_ptr(key) }.to_str(),
+        unsafe { std::ffi::CStr::from_ptr(expected) }.to_str(),
+    ) else {
+        return;
+    };
+    let _ = stop_provider_if_fingerprint(key, expected);
+}
+
+#[cfg(target_os = "macos")]
+fn forget_provider(key: &str, slot: &ProviderSlot) {
+    if let Some(providers) = PROVIDERS.get() {
+        if let Ok(mut providers) = providers.lock() {
+            if providers
+                .get(key)
+                .and_then(Option::as_ref)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, slot))
+                && std::sync::Arc::strong_count(slot) == 2
+            {
+                providers.remove(key);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_literal(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn make_provider_stdin_nonblocking(stdin: &impl std::os::fd::AsRawFd) -> Result<(), String> {
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+    if flags < 0
+        || unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) } < 0
+    {
+        return Err(format!(
+            "Cannot configure provider stdin: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn write_provider_request_checked(
+    stdin: &mut impl std::io::Write,
+    message: &str,
+    timeout: std::time::Duration,
+    mut check: impl FnMut(bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let message = message.trim_end_matches(['\r', '\n']);
+    let mut written = false;
+    for bytes in [message.as_bytes(), b"\n".as_slice()] {
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            check(written)?;
+            match stdin.write(remaining) {
+                Ok(0) => return Err("Provider stdin closed before request completed.".into()),
+                Ok(count) => {
+                    written = true;
+                    remaining = &remaining[count..];
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    check(written)?;
+                    let remaining_time =
+                        deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining_time.is_zero() {
+                        return Err("Provider stdin write timed out.".into());
+                    }
+                    std::thread::sleep(remaining_time.min(std::time::Duration::from_millis(10)));
+                }
+                Err(error) => return Err(format!("Provider stdin write failed: {error}")),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn staged_provider(
+    executable: &Path,
+    expected_hash: &str,
+    data_root: &Path,
+) -> Result<Option<StagedExecutable>, String> {
+    if ["/System/Library", "/usr/bin", "/bin", "/sbin"]
+        .iter()
+        .any(|root| executable.starts_with(root))
+    {
+        return Ok(None);
+    }
+    let staging = data_root
+        .parent()
+        .ok_or("Provider data directory has no parent.")?
+        .join("executables");
+    fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    let staging = dunce::canonicalize(staging).map_err(|error| error.to_string())?;
+    let path = staging.join(format!("provider-{}", uuid::Uuid::new_v4()));
+    fs::copy(executable, &path)
+        .map_err(|error| format!("Cannot stage provider executable: {error}"))?;
+    let staged = StagedExecutable(path);
+    fs::set_permissions(&staged.0, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    if executable_hash(&staged.0)? != expected_hash {
+        return Err("Provider executable changed before launch.".into());
+    }
+    Ok(Some(staged))
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_provider(
+    directory: &Path,
+    current: &ProviderStatus,
+    data_root: &Path,
+) -> Result<ProviderProcess, String> {
+    use std::os::unix::process::CommandExt;
+    let executable = PathBuf::from(
+        current
+            .executable
+            .as_deref()
+            .ok_or("Provider executable missing.")?,
+    );
+    fs::create_dir_all(data_root).map_err(|error| error.to_string())?;
+    fs::set_permissions(data_root, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    let data_root = dunce::canonicalize(data_root).map_err(|error| error.to_string())?;
+    let staged = staged_provider(
+        &executable,
+        current
+            .executable_sha256
+            .as_deref()
+            .ok_or("Provider hash missing.")?,
+        &data_root,
+    )?;
+    let launch = staged
+        .as_ref()
+        .map_or(executable.as_path(), |value| value.0.as_path());
+    let profile = format!(
+        "(version 1)\n(deny default)\n(allow file-read-data (literal \"/\"))\n\
+         (allow file-read* (subpath \"/System\") (subpath \"/usr/lib\") \
+         (subpath \"/Library/Apple\") (literal \"{}\") \
+         (subpath \"{}\") (subpath \"{}\"))\n\
+         (allow file-write* (subpath \"{}\"))\n\
+         (allow process-exec (literal \"{}\"))\n\
+         (allow sysctl-read (sysctl-name \"kern.bootargs\") \
+         (sysctl-name \"security.mac.lockdown_mode_state\"))\n",
+        seatbelt_literal(launch),
+        seatbelt_literal(directory),
+        seatbelt_literal(&data_root),
+        seatbelt_literal(&data_root),
+        seatbelt_literal(launch),
+    );
+    if !Path::new("/usr/bin/sandbox-exec").is_file() {
+        return Err("Provider confinement is unavailable on this macOS installation.".into());
+    }
+    let mut child = Command::new("/usr/bin/sandbox-exec")
+        .arg("-p")
+        .arg(profile)
+        .arg(launch)
+        .current_dir(directory)
+        .env_clear()
+        .env("HOME", &data_root)
+        .env("TMPDIR", &data_root)
+        .env("PATH", "/usr/bin:/bin")
+        .process_group(0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Provider startup failed: {error}"))?;
+    let stdin = child.stdin.take().ok_or("Provider stdin unavailable.")?;
+    if let Err(error) = make_provider_stdin_nonblocking(&stdin) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let stdout = child.stdout.take().ok_or("Provider stdout unavailable.")?;
+    let mut stderr = child.stderr.take().ok_or("Provider stderr unavailable.")?;
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let tail = stderr_tail.clone();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        while let Ok(count) = stderr.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            if let Ok(mut tail) = tail.lock() {
+                for byte in &buffer[..count] {
+                    tail.push_back(*byte);
+                }
+                while tail.len() > 4096 {
+                    tail.pop_front();
+                }
+            }
+        }
+    });
+    Ok(ProviderProcess {
+        fingerprint: current
+            .fingerprint
+            .clone()
+            .ok_or("Provider fingerprint missing.")?,
+        initialization: None,
+        initialized_notification_sent: false,
+        request_sequence: 0,
+        subscriptions: HashSet::new(),
+        child,
+        stdin: std::sync::Arc::new(std::sync::Mutex::new(stdin)),
+        stdout: Some(std::io::BufReader::new(stdout)),
+        output: None,
+        stderr_tail,
+        staged_executable: staged,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn provider_request(
+    directory: &Path,
+    expected: &str,
+    capability: &str,
+    message: &str,
+    notify: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    #[cfg(feature = "e2e")]
+    let root = PathBuf::from(
+        std::env::var_os("SAIL_E2E_CONFIG_DIR")
+            .ok_or("Set SAIL_E2E_CONFIG_DIR for isolated provider data.")?,
+    );
+    #[cfg(not(feature = "e2e"))]
+    let root = dirs::data_dir()
+        .ok_or("Cannot locate provider data directory.")?
+        .join("sail/context-providers");
+    provider_request_with_notifications_at(
+        directory,
+        expected,
+        Some(capability),
+        message,
+        &service_store_path()?,
+        &root,
+        Some(notify),
+    )
+}
+
+#[cfg(all(target_os = "macos", test))]
+fn provider_request_at(
+    directory: &Path,
+    expected: &str,
+    capability: Option<&str>,
+    message: &str,
+    store_path: &Path,
+    data_root: &Path,
+) -> Result<Option<String>, String> {
+    provider_request_with_notifications_at(
+        directory, expected, capability, message, store_path, data_root, None,
+    )
+}
+
+#[cfg(target_os = "macos")]
+type NotificationSink<'a> = Option<&'a mut dyn FnMut(&str) -> Result<(), String>>;
+
+#[cfg(target_os = "macos")]
+fn flush_provider_notifications(
+    notify: &mut NotificationSink<'_>,
+    pending: &mut String,
+) -> Result<(), String> {
+    if let Some(notify) = notify {
+        if !pending.is_empty() {
+            notify(pending)?;
+            pending.clear();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn provider_request_with_notifications_at(
+    directory: &Path,
+    expected: &str,
+    capability: Option<&str>,
+    message: &str,
+    store_path: &Path,
+    data_root: &Path,
+    mut notify: NotificationSink<'_>,
+) -> Result<Option<String>, String> {
+    use std::time::Duration;
+    if message.len() > 1024 * 1024 {
+        return Err("Context MCP request exceeds 1 MiB.".into());
+    }
+    let request: serde_json::Value =
+        serde_json::from_str(message).map_err(|_| "Invalid context MCP JSON-RPC request.")?;
+    if !request.is_object()
+        || request.get("jsonrpc").and_then(|value| value.as_str()) != Some("2.0")
+        || request
+            .get("method")
+            .and_then(|value| value.as_str())
+            .is_none()
+    {
+        return Err("Invalid context MCP JSON-RPC request.".into());
+    }
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    if method == "initialize" {
+        request
+            .get("params")
+            .and_then(|params| params.get("protocolVersion"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|version| !version.is_empty())
+            .ok_or("MCP initialize request has no protocol version.")?;
+        request
+            .get("id")
+            .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+            .ok_or("MCP initialize request has no valid ID.")?;
+    }
+    let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
+    let key = project_key(&canonical)?;
+    if is_cancellation(&request) {
+        if !session_is_active(capability)? {
+            return Err("Context session revoked before provider cancellation.".into());
+        }
+        let current = locked_store(store_path, |store| Ok((status(&canonical, store), false)))?;
+        if current.state != "approved" || current.fingerprint.as_deref() != Some(expected) {
+            return Err("Context approval changed or was revoked.".into());
+        }
+        let request_id = request
+            .get("params")
+            .and_then(|params| params.get("requestId"))
+            .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+            .ok_or("Context MCP cancellation has no valid request ID.")?;
+        let mut registry = cancellation_registry()
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if !session_is_active(capability)? {
+            return Err("Context session revoked before provider cancellation.".into());
+        }
+        let queued = registry.entry(key).or_default();
+        if queued.len() == 32 {
+            queued.pop_front();
+        }
+        queued.push_back(ProviderCancellation {
+            capability: capability.map(str::to_owned),
+            request_id: request_id.clone(),
+            message: message.to_owned(),
+        });
+        return Ok(None);
+    }
+    let providers = PROVIDERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    let mut registry = providers.lock().map_err(|error| error.to_string())?;
+    let slot = loop {
+        if let Some(slot) = registry
+            .entry(key.clone())
+            .or_insert_with(|| Some(std::sync::Arc::new(std::sync::Mutex::new(None))))
+            .clone()
+        {
+            break slot;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("Provider stop timed out during session handoff.".into());
+        }
+        (registry, _) = PROVIDER_STOPPED
+            .wait_timeout(registry, remaining)
+            .map_err(|error| error.to_string())?;
+    };
+    drop(registry);
+    let session_active = || session_is_active(capability);
+    let mut provider = loop {
+        match slot.try_lock() {
+            Ok(provider) => break provider,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if !session_active()? {
+                    return Err("Context session revoked before provider request.".into());
+                }
+                if let Some(id) = request.get("id") {
+                    if !take_cancellations(&key, capability, id).is_empty() {
+                        let current = locked_store(store_path, |store| {
+                            Ok((status(&canonical, store), false))
+                        })?;
+                        if current.state != "approved"
+                            || current.fingerprint.as_deref() != Some(expected)
+                            || !session_active()?
+                        {
+                            return Err("Context approval changed or was revoked.".into());
+                        }
+                        return Ok(Some(cancelled_provider_response(id)));
+                    }
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err("Provider request timed out waiting for another request.".into());
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    if !session_active()? {
+        if provider.is_none() {
+            drop(provider);
+            forget_provider(&key, &slot);
+        }
+        return Err("Context session revoked before provider request.".into());
+    }
+    let current = locked_store(store_path, |store| Ok((status(&canonical, store), false)))?;
+    if current.state != "approved" || current.fingerprint.as_deref() != Some(expected) {
+        if provider
+            .as_ref()
+            .is_none_or(|process| process.fingerprint == expected)
+        {
+            provider.take();
+            drop(provider);
+            forget_provider(&key, &slot);
+        }
+        return Err("Context approval changed or was revoked.".into());
+    }
+    if let Some(id) = request.get("id") {
+        if !take_cancellations(&key, capability, id).is_empty() {
+            if provider.is_none() {
+                drop(provider);
+                forget_provider(&key, &slot);
+            }
+            return Ok(Some(cancelled_provider_response(id)));
+        }
+    }
+    let stale = provider.as_mut().is_some_and(|current| {
+        current.fingerprint != expected || current.child.try_wait().ok().flatten().is_some()
+    });
+    if stale {
+        provider.take();
+    }
+    if !session_active()? {
+        provider.take();
+        drop(provider);
+        forget_provider(&key, &slot);
+        return Err("Context session revoked before provider launch.".into());
+    }
+    if provider.is_none() {
+        match spawn_provider(&canonical, &current, &data_root.join(&key)) {
+            Ok(process) => *provider = Some(process),
+            Err(error) => {
+                drop(provider);
+                forget_provider(&key, &slot);
+                return Err(error);
+            }
+        }
+    }
+    if !session_active()? {
+        provider.take();
+        drop(provider);
+        forget_provider(&key, &slot);
+        return Err("Context session revoked before provider request.".into());
+    }
+    let process = provider.as_mut().ok_or("Provider unavailable.")?;
+    let request_deadline = std::time::Instant::now() + Duration::from_secs(29);
+    let saved = capability
+        .map(|capability| {
+            active_sessions()
+                .lock()
+                .map_err(|error| error.to_string())
+                .map(|sessions| sessions.get(capability).and_then(Option::as_ref).cloned())
+        })
+        .transpose()?
+        .flatten()
+        .filter(|saved| saved.project == key && saved.fingerprint == expected);
+    let response = (|| -> Result<Option<String>, String> {
+        if method == "initialize" {
+            let id = request
+                .get("id")
+                .ok_or("MCP initialize request has no ID.")?;
+            if let Some(result) = &process.initialization {
+                return Ok(Some(
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}).to_string(),
+                ));
+            }
+        } else if process.initialization.is_none() {
+            if let Some(saved) = &saved {
+                let mut initialize = saved.request.clone();
+                initialize["params"]["protocolVersion"] = serde_json::json!(saved.protocol_version);
+                exchange_provider_request(
+                    process,
+                    &key,
+                    capability,
+                    &initialize,
+                    &initialize.to_string(),
+                    None,
+                    Some(request_deadline),
+                )?;
+                if process
+                    .initialization
+                    .as_ref()
+                    .and_then(|result| result.get("protocolVersion"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some(saved.protocol_version.as_str())
+                {
+                    return Err(
+                        "Replacement provider changed the negotiated MCP protocol version.".into(),
+                    );
+                }
+                if saved.initialized {
+                    let initialized =
+                        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+                    exchange_provider_request(
+                        process,
+                        &key,
+                        capability,
+                        &initialized,
+                        &initialized.to_string(),
+                        None,
+                        Some(request_deadline),
+                    )?;
+                }
+            }
+        }
+        if method == "notifications/initialized" && process.initialized_notification_sent {
+            return Ok(None);
+        }
+        if process.initialized_notification_sent {
+            let subscriptions: HashSet<String> = active_sessions()
+                .lock()
+                .map_err(|error| error.to_string())?
+                .values()
+                .filter_map(Option::as_ref)
+                .filter(|session| {
+                    session.project == key && session.fingerprint == expected && session.initialized
+                })
+                .flat_map(|session| session.subscriptions.iter().cloned())
+                .collect();
+            synchronize_provider_subscriptions(
+                process,
+                &key,
+                capability,
+                &subscriptions,
+                notify
+                    .as_mut()
+                    .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
+                request_deadline,
+            )?;
+        }
+        let uri = request
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(serde_json::Value::as_str);
+        let shared_subscription = if let Some(uri) = uri {
+            if method == "resources/subscribe" {
+                if saved.as_ref().is_some_and(|session| {
+                    session.subscriptions.len() >= 1024 && !session.subscriptions.contains(uri)
+                }) {
+                    return Err(
+                        "Context resource subscriptions exceeded their bounded queue.".into(),
+                    );
+                }
+                process.subscriptions.contains(uri)
+            } else if method == "resources/unsubscribe" {
+                active_sessions()
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .iter()
+                    .any(|(owner, session)| {
+                        Some(owner.as_str()) != capability
+                            && session.as_ref().is_some_and(|session| {
+                                session.project == key
+                                    && session.fingerprint == expected
+                                    && session.subscriptions.contains(uri)
+                            })
+                    })
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let response = if shared_subscription {
+            let id = request
+                .get("id")
+                .ok_or("MCP resource subscription request has no ID.")?;
+            Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string())
+        } else {
+            exchange_provider_request(
+                process,
+                &key,
+                capability,
+                &request,
+                message,
+                notify,
+                Some(request_deadline),
+            )?
+        };
+        if successful_provider_response(response.as_deref()) {
+            if let Some(uri) = uri {
+                if method == "resources/subscribe" {
+                    process.subscriptions.insert(uri.into());
+                } else if method == "resources/unsubscribe" && !shared_subscription {
+                    process.subscriptions.remove(uri);
+                }
+            }
+        }
+        Ok(response)
+    })();
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let detail = process.error(&error);
+            provider.take();
+            drop(provider);
+            forget_provider(&key, &slot);
+            return Err(detail);
+        }
+    };
+    if let Some(capability) = capability {
+        let mut sessions = active_sessions()
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let initialization = sessions
+            .get_mut(capability)
+            .ok_or("Context session revoked after provider response.")?;
+        if method == "initialize" {
+            if let Some(result) = &process.initialization {
+                *initialization = Some(SessionInitialization {
+                    project: key,
+                    fingerprint: expected.into(),
+                    request,
+                    protocol_version: result["protocolVersion"]
+                        .as_str()
+                        .ok_or("Provider protocol version missing.")?
+                        .into(),
+                    initialized: false,
+                    subscriptions: HashSet::new(),
+                });
+            }
+        } else if method == "notifications/initialized" {
+            if let Some(initialization) = initialization {
+                initialization.initialized = true;
+            }
+        } else if successful_provider_response(response.as_deref()) {
+            if let Some(uri) = request
+                .get("params")
+                .and_then(|params| params.get("uri"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some(initialization) = initialization {
+                    if method == "resources/subscribe" {
+                        initialization.subscriptions.insert(uri.into());
+                    } else if method == "resources/unsubscribe" {
+                        initialization.subscriptions.remove(uri);
+                    }
+                }
+            }
+        }
+    }
+    Ok(response)
+}
+
+#[cfg(target_os = "macos")]
+fn successful_provider_response(response: Option<&str>) -> bool {
+    response
+        .and_then(|response| response.lines().last())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .is_some_and(|value| value.get("result").is_some() && value.get("error").is_none())
+}
+
+#[cfg(target_os = "macos")]
+fn cancelled_provider_response(id: &serde_json::Value) -> String {
+    serde_json::json!({"jsonrpc":"2.0","id":id,
+        "error":{"code":-32800,"message":"Provider request cancelled."}})
+    .to_string()
+}
+
+#[cfg(target_os = "macos")]
+enum ProviderEvent {
+    Notification(String),
+    Response(String),
+    Failure(String),
+}
+
+#[cfg(target_os = "macos")]
+struct ProviderOutput {
+    receive: std::sync::mpsc::Receiver<ProviderEvent>,
+    pending: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn write_shared_provider_request(
+    stdin: &std::sync::Mutex<std::process::ChildStdin>,
+    message: &str,
+    timeout: std::time::Duration,
+    mut check: impl FnMut(bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        check(false)?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("Provider stdin write timed out.".into());
+        }
+        match stdin.try_lock() {
+            Ok(mut stdin) => {
+                return write_provider_request_checked(&mut *stdin, message, remaining, check);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn provider_notifications(
+    key: &str,
+    expected: &str,
+    capability: &str,
+) -> Result<Option<String>, String> {
+    let sessions = active_sessions()
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let initialization = sessions.get(capability).ok_or("Context session revoked.")?;
+    let Some(initialization) = initialization else {
+        return Ok(None);
+    };
+    if initialization.project != key || initialization.fingerprint != expected {
+        return Err("Context session belongs to another provider.".into());
+    }
+    drop(sessions);
+    let slot = PROVIDERS
+        .get()
+        .and_then(|registry| registry.lock().ok()?.get(key).and_then(Option::clone));
+    let Some(slot) = slot else {
+        return Ok(None);
+    };
+    let mut provider = match slot.try_lock() {
+        Ok(provider) => provider,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let Some(process) = provider.as_mut() else {
+        return Ok(None);
+    };
+    if process.fingerprint != expected {
+        return Err("Context approval changed or was revoked.".into());
+    }
+    let Some(output) = process.output.as_mut() else {
+        return Ok(None);
+    };
+    let drain = (|| -> Result<Option<String>, String> {
+        let mut buffered = String::new();
+        for _ in 0..32 {
+            let event = if let Some(pending) = output.pending.take() {
+                ProviderEvent::Notification(pending)
+            } else {
+                match output.receive.try_recv() {
+                    Ok(event) => event,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Err("Provider response reader stopped.".into());
+                    }
+                }
+            };
+            match event {
+                ProviderEvent::Notification(message) => {
+                    let value: serde_json::Value = serde_json::from_str(message.trim_end())
+                        .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                    if value.get("method").and_then(serde_json::Value::as_str)
+                        == Some("notifications/progress")
+                    {
+                        continue;
+                    }
+                    if buffered.len() + message.len() > 1024 * 1024 {
+                        output.pending = Some(message);
+                        break;
+                    }
+                    buffered.push_str(&message);
+                }
+                ProviderEvent::Response(message) => {
+                    let value: serde_json::Value = serde_json::from_str(message.trim_end())
+                        .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                    if value
+                        .get("id")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_none_or(|id| id == 0 || id > process.request_sequence)
+                    {
+                        return Err("Provider sent a response without an active request.".into());
+                    }
+                }
+                ProviderEvent::Failure(error) => return Err(error),
+            }
+        }
+        Ok((!buffered.is_empty()).then_some(buffered))
+    })();
+    match drain {
+        Ok(messages) => Ok(messages),
+        Err(_) => {
+            provider.take();
+            drop(provider);
+            forget_provider(key, &slot);
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// Inputs must be NUL-terminated strings; output must hold the stated length.
+pub unsafe extern "C" fn sail_context_provider_notifications(
+    key: *const std::ffi::c_char,
+    expected: *const std::ffi::c_char,
+    capability: *const std::ffi::c_char,
+    output: *mut std::ffi::c_char,
+    output_length: usize,
+) -> bool {
+    if key.is_null()
+        || expected.is_null()
+        || capability.is_null()
+        || output.is_null()
+        || output_length == 0
+    {
+        return false;
+    }
+    let result = (|| {
+        let key = unsafe { std::ffi::CStr::from_ptr(key) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let expected = unsafe { std::ffi::CStr::from_ptr(expected) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let capability = unsafe { std::ffi::CStr::from_ptr(capability) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        provider_notifications(key, expected, capability)
+    })();
+    let (ok, text) = match result {
+        Ok(Some(message)) => (true, message),
+        Ok(None) => (true, String::new()),
+        Err(error) => (false, error),
+    };
+    if text.len() >= output_length {
+        return false;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), output.cast::<u8>(), text.len());
+        *output.add(text.len()) = 0;
+    }
+    ok
+}
+
+#[cfg(target_os = "macos")]
+fn start_provider_output(process: &mut ProviderProcess) -> Result<(), String> {
+    if process.output.is_some() {
+        return Ok(());
+    }
+    let mut reader = process
+        .stdout
+        .take()
+        .ok_or("Provider output unavailable.")?;
+    let stdin = process.stdin.clone();
+    let (send, receive) = std::sync::mpsc::sync_channel(32);
+    process.output = Some(ProviderOutput {
+        receive,
+        pending: None,
+    });
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            loop {
+                let line = read_bounded_line(&mut reader, LARGE_PROVIDER_RESPONSE_BYTES)?;
+                let value: serde_json::Value = serde_json::from_str(line.trim_end())
+                    .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                if !value.is_object()
+                    || value.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
+                {
+                    return Err("Provider returned invalid JSON-RPC.".into());
+                }
+                let event =
+                    if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
+                        if value.get("result").is_some() || value.get("error").is_some() {
+                            return Err("Provider returned an invalid JSON-RPC request.".into());
+                        }
+                        if let Some(id) = value.get("id") {
+                            if !(id.is_string() || id.is_i64() || id.is_u64()) {
+                                return Err("Provider returned an invalid JSON-RPC request.".into());
+                            }
+                            if method != "ping" {
+                                return Err(format!(
+                                    "Provider requested unsupported MCP method: {method}."
+                                ));
+                            }
+                            let reply = serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}})
+                                .to_string();
+                            write_shared_provider_request(
+                                &stdin,
+                                &reply,
+                                std::time::Duration::from_secs(1),
+                                |_| Ok(()),
+                            )?;
+                            continue;
+                        }
+                        ProviderEvent::Notification(line)
+                    } else {
+                        if value.get("id").is_none()
+                            || (value.get("result").is_some() == value.get("error").is_some())
+                        {
+                            return Err("Provider returned an invalid response.".into());
+                        }
+                        ProviderEvent::Response(line)
+                    };
+                send.send(event)
+                    .map_err(|_| "Provider request was stopped.".to_string())?;
+            }
+        })();
+        if let Err(error) = result {
+            let _ = send.send(ProviderEvent::Failure(error));
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn synchronize_provider_subscriptions(
+    process: &mut ProviderProcess,
+    key: &str,
+    capability: Option<&str>,
+    subscriptions: &HashSet<String>,
+    mut notify: NotificationSink<'_>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    for uri in subscriptions
+        .difference(&process.subscriptions)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let subscribe = serde_json::json!({"jsonrpc":"2.0","id":"sail-subscription",
+            "method":"resources/subscribe","params":{"uri":uri}});
+        let response = exchange_provider_request(
+            process,
+            key,
+            capability,
+            &subscribe,
+            &subscribe.to_string(),
+            notify
+                .as_mut()
+                .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
+            Some(deadline),
+        )?;
+        if !successful_provider_response(response.as_deref()) {
+            return Err("Replacement provider rejected an active resource subscription.".into());
+        }
+        process.subscriptions.insert(uri);
+    }
+    for uri in process
+        .subscriptions
+        .difference(subscriptions)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let unsubscribe = serde_json::json!({"jsonrpc":"2.0","id":"sail-unsubscription",
+            "method":"resources/unsubscribe","params":{"uri":uri}});
+        let response = exchange_provider_request(
+            process,
+            key,
+            capability,
+            &unsubscribe,
+            &unsubscribe.to_string(),
+            notify
+                .as_mut()
+                .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
+            Some(deadline),
+        )?;
+        if !successful_provider_response(response.as_deref()) {
+            return Err("Provider rejected an expired resource subscription.".into());
+        }
+        process.subscriptions.remove(&uri);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn exchange_provider_request(
+    process: &mut ProviderProcess,
+    key: &str,
+    capability: Option<&str>,
+    request: &serde_json::Value,
+    message: &str,
+    mut notify: NotificationSink<'_>,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<String>, String> {
+    use std::time::Duration;
+    let response_limit = provider_response_limit(request);
+    let session_active = || session_is_active(capability);
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("MCP method missing.")?;
+    let request_id = request.get("id");
+    let mut upstream = request.clone();
+    let upstream_id = if let Some(id) = request_id {
+        if !(id.is_string() || id.is_i64() || id.is_u64()) {
+            return Err("MCP request has no valid ID.".into());
+        }
+        process.request_sequence = process
+            .request_sequence
+            .checked_add(1)
+            .ok_or("Provider request ID sequence exhausted.")?;
+        upstream["id"] = serde_json::json!(process.request_sequence);
+        Some(process.request_sequence)
+    } else {
+        None
+    };
+    let progress_token = request.pointer("/params/_meta/progressToken");
+    if progress_token.is_some() {
+        if let Some(upstream_id) = upstream_id {
+            upstream["params"]["_meta"]["progressToken"] = serde_json::json!(upstream_id);
+        }
+    }
+    if method == "initialize" {
+        // A shared provider cannot call back into any individual agent client.
+        upstream["params"]["capabilities"] = serde_json::json!({});
+    }
+    let encoded;
+    let message = if upstream_id.is_some() || method == "initialize" {
+        encoded = upstream.to_string();
+        encoded.as_str()
+    } else {
+        message
+    };
+    let write_timeout = deadline.map_or(Duration::from_secs(30), |deadline| {
+        deadline.saturating_duration_since(std::time::Instant::now())
+    });
+    let mut cancelled_before_write = false;
+    let write = write_shared_provider_request(&process.stdin, message, write_timeout, |written| {
+        if !session_active()? {
+            return Err("Context session revoked during provider stdin write.".into());
+        }
+        if request
+            .get("id")
+            .is_some_and(|id| !take_cancellations(key, capability, id).is_empty())
+        {
+            cancelled_before_write = !written;
+            return Err("Provider request cancelled while writing stdin.".into());
+        }
+        Ok(())
+    });
+    if cancelled_before_write {
+        return Ok(request_id.map(cancelled_provider_response));
+    }
+    write?;
+    let Some(request_id) = request_id else {
+        if method == "notifications/initialized" {
+            process.initialized_notification_sent = true;
+        }
+        return Ok(None);
+    };
+    start_provider_output(process)?;
+    let output = process
+        .output
+        .as_mut()
+        .ok_or("Provider output unavailable.")?;
+    let upstream_id = upstream_id.ok_or("Provider request has no upstream ID.")?;
+    let deadline = deadline.unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(30));
+    let mut buffered = String::new();
+    let mut notifications = String::new();
+    let mut flush_at = std::time::Instant::now() + Duration::from_millis(10);
+    let response = loop {
+        if !session_active()? {
+            return Err("Context session revoked before provider response.".into());
+        }
+        if std::time::Instant::now() >= flush_at {
+            flush_provider_notifications(&mut notify, &mut notifications)?;
+            flush_at = std::time::Instant::now() + Duration::from_millis(10);
+        }
+        let cancellations = take_cancellations(key, capability, request_id);
+        for notification in &cancellations {
+            let mut notification: serde_json::Value = serde_json::from_str(notification)
+                .map_err(|_| "Invalid provider cancellation.".to_string())?;
+            notification["params"]["requestId"] = serde_json::json!(upstream_id);
+            write_shared_provider_request(
+                &process.stdin,
+                &notification.to_string(),
+                Duration::from_secs(1),
+                |_| {
+                    if session_active()? {
+                        Ok(())
+                    } else {
+                        Err("Context session revoked during provider cancellation.".into())
+                    }
+                },
+            )?;
+        }
+        if !cancellations.is_empty() {
+            let cancelled = cancelled_provider_response(request_id);
+            if buffered.len() + cancelled.len() > response_limit {
+                return Err("Buffered provider output exceeds its limit.".into());
+            }
+            buffered.push_str(&cancelled);
+            break buffered;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("Provider response timed out.".into());
+        }
+        let event = output.pending.take().map_or_else(
+            || {
+                output
+                    .receive
+                    .recv_timeout(remaining.min(Duration::from_millis(10)))
+            },
+            |message| Ok(ProviderEvent::Notification(message)),
+        );
+        match event {
+            Ok(ProviderEvent::Notification(mut message)) => {
+                let mut value: serde_json::Value = serde_json::from_str(message.trim_end())
+                    .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                if value.get("method").and_then(serde_json::Value::as_str)
+                    == Some("notifications/progress")
+                {
+                    let Some(progress_token) = progress_token else {
+                        continue;
+                    };
+                    if value
+                        .pointer("/params/progressToken")
+                        .and_then(serde_json::Value::as_u64)
+                        != Some(upstream_id)
+                    {
+                        continue;
+                    }
+                    value["params"]["progressToken"] = progress_token.clone();
+                    message = format!("{value}\n");
+                }
+                if notify.is_some() {
+                    if notifications.len() + message.len() > 1024 * 1024 {
+                        flush_provider_notifications(&mut notify, &mut notifications)?;
+                        flush_at = std::time::Instant::now() + Duration::from_millis(10);
+                    }
+                    notifications.push_str(&message);
+                } else {
+                    if buffered.len() + message.len() > response_limit {
+                        return Err("Buffered provider output exceeds its limit.".into());
+                    }
+                    buffered.push_str(&message);
+                }
+            }
+            Ok(ProviderEvent::Response(message)) => {
+                let mut value: serde_json::Value = serde_json::from_str(message.trim_end())
+                    .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                let response_id = value.get("id").and_then(serde_json::Value::as_u64);
+                if response_id.is_some_and(|id| id > 0 && id < upstream_id) {
+                    continue;
+                }
+                if response_id != Some(upstream_id) {
+                    return Err("Provider response ID did not match the request.".into());
+                }
+                flush_provider_notifications(&mut notify, &mut notifications)?;
+                value["id"] = request_id.clone();
+                let message = value.to_string();
+                if buffered.len() + message.len() > response_limit {
+                    return Err("Buffered provider output exceeds its limit.".into());
+                }
+                buffered.push_str(&message);
+                break buffered;
+            }
+            Ok(ProviderEvent::Failure(error)) => return Err(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Provider response reader stopped.".into());
+            }
+        }
+    };
+    if method == "initialize" && successful_provider_response(Some(&response)) {
+        if let Some(result) = response
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .and_then(|value| value.get("result").cloned())
+        {
+            if result
+                .get("protocolVersion")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("Provider initialize response has no protocol version.".into());
+            }
+            process.initialization = Some(result);
+        }
+    }
+    Ok(Some(response.trim_end().to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn read_bounded_line(reader: &mut impl std::io::BufRead, limit: usize) -> Result<String, String> {
+    let mut output = Vec::new();
+    loop {
+        let available = reader.fill_buf().map_err(|error| error.to_string())?;
+        if available.is_empty() {
+            return Err("MCP message ended before a newline.".into());
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if output.len() + count > limit {
+            return Err("MCP message exceeds its limit.".into());
+        }
+        let done = available[count - 1] == b'\n';
+        output.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if done {
+            return String::from_utf8(output).map_err(|error| error.to_string());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// All pointers must reference valid buffers of the stated lengths.
+pub unsafe extern "C" fn sail_context_provider_request(
+    directory: *const std::ffi::c_char,
+    expected: *const std::ffi::c_char,
+    capability: *const std::ffi::c_char,
+    message: *const std::ffi::c_char,
+    notify: extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_char) -> bool,
+    notify_context: *mut std::ffi::c_void,
+    output: *mut std::ffi::c_char,
+    output_length: usize,
+) -> bool {
+    use std::ffi::CStr;
+    if directory.is_null()
+        || expected.is_null()
+        || capability.is_null()
+        || message.is_null()
+        || output.is_null()
+        || output_length == 0
+    {
+        return false;
+    }
+    let result = (|| {
+        let directory = unsafe { CStr::from_ptr(directory) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let expected = unsafe { CStr::from_ptr(expected) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let capability = unsafe { CStr::from_ptr(capability) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let message = unsafe { CStr::from_ptr(message) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let mut emit = |message: &str| {
+            let message = std::ffi::CString::new(message)
+                .map_err(|_| "Provider notification contains a NUL byte.".to_string())?;
+            if notify(notify_context, message.as_ptr()) {
+                Ok(())
+            } else {
+                Err("Provider notification rejected or output queue full.".into())
+            }
+        };
+        provider_request(
+            Path::new(directory),
+            expected,
+            capability,
+            message,
+            &mut emit,
+        )
+    })();
+    let (ok, text) = match result {
+        Ok(Some(response)) => (true, response),
+        Ok(None) => (true, String::new()),
+        Err(error) => (false, error),
+    };
+    if text.len() >= output_length {
+        return false;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), output.cast::<u8>(), text.len());
+        *output.add(text.len()) = 0;
+    }
+    ok
 }
 
 #[cfg(target_os = "macos")]
@@ -790,6 +2748,59 @@ mod tests {
     use serde_json::json;
 
     struct Repository(PathBuf);
+
+    #[cfg(target_os = "macos")]
+    struct StopProvider(String);
+
+    #[cfg(target_os = "macos")]
+    struct StopAndWait(String);
+
+    #[cfg(target_os = "macos")]
+    struct ActiveSession(String);
+
+    #[cfg(target_os = "macos")]
+    impl ActiveSession {
+        fn new() -> Self {
+            let value = sha256(uuid::Uuid::new_v4().as_bytes());
+            let capability = std::ffi::CString::new(value.clone()).unwrap();
+            assert!(unsafe { sail_context_session_activate(capability.as_ptr()) });
+            Self(value)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ActiveSession {
+        fn drop(&mut self) {
+            let capability = std::ffi::CString::new(self.0.clone()).unwrap();
+            unsafe { sail_context_session_deactivate(capability.as_ptr()) };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for StopProvider {
+        fn drop(&mut self) {
+            let key = std::ffi::CString::new(self.0.clone()).unwrap();
+            unsafe { sail_context_provider_stop(key.as_ptr()) };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for StopAndWait {
+        fn drop(&mut self) {
+            let key = std::ffi::CString::new(self.0.clone()).unwrap();
+            unsafe { sail_context_provider_stop(key.as_ptr()) };
+            if let Some(providers) = PROVIDERS.get() {
+                let registry = providers.lock().unwrap();
+                drop(
+                    PROVIDER_STOPPED
+                        .wait_while(registry, |registry| {
+                            registry.get(&self.0).is_some_and(Option::is_none)
+                        })
+                        .unwrap(),
+                );
+            }
+        }
+    }
 
     impl Repository {
         fn new(name: &str) -> Self {
@@ -840,6 +2851,27 @@ mod tests {
             );
             self.commit();
         }
+
+        #[cfg(target_os = "macos")]
+        fn provider_fixture(&self) -> PathBuf {
+            let executable = self.0.join("provider");
+            let source =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/fixtures/context-provider.c");
+            assert!(Command::new("cc")
+                .args(["-o"])
+                .arg(&executable)
+                .arg(source)
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&executable)
+                .status()
+                .unwrap()
+                .success());
+            dunce::canonicalize(executable).unwrap()
+        }
     }
 
     impl Drop for Repository {
@@ -865,6 +2897,2163 @@ mod tests {
             )]),
             approvals: BTreeMap::new(),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_provider_can_exchange_a_bounded_mcp_line() {
+        let repository = Repository::new("confined-provider");
+        repository.configure();
+        let executable = repository.provider_fixture();
+        let current = ProviderStatus {
+            state: "approved".into(),
+            id: Some("fixture".into()),
+            command: Some("fixture".into()),
+            executable: Some(executable.to_string_lossy().into_owned()),
+            executable_sha256: Some(executable_hash(&executable).unwrap()),
+            capabilities: vec!["get".into()],
+            fingerprint: Some("fixture-fingerprint".into()),
+            revision: None,
+            reason: None,
+        };
+        let mut provider =
+            spawn_provider(&repository.0, &current, &repository.0.join("data")).unwrap();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"write"}"#;
+        write_shared_provider_request(
+            &provider.stdin,
+            request,
+            std::time::Duration::from_secs(1),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let response = read_bounded_line(provider.stdout.as_mut().unwrap(), 1024)
+            .unwrap_or_else(|error| panic!("{}", provider.error(&error)));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], 1);
+        assert!(response["result"]["pid"].as_i64().unwrap() > 0);
+        assert!(repository.0.join("data/written").exists());
+        assert!(read_bounded_line(&mut std::io::Cursor::new(vec![b'x'; 5]), 4).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_requests_track_committed_approval_and_stop_after_change() {
+        let repository = Repository::new("runtime-approval");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let call = || {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                request,
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let first: serde_json::Value = serde_json::from_str(&call().unwrap().unwrap()).unwrap();
+        assert_eq!(first["id"], 1);
+        repository.write(
+            ".sail/context.json",
+            r#"{"version":1,"providers":[{"id":"project-files","type":"stdio","command":"fixture-provider","capabilities":["execute"]}]}"#,
+        );
+        let second: serde_json::Value = serde_json::from_str(&call().unwrap().unwrap()).unwrap();
+        assert_eq!(first["result"]["pid"], second["result"]["pid"]);
+        repository.commit();
+        assert!(call().unwrap_err().contains("approval changed"));
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_negotiates_only_supported_client_capabilities() {
+        let repository = Repository::new("runtime-client-capabilities");
+        repository.configure();
+        let _stop = StopProvider(project_key(&repository.0).unwrap());
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let call = |request: serde_json::Value| {
+            let response = provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap();
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+        let initialized = call(json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"test","version":"1"},
+            "capabilities":{"roots":{"listChanged":true},"sampling":{},"elicitation":{},
+            "experimental":{"custom":{}},"tasks":{}}}}));
+        assert_eq!(initialized["result"]["clientCapabilitiesEmpty"], true);
+        let called = call(json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"fixture_ping","arguments":{}}}));
+        assert_eq!(called["result"]["content"][0]["text"], "fixture reply");
+        assert_eq!(called["result"]["pid"], initialized["result"]["pid"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_initialization_never_creates_a_shared_success() {
+        for mode in ["both", "neither", "error"] {
+            let repository = Repository::new("runtime-malformed-initialize");
+            repository.write(".sail/initialize-response", mode);
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopAndWait(key.clone());
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let peer = ActiveSession::new();
+            let call = |capability: &str, id| {
+                provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(capability),
+                    &json!({"jsonrpc":"2.0","id":id,"method":"initialize",
+                        "params":{"protocolVersion":"2025-06-18"}})
+                    .to_string(),
+                    &store_path,
+                    &repository.0.join("data"),
+                )
+            };
+            for capability in [&owner.0, &peer.0] {
+                let response = call(capability, 1);
+                if mode == "error" {
+                    let response: serde_json::Value =
+                        serde_json::from_str(&response.unwrap().unwrap()).unwrap();
+                    assert_eq!(response["id"], 1);
+                    assert_eq!(response["error"]["message"], "startup failed");
+                    assert!(response.get("result").is_none());
+                } else {
+                    assert!(response.unwrap_err().contains("invalid response"), "{mode}");
+                    assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+                }
+                assert!(active_sessions()
+                    .lock()
+                    .unwrap()
+                    .get(capability)
+                    .unwrap()
+                    .is_none());
+            }
+            fs::remove_file(repository.0.join(".sail/initialize-response")).unwrap();
+            let first: serde_json::Value =
+                serde_json::from_str(&call(&owner.0, 2).unwrap().unwrap()).unwrap();
+            let second: serde_json::Value =
+                serde_json::from_str(&call(&peer.0, 3).unwrap().unwrap()).unwrap();
+            assert_eq!(first["id"], 2);
+            assert_eq!(second["id"], 3);
+            assert_eq!(first["result"]["pid"], second["result"]["pid"]);
+            let initialize_count = if mode == "error" { 3 } else { 1 };
+            assert_eq!(first["result"]["initializeCount"], initialize_count);
+            assert_eq!(second["result"]["initializeCount"], initialize_count);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn approved_get_reads_a_large_provider_result() {
+        let repository = Repository::new("runtime-large-get");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let request = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{"name":"get","arguments":{"id":"large"}}});
+        assert_eq!(
+            provider_response_limit(&request),
+            LARGE_PROVIDER_RESPONSE_BYTES
+        );
+        assert_eq!(
+            provider_response_limit(&json!({"method":"tools/call","params":{"name":"search"}})),
+            LARGE_PROVIDER_RESPONSE_BYTES
+        );
+        let response = provider_request_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            &request.to_string(),
+            &store_path,
+            &repository.0.join("data"),
+        )
+        .unwrap()
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["content"].as_str().unwrap().len(),
+            2 * 1024 * 1024
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn second_agent_reuses_provider_initialization() {
+        let repository = Repository::new("runtime-initialize");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let call = |id| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"initialize","params":{{"protocolVersion":"2025-06-18"}}}}"#),
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first: serde_json::Value = serde_json::from_str(&call(1)).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&call(2)).unwrap();
+        assert_eq!(first["id"], 1);
+        assert_eq!(second["id"], 2);
+        assert_eq!(first["result"]["pid"], second["result"]["pid"]);
+        assert_eq!(first["result"]["initializeCount"], 1);
+        assert_eq!(second["result"]["initializeCount"], 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn surviving_session_reinitializes_a_strict_replacement_provider() {
+        let repository = Repository::new("runtime-survivor-initialize");
+        repository.write(".sail/strict-provider-lifecycle", "require MCP handshake");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let first = ActiveSession::new();
+        let survivor = ActiveSession::new();
+        let call = |capability: &str, request: serde_json::Value| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                Some(capability),
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}});
+        let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        for session in [&first.0, &survivor.0] {
+            call(session, initialize.clone()).unwrap();
+            call(session, initialized.clone()).unwrap();
+        }
+        let first_response: serde_json::Value = serde_json::from_str(
+            &call(
+                &survivor.0,
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(call(
+            &first.0,
+            json!({"jsonrpc":"2.0","id":3,"method":"invalid-slow"})
+        )
+        .unwrap_err()
+        .contains("invalid JSON-RPC"));
+        drop(first);
+        let recovered: serde_json::Value = serde_json::from_str(
+            &call(
+                &survivor.0,
+                json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(first_response["result"]["pid"], recovered["result"]["pid"]);
+        assert_eq!(recovered["result"]["initializeCount"], 1);
+        assert_eq!(recovered["result"]["tools"][0]["name"], "fixture_ping");
+        let slot = PROVIDERS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        {
+            let mut provider = slot.lock().unwrap();
+            let child = &mut provider.as_mut().unwrap().child;
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        let restarted: serde_json::Value = serde_json::from_str(
+            &call(
+                &survivor.0,
+                json!({"jsonrpc":"2.0","id":5,"method":"tools/list"}),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(recovered["result"]["pid"], restarted["result"]["pid"]);
+        assert_eq!(restarted["result"]["initializeCount"], 1);
+        assert_eq!(restarted["result"]["tools"][0]["name"], "fixture_ping");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_provider_returns_its_actual_protocol_fallback_and_rejects_invalid_initialization() {
+        let repository = Repository::new("runtime-protocol-fallback");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let call = |request: serde_json::Value| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let first: serde_json::Value = serde_json::from_str(&call(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&call(json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2024-11-05"}})).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            second["result"]["protocolVersion"],
+            first["result"]["protocolVersion"]
+        );
+        assert_eq!(second["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(second["result"]["initializeCount"], 1);
+        assert_eq!(second["result"]["pid"], first["result"]["pid"]);
+        for version in [serde_json::Value::Null, json!(1), json!("")] {
+            assert!(call(json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":version}})).unwrap_err().contains("no protocol version"));
+        }
+        let third: serde_json::Value = serde_json::from_str(&call(json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap().unwrap()).unwrap();
+        assert_eq!(third["result"]["pid"], first["result"]["pid"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fingerprint_scoped_stop_preserves_a_reapproved_provider() {
+        let repository = Repository::new("runtime-scoped-stop");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let approve_current = || {
+            locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap()
+        };
+        let original = approve_current();
+        let call = |fingerprint: &str| {
+            let response = provider_request_at(&repository.0, fingerprint, None,
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                &store_path, &repository.0.join("data")).unwrap().unwrap();
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["result"]["pid"].clone()
+        };
+        let original_pid = call(&original);
+        stop_provider_if_fingerprint(&key, "unrelated")
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(call(&original), original_pid);
+        repository.write(".sail/context.json", r#"{"version":1,"providers":[{"id":"project-files","type":"stdio","command":"fixture-provider","capabilities":["search"]}]}"#);
+        repository.commit();
+        let replacement = approve_current();
+        assert_ne!(original, replacement);
+        let replacement_pid = call(&replacement);
+        assert_ne!(original_pid, replacement_pid);
+        stop_provider_if_fingerprint(&key, &original)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(call(&replacement), replacement_pid);
+        assert!(provider_request_at(
+            &repository.0,
+            &replacement,
+            Some(&"0".repeat(64)),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &store_path,
+            &repository.0.join("data")
+        )
+        .unwrap_err()
+        .contains("session revoked"));
+        assert_eq!(call(&replacement), replacement_pid);
+        stop_provider_if_fingerprint(&key, &replacement)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stdio_notification_batches_have_exactly_one_trailing_newline() {
+        let first =
+            json!({"jsonrpc":"2.0","method":"notifications/message","params":{"data":"first"}})
+                .to_string();
+        let second =
+            json!({"jsonrpc":"2.0","method":"notifications/message","params":{"data":"second"}})
+                .to_string();
+        for (name, suffix) in [
+            ("no terminator", ""),
+            ("one LF", "\n"),
+            ("CRLF", "\r\n"),
+            ("duplicate LF", "\n\n"),
+        ] {
+            let mut output = Vec::new();
+            write_provider_request_checked(
+                &mut output,
+                &format!("{first}\n{second}{suffix}"),
+                std::time::Duration::from_secs(1),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(
+                output,
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"data\":\"first\"}}\n\
+                 {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"data\":\"second\"}}\n",
+                "{name}",
+            );
+            let frames: Vec<_> = output.split_terminator('\n').collect();
+            assert_eq!(frames.len(), 2);
+            for frame in frames {
+                assert!(serde_json::from_str::<serde_json::Value>(frame).is_ok());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn idle_provider_ping_is_answered_without_another_client_request() {
+        let repository = Repository::new("runtime-idle-ping");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let call = |id, method: &str| {
+            let request = json!({"jsonrpc":"2.0","id":id,"method":method}).to_string();
+            let response = provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &request,
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap();
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+        let response = call(1, "idle-ping");
+        let marker = repository
+            .0
+            .join("data")
+            .join(key)
+            .join("idle-ping-replied");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "Idle server ping received no reply");
+        assert_eq!(
+            call(2, "tools/list")["result"]["pid"],
+            response["result"]["pid"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn idle_notification_burst_drains_before_the_following_provider_ping() {
+        let repository = Repository::new("runtime-idle-notification-ping");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let owner = ActiveSession::new();
+        let call = |message: &str| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                Some(&owner.0),
+                message,
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        );
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let response = call(r#"{"jsonrpc":"2.0","id":2,"method":"idle-many-progress"}"#);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["pid"], first["result"]["pid"]);
+
+        let marker = repository
+            .0
+            .join("data")
+            .join(&key)
+            .join("idle-progress-ping-replied");
+        let mut count = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (count < 160 || !marker.exists()) && std::time::Instant::now() < deadline {
+            if let Some(messages) = provider_notifications(&key, &fingerprint, &owner.0).unwrap() {
+                for message in messages.lines() {
+                    let notification: serde_json::Value = serde_json::from_str(message).unwrap();
+                    assert_eq!(notification["method"], "notifications/message");
+                    assert_eq!(notification["params"]["data"], count);
+                    count += 1;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(count, 160);
+        assert!(
+            marker.exists(),
+            "Idle ping was blocked by the notification queue"
+        );
+        let next = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(next["result"]["pid"], first["result"]["pid"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn idle_provider_exit_keeps_the_session_usable() {
+        let repository = Repository::new("runtime-idle-provider-exit");
+        repository.configure();
+        fs::write(
+            repository.0.join(".sail/strict-provider-lifecycle"),
+            b"strict",
+        )
+        .unwrap();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let owner = ActiveSession::new();
+        let call = |request: serde_json::Value| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                Some(&owner.0),
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+        };
+        let first = call(json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{}}}))
+        .unwrap();
+        assert_eq!(
+            call(json!({"jsonrpc":"2.0","method":"notifications/initialized"})),
+            None
+        );
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let pid = first["result"]["pid"].as_i64().unwrap() as i32;
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert_eq!(
+            provider_notifications(&key, &fingerprint, &owner.0).unwrap(),
+            None
+        );
+        let replacement = call(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
+        let replacement: serde_json::Value = serde_json::from_str(&replacement).unwrap();
+        assert_ne!(replacement["result"]["pid"], pid);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn progress_stream_exceeding_32_messages_reaches_its_result() {
+        let repository = Repository::new("runtime-many-progress");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"many-progress","params":{"_meta":{"progressToken":"fixture"}}}).to_string();
+        let mut count = 0;
+        let mut notify = |message: &str| {
+            for line in message.lines() {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(value["method"], "notifications/progress");
+                assert_eq!(value["params"]["progressToken"], "fixture");
+                assert_eq!(value["params"]["progress"], count);
+                count += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Ok(())
+        };
+        let response = provider_request_with_notifications_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            &request,
+            &store_path,
+            &repository.0.join("data"),
+            Some(&mut notify),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 160);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], 1);
+        let next = provider_request_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &store_path,
+            &repository.0.join("data"),
+        )
+        .unwrap()
+        .unwrap();
+        let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(next["result"]["pid"], response["result"]["pid"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn delayed_authorized_worker_preserves_a_reapproved_provider() {
+        let repository = Repository::new("runtime-delayed-old-worker");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let approve_current = || {
+            locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap()
+        };
+        let original = approve_current();
+        let owner = ActiveSession::new();
+        let call = |fingerprint: &str, capability| {
+            provider_request_at(
+                &repository.0,
+                fingerprint,
+                capability,
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let first = call(&original, Some(owner.0.as_str())).unwrap().unwrap();
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        std::thread::scope(|scope| {
+            let (authorized, ready) = std::sync::mpsc::sync_channel(1);
+            let (resume, suspended) = std::sync::mpsc::sync_channel(1);
+            let repository = &repository;
+            let store_path = &store_path;
+            let owner = &owner;
+            let original = &original;
+            let old = scope.spawn(move || {
+                assert!(session_is_active(Some(&owner.0)).unwrap());
+                assert_eq!(
+                    locked_store(store_path, |store| Ok((
+                        status(&repository.0, store).fingerprint,
+                        false
+                    )))
+                    .unwrap(),
+                    Some(original.to_owned()),
+                );
+                authorized.send(()).unwrap();
+                suspended.recv().unwrap();
+                call(original, Some(owner.0.as_str()))
+            });
+            ready.recv().unwrap();
+            repository.write(".sail/context.json", r#"{"version":1,"providers":[{"id":"project-files","type":"stdio","command":"fixture-provider","capabilities":["search"]}]}"#);
+            repository.commit();
+            let replacement = approve_current();
+            assert_ne!(&replacement, original);
+            let latest = call(&replacement, None).unwrap().unwrap();
+            let latest: serde_json::Value = serde_json::from_str(&latest).unwrap();
+            assert_ne!(latest["result"]["pid"], first["result"]["pid"]);
+            resume.send(()).unwrap();
+            assert!(old
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .contains("approval changed"));
+            let preserved = call(&replacement, None).unwrap().unwrap();
+            let preserved: serde_json::Value = serde_json::from_str(&preserved).unwrap();
+            assert_eq!(latest["result"]["pid"], preserved["result"]["pid"]);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_server_ping_keeps_the_client_request_and_process_alive() {
+        for method in ["server-ping", "server-ping-different-id"] {
+            let repository = Repository::new(method);
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopProvider(key);
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let request = json!({"jsonrpc":"2.0","id":1,"method":method}).to_string();
+
+            let response = provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &request,
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            let next = provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap();
+            let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+
+            assert_eq!(value["id"], 1);
+            assert_eq!(value["result"]["pid"], next["result"]["pid"]);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queued_requests_share_one_provider_after_protocol_failure() {
+        let repository = Repository::new("runtime-error-queue");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let owner = ActiveSession::new();
+        let call = |id, method| {
+            let request = if method == "initialize" {
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":{"protocolVersion":"2025-06-18"}})
+            } else {
+                json!({"jsonrpc":"2.0","id":id,"method":method})
+            }.to_string();
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                Some(&owner.0),
+                &request,
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+
+        call(0, "initialize").unwrap();
+        provider_request_at(
+            &repository.0,
+            &fingerprint,
+            Some(&owner.0),
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &store_path,
+            &repository.0.join("data"),
+        )
+        .unwrap();
+
+        std::thread::scope(|scope| {
+            let failing = scope.spawn(|| call(1, "invalid-slow"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let slot = loop {
+                if let Some(slot) = PROVIDERS
+                    .get()
+                    .and_then(|registry| registry.lock().unwrap().get(&key).and_then(Option::clone))
+                {
+                    break slot;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Provider did not start"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            let ready = repository
+                .0
+                .join("data")
+                .join(&key)
+                .join("protocol-fault-ready");
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                ready.exists(),
+                "Protocol-fault request did not reach the provider"
+            );
+            let queued = scope.spawn(|| call(2, "slow"));
+            while std::sync::Arc::strong_count(&slot) < 4 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let waiting = std::sync::Arc::strong_count(&slot) >= 4;
+            let failure = failing.join().unwrap();
+            let latest = call(3, "tools/list").unwrap().unwrap();
+            let previous = queued.join().unwrap().unwrap().unwrap();
+            let latest: serde_json::Value = serde_json::from_str(&latest).unwrap();
+            let previous: serde_json::Value = serde_json::from_str(&previous).unwrap();
+
+            assert!(
+                waiting,
+                "Second request did not queue before the protocol failure"
+            );
+            assert!(failure.unwrap_err().contains("invalid JSON-RPC"));
+            assert_eq!(previous["result"]["pid"], latest["result"]["pid"]);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_agents_keep_request_ids_and_resource_subscriptions_independent() {
+        let repository = Repository::new("runtime-shared-identities");
+        repository.configure();
+        fs::write(
+            repository.0.join(".sail/strict-provider-ids"),
+            b"unique IDs",
+        )
+        .unwrap();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let a = ActiveSession::new();
+        let b = ActiveSession::new();
+        let call = |capability: &str, request: serde_json::Value| {
+            let result = provider_request_at(
+                &repository.0,
+                &fingerprint,
+                Some(capability),
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap();
+            result.map(|result| {
+                serde_json::from_str::<serde_json::Value>(result.lines().last().unwrap()).unwrap()
+            })
+        };
+        for capability in [&a.0, &b.0] {
+            let response = call(
+                capability,
+                serde_json::json!({"jsonrpc":"2.0","id":1,
+                "method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}),
+            )
+            .unwrap();
+            assert_eq!(response["id"], 1);
+            assert!(response.get("result").is_some());
+            assert!(call(
+                capability,
+                serde_json::json!({"jsonrpc":"2.0",
+                "method":"notifications/initialized"})
+            )
+            .is_none());
+        }
+        let tools = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+        let first = call(&a.0, tools.clone()).unwrap();
+        let second = call(&b.0, tools.clone()).unwrap();
+        assert_eq!(first["id"], 1);
+        assert_eq!(second["id"], 1);
+        assert_eq!(first["result"]["pid"], second["result"]["pid"]);
+        assert!(second["result"]["tools"].is_array());
+        let subscription = |id, method| {
+            serde_json::json!({"jsonrpc":"2.0","id":id,
+            "method":method,"params":{"uri":"fixture://shared"}})
+        };
+        call(&a.0, subscription("a-subscribe", "resources/subscribe")).unwrap();
+        call(&b.0, subscription("b-subscribe", "resources/subscribe")).unwrap();
+        let shared = call(&b.0, tools.clone()).unwrap();
+        assert_eq!(shared["result"]["subscriptions"], 1);
+        call(&a.0, subscription("a-unsubscribe", "resources/unsubscribe")).unwrap();
+        let remaining = call(&b.0, tools.clone()).unwrap();
+        assert_eq!(remaining["result"]["unsubscriptions"], 0);
+        assert_eq!(remaining["result"]["subscribed"], true);
+        stop_provider_if_fingerprint(&key, &fingerprint)
+            .unwrap()
+            .join()
+            .unwrap();
+        let replacement = call(&b.0, tools.clone()).unwrap();
+        assert_ne!(replacement["result"]["pid"], first["result"]["pid"]);
+        assert_eq!(replacement["result"]["subscriptions"], 1);
+        assert_eq!(replacement["result"]["subscribed"], true);
+        call(&b.0, subscription("b-unsubscribe", "resources/unsubscribe")).unwrap();
+        let final_state = call(&b.0, tools).unwrap();
+        assert_eq!(final_state["result"]["unsubscriptions"], 1);
+        assert_eq!(final_state["result"]["subscribed"], false);
+        call(
+            &a.0,
+            subscription("a-subscribe-again", "resources/subscribe"),
+        )
+        .unwrap();
+        drop(a);
+        let closed = call(
+            &b.0,
+            serde_json::json!({"jsonrpc":"2.0","id":"closed-owner",
+            "method":"tools/list"}),
+        )
+        .unwrap();
+        assert_eq!(closed["result"]["unsubscriptions"], 2);
+        assert_eq!(closed["result"]["subscribed"], false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restored_subscriptions_stop_when_session_authorization_is_removed() {
+        type RemoveAuthorization = fn(&Repository, &Path, &ActiveSession);
+        let cases: [(&str, RemoveAuthorization); 2] = [
+            ("session-close", |_, _, owner| {
+                let capability = std::ffi::CString::new(owner.0.clone()).unwrap();
+                unsafe { sail_context_session_deactivate(capability.as_ptr()) };
+            }),
+            ("approval-revocation", |repository, store_path, owner| {
+                locked_store(store_path, |store| {
+                    let removed = revoke(&repository.0, store)?;
+                    Ok(((), removed))
+                })
+                .unwrap();
+                let capability = std::ffi::CString::new(owner.0.clone()).unwrap();
+                unsafe { sail_context_session_deactivate(capability.as_ptr()) };
+            }),
+        ];
+        for (name, remove_authorization) in cases {
+            let repository = Repository::new(name);
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopAndWait(key.clone());
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let peer = (name == "session-close").then(ActiveSession::new);
+            let call = |capability: &str, request: serde_json::Value| {
+                provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(capability),
+                    &request.to_string(),
+                    &store_path,
+                    &repository.0.join("data"),
+                )
+            };
+            call(
+                &owner.0,
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"protocolVersion":"2025-06-18","capabilities":{}}}),
+            )
+            .unwrap();
+            call(
+                &owner.0,
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            )
+            .unwrap();
+            if let Some(peer) = &peer {
+                call(
+                    &peer.0,
+                    json!({"jsonrpc":"2.0","id":"peer-init","method":"initialize",
+                    "params":{"protocolVersion":"2025-06-18","capabilities":{}}}),
+                )
+                .unwrap();
+                call(
+                    &peer.0,
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                )
+                .unwrap();
+            }
+            call(
+                &owner.0,
+                json!({"jsonrpc":"2.0","id":2,"method":"resources/subscribe",
+                "params":{"uri":"fixture://first"}}),
+            )
+            .unwrap();
+            call(
+                &owner.0,
+                json!({"jsonrpc":"2.0","id":3,"method":"resources/subscribe",
+                "params":{"uri":"fixture://second"}}),
+            )
+            .unwrap();
+            stop_provider_if_fingerprint(&key, &fingerprint)
+                .unwrap()
+                .join()
+                .unwrap();
+            fs::write(
+                repository.0.join(".sail/hold-resource-subscriptions"),
+                b"hold",
+            )
+            .unwrap();
+
+            std::thread::scope(|scope| {
+                let (send, receive) = std::sync::mpsc::channel();
+                let owner_capability = &owner.0;
+                let request = scope.spawn(move || {
+                    let result = call(
+                        owner_capability,
+                        json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}),
+                    );
+                    send.send(result).unwrap();
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let marker = loop {
+                    let marker = fs::read_dir(repository.0.join("data").join(&key))
+                        .ok()
+                        .and_then(|entries| {
+                            entries.filter_map(Result::ok).find(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with("subscription-ready-")
+                            })
+                        });
+                    if let Some(marker) = marker {
+                        break marker;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{name}: replay did not start"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                };
+                let pid: i32 = marker
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix("subscription-ready-")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                remove_authorization(&repository, &store_path, &owner);
+                let interrupted = receive.recv_timeout(std::time::Duration::from_secs(2));
+                fs::write(
+                    repository.0.join(".sail/release-resource-subscriptions"),
+                    b"release",
+                )
+                .unwrap();
+                request.join().unwrap();
+
+                assert!(
+                    interrupted
+                        .unwrap()
+                        .unwrap_err()
+                        .contains("session revoked"),
+                    "{name}"
+                );
+                assert_eq!(
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                    Err(nix::errno::Errno::ESRCH),
+                    "{name}: revoked provider is still running"
+                );
+            });
+            if let Some(peer) = &peer {
+                let response = call(
+                    &peer.0,
+                    json!({"jsonrpc":"2.0","id":"survivor","method":"tools/list"}),
+                )
+                .unwrap()
+                .unwrap();
+                let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(response["result"]["subscriptions"], 0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn subscription_restoration_shares_one_deadline_across_slow_replies() {
+        let repository = Repository::new("runtime-subscription-deadline");
+        repository.configure();
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let current = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((status(&repository.0, store), true))
+        })
+        .unwrap();
+        let key = project_key(&repository.0).unwrap();
+        let owner = ActiveSession::new();
+        let mut process =
+            spawn_provider(&repository.0, &current, &repository.0.join("data")).unwrap();
+        let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{}}});
+        exchange_provider_request(
+            &mut process,
+            &key,
+            Some(&owner.0),
+            &initialize,
+            &initialize.to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        exchange_provider_request(
+            &mut process,
+            &key,
+            Some(&owner.0),
+            &initialized,
+            &initialized.to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        fs::write(
+            repository.0.join(".sail/slow-resource-subscriptions"),
+            b"slow",
+        )
+        .unwrap();
+        let subscriptions = HashSet::from(["fixture://first".into(), "fixture://second".into()]);
+
+        let result = synchronize_provider_subscriptions(
+            &mut process,
+            &key,
+            Some(&owner.0),
+            &subscriptions,
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+
+        assert!(result.unwrap_err().contains("timed out"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_batch_can_back_off_within_relay_frame() {
+        let repository = Repository::new("runtime-large-search");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let search = |id, limit, query| {
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"search","arguments":{"query":query,"limit":limit}}})
+        };
+        let call = |request: serde_json::Value| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+
+        assert!(call(search(1, 8, "plain"))
+            .unwrap_err()
+            .starts_with("MCP message exceeds its limit."));
+        let response = call(search(2, 4, "plain")).unwrap().unwrap();
+        assert!(response.len() < LARGE_PROVIDER_RESPONSE_BYTES);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["structuredContent"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        let response = call(search(3, 1, "escaped")).unwrap().unwrap();
+        assert!(response.len() < LARGE_PROVIDER_RESPONSE_BYTES);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["structuredContent"]["items"][0]["content"]
+                .as_str()
+                .unwrap()
+                .len(),
+            8 * 1024 * 1024
+        );
+        assert!(call(search(4, 1, "ignore-limit"))
+            .unwrap_err()
+            .starts_with("MCP message exceeds its limit."));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancelling_a_queued_request_preserves_the_shared_provider() {
+        for (name, request_id) in [("integer-id", json!(11)), ("string-id", json!("queued"))] {
+            let repository = Repository::new(name);
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopProvider(key);
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let peer = ActiveSession::new();
+            let call = |message: &str, capability: &str| {
+                provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(capability),
+                    message,
+                    &store_path,
+                    &repository.0.join("data"),
+                )
+            };
+            let before = call(
+                r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#,
+                &owner.0,
+            )
+            .unwrap()
+            .unwrap();
+            let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+            let queued_request =
+                json!({"jsonrpc":"2.0","id":request_id,"method":"tools/list"}).to_string();
+            let queued_cancellation = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":request_id}}).to_string();
+            let (ready, received) = std::sync::mpsc::sync_channel(1);
+            let (completion, completed) = std::sync::mpsc::sync_channel(1);
+
+            let cancelled = std::thread::scope(|scope| {
+                let active = scope.spawn(|| {
+                    let mut notify = |_: &str| ready.send(()).map_err(|error| error.to_string());
+                    provider_request_with_notifications_at(
+                        &repository.0,
+                        &fingerprint,
+                        Some(&owner.0),
+                        r#"{"jsonrpc":"2.0","id":10,"method":"wait-for-cancel-no-response"}"#,
+                        &store_path,
+                        &repository.0.join("data"),
+                        Some(&mut notify),
+                    )
+                });
+                received
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let queued = scope.spawn(|| {
+                    completion.send(call(&queued_request, &peer.0)).unwrap();
+                });
+                call(&queued_cancellation, &peer.0).unwrap();
+                let cancelled = completed.recv_timeout(std::time::Duration::from_secs(2));
+                call(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":10}}"#, &owner.0).unwrap();
+                active.join().unwrap().unwrap();
+                queued.join().unwrap();
+                cancelled.expect("Queued cancellation waited for the unrelated active request")
+            });
+
+            let cancelled = cancelled.unwrap().unwrap();
+            let cancelled: serde_json::Value = serde_json::from_str(&cancelled).unwrap();
+            assert_eq!(cancelled["id"], request_id);
+            assert_eq!(cancelled["error"]["code"], -32800);
+            let reused = call(&queued_request, &owner.0).unwrap().unwrap();
+            let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+            let adjacent = call(&queued_request, &peer.0).unwrap().unwrap();
+            let adjacent: serde_json::Value = serde_json::from_str(&adjacent).unwrap();
+            assert_eq!(reused["result"]["pid"], before["result"]["pid"]);
+            assert_eq!(adjacent["result"]["pid"], before["result"]["pid"]);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancellation_reaches_a_waiting_provider_without_ending_other_calls() {
+        for method in ["wait-for-cancel", "wait-for-cancel-no-response"] {
+            let repository = Repository::new("runtime-cancellation");
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopProvider(key);
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let other = ActiveSession::new();
+            let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method}).to_string();
+            let cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"owner"}}"#;
+            let other_cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"other"}}"#;
+            let unrelated_cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":999,"reason":"other"}}"#;
+            let call = |message, capability: &str| {
+                provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(capability),
+                    message,
+                    &store_path,
+                    &repository.0.join("data"),
+                )
+            };
+            let before = call(
+                r#"{"jsonrpc":"2.0","id":"before","method":"tools/list"}"#,
+                &owner.0,
+            )
+            .unwrap()
+            .unwrap();
+            let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+            let (notifications, received) = std::sync::mpsc::sync_channel(1);
+            let (completion, completed) = std::sync::mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| {
+                    let mut notify = |message: &str| {
+                        notifications
+                            .send(message.to_owned())
+                            .map_err(|error| error.to_string())
+                    };
+                    let result = provider_request_with_notifications_at(
+                        &repository.0,
+                        &fingerprint,
+                        Some(&owner.0),
+                        &request,
+                        &store_path,
+                        &repository.0.join("data"),
+                        Some(&mut notify),
+                    );
+                    let _ = completion.send(result);
+                });
+                let notification = received
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let notification: serde_json::Value = serde_json::from_str(&notification).unwrap();
+                assert_eq!(notification["method"], "notifications/message");
+                assert_eq!(notification["params"]["data"], "waiting for cancellation");
+                assert_eq!(call(other_cancellation, &other.0).unwrap(), None);
+                assert_eq!(call(unrelated_cancellation, &owner.0).unwrap(), None);
+                assert!(
+                    !waiting.is_finished(),
+                    "Unrelated cancellation ended the owner request"
+                );
+                let started = std::time::Instant::now();
+                assert_eq!(call(cancellation, &owner.0).unwrap(), None);
+                let response = completed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("Owner cancellation did not complete within five seconds")
+                    .unwrap()
+                    .unwrap();
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed < std::time::Duration::from_secs(5),
+                    "{method}: owner cancellation took {elapsed:?}"
+                );
+                waiting.join().unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(response.lines().last().unwrap()).unwrap();
+                let next = call(
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                    &owner.0,
+                )
+                .unwrap()
+                .unwrap();
+                let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+
+                assert_eq!(value["id"], 1);
+                assert_eq!(value["error"]["code"], -32800);
+                assert!(next["result"]["pid"].is_number());
+                assert_eq!(next["result"]["pid"], before["result"]["pid"]);
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancelled_progress_never_reaches_the_next_shared_client() {
+        for (token, idle_drain) in [
+            (json!("shared"), false),
+            (json!("shared"), true),
+            (json!(47), false),
+            (json!(-4), false),
+        ] {
+            let repository = Repository::new("runtime-cancelled-progress");
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopAndWait(key.clone());
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let peer = ActiveSession::new();
+            let call = |capability: &str, message: &str| {
+                provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(capability),
+                    message,
+                    &store_path,
+                    &repository.0.join("data"),
+                )
+            };
+            for capability in [&owner.0, &peer.0] {
+                call(capability, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#)
+                    .unwrap().unwrap();
+                call(
+                    capability,
+                    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                )
+                .unwrap();
+            }
+            let mut cancel = |message: &str| {
+                let value: serde_json::Value = serde_json::from_str(message).unwrap();
+                assert_eq!(value["params"]["data"], "waiting for cancellation");
+                call(&owner.0, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#)
+                    .unwrap();
+                Ok(())
+            };
+            let request = json!({"jsonrpc":"2.0","id":2,"method":"wait-for-cancel-late-progress",
+                "params":{"_meta":{"progressToken":token}}})
+            .to_string();
+            let cancelled = provider_request_with_notifications_at(
+                &repository.0,
+                &fingerprint,
+                Some(&owner.0),
+                &request,
+                &store_path,
+                &repository.0.join("data"),
+                Some(&mut cancel),
+            )
+            .unwrap()
+            .unwrap();
+            let cancelled: serde_json::Value = serde_json::from_str(&cancelled).unwrap();
+            assert_eq!(cancelled["error"]["code"], -32800);
+            let slot = PROVIDERS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            {
+                let mut provider = slot.lock().unwrap();
+                let output = provider.as_mut().unwrap().output.as_mut().unwrap();
+                let ProviderEvent::Notification(message) = output
+                    .receive
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                else {
+                    panic!("Expected the real provider's late progress notification");
+                };
+                let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+                assert_eq!(value["method"], "notifications/progress");
+                assert_eq!(value["params"]["progress"], 999);
+                output.pending = Some(message);
+            }
+            if idle_drain {
+                assert_eq!(
+                    provider_notifications(&key, &fingerprint, &peer.0).unwrap(),
+                    None
+                );
+            }
+            let request = json!({"jsonrpc":"2.0","id":2,"method":"many-progress",
+                "params":{"_meta":{"progressToken":token}}})
+            .to_string();
+            let mut count = 0;
+            let mut notify = |message: &str| {
+                for line in message.lines() {
+                    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                    assert_eq!(value["method"], "notifications/progress");
+                    assert_eq!(value["params"]["progressToken"], token);
+                    assert_eq!(value["params"]["progress"], count);
+                    count += 1;
+                }
+                Ok(())
+            };
+            let response = provider_request_with_notifications_at(
+                &repository.0,
+                &fingerprint,
+                Some(&peer.0),
+                &request,
+                &store_path,
+                &repository.0.join("data"),
+                Some(&mut notify),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(count, 160);
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            let next = call(
+                &owner.0,
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+            )
+            .unwrap()
+            .unwrap();
+            let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+            assert_eq!(response["result"]["pid"], next["result"]["pid"]);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancellation_interrupts_blocked_provider_stdin_and_allows_replacement() {
+        let repository = Repository::new("runtime-blocked-input");
+        repository.configure();
+        repository.write(".sail/block-provider-stdin", "block after initialize");
+        repository.write(".sail/observe-provider-write", "signal a partial request");
+        repository.commit();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let owner = ActiveSession::new();
+        let peer = ActiveSession::new();
+        let call = |message: &str, capability: &str| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                Some(capability),
+                message,
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"sail-test","version":"1.0"}}}"#;
+        let first = call(initialize, &owner.0).unwrap().unwrap();
+        call(
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &owner.0,
+        )
+        .unwrap();
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let data_root = repository.0.join("data").join(key);
+        let marker = data_root.join("blocked-input");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "Provider did not stop reading stdin");
+        let request = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fixture_ping","arguments":{"payload":"x".repeat(900_000)}}}).to_string();
+        let cancellation =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#;
+
+        std::thread::scope(|scope| {
+            let pending = scope.spawn(|| call(&request, &owner.0));
+            let partial = data_root.join("partial-input");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !partial.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                partial.exists(),
+                "Provider did not receive a partial request"
+            );
+            let start = std::time::Instant::now();
+            assert_eq!(call(cancellation, &owner.0).unwrap(), None);
+            let result = pending.join().unwrap();
+            let elapsed = start.elapsed();
+            fs::remove_file(repository.0.join(".sail/block-provider-stdin")).unwrap();
+            let replacement = call(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+                &owner.0,
+            )
+            .unwrap()
+            .unwrap();
+            let replacement: serde_json::Value = serde_json::from_str(&replacement).unwrap();
+            call(initialize, &peer.0).unwrap();
+            let adjacent = call(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+                &owner.0,
+            )
+            .unwrap()
+            .unwrap();
+            let adjacent: serde_json::Value = serde_json::from_str(&adjacent).unwrap();
+
+            assert!(result
+                .unwrap_err()
+                .contains("cancelled while writing stdin"));
+            assert!(elapsed < std::time::Duration::from_secs(5));
+            assert_ne!(first["result"]["pid"], replacement["result"]["pid"]);
+            assert_eq!(replacement["result"]["pid"], adjacent["result"]["pid"]);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_startup_failure_returns_an_error_without_a_live_process() {
+        let repository = Repository::new("runtime-startup");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let store_path = repository.0.join("approvals.json");
+        let executable = dunce::canonicalize("/usr/bin/false").unwrap();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let result = provider_request_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &store_path,
+            &repository.0.join("data"),
+        );
+        assert!(result.is_err());
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_spawn_failure_releases_project_slot() {
+        let repository = Repository::new("runtime-spawn-failure");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let data_root = repository.0.join("file-instead-of-directory");
+        fs::write(&data_root, "occupied").unwrap();
+        let error = provider_request_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &store_path,
+            &data_root,
+        )
+        .unwrap_err();
+        assert!(error.contains("Not a directory") || error.contains("not a directory"));
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn executable_replacement_revokes_a_live_provider() {
+        let repository = Repository::new("runtime-executable-change");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.0.join("provider");
+        repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let call = || {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                request,
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let response: serde_json::Value = serde_json::from_str(&call().unwrap().unwrap()).unwrap();
+        assert_eq!(response["id"], 1);
+        let replacement = repository.0.join("replacement");
+        fs::copy("/usr/bin/false", &replacement).unwrap();
+        fs::rename(replacement, executable).unwrap();
+        assert!(call().unwrap_err().contains("approval changed"));
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn executable_replacement_between_check_and_launch_is_rejected() {
+        let repository = Repository::new("runtime-launch-race");
+        repository.configure();
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let current = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((status(&repository.0, store), true))
+        })
+        .unwrap();
+        let replacement = repository.0.join("replacement");
+        fs::copy("/usr/bin/false", &replacement).unwrap();
+        fs::rename(replacement, executable).unwrap();
+        let error = spawn_provider(&repository.0, &current, &repository.0.join("data"))
+            .err()
+            .unwrap();
+        assert!(error.contains("changed before launch"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stopping_a_busy_provider_does_not_wait_on_its_project_lock() {
+        let repository = Repository::new("runtime-stop-busy");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopAndWait(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let slot: ProviderSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        PROVIDERS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Some(slot.clone()));
+        let guard = slot.lock().unwrap();
+        let key = std::ffi::CString::new(key).unwrap();
+        let start = std::time::Instant::now();
+        unsafe { sail_context_provider_stop(key.as_ptr()) };
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+        assert!(PROVIDERS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get(key.to_str().unwrap())
+            .is_some_and(Option::is_none));
+        std::thread::scope(|scope| {
+            let guard = guard;
+            let project = repository.0.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let result = provider_request_at(
+                    &project,
+                    &fingerprint,
+                    None,
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                    &store_path,
+                    &project.join("data"),
+                );
+                send.send(result).unwrap();
+            });
+            assert_eq!(
+                receive.recv_timeout(std::time::Duration::from_millis(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            );
+            drop(guard);
+            let registry = PROVIDERS.get().unwrap().lock().unwrap();
+            let (registry, _) = PROVIDER_STOPPED
+                .wait_timeout_while(registry, std::time::Duration::from_secs(2), |registry| {
+                    registry
+                        .get(key.to_str().unwrap())
+                        .is_some_and(Option::is_none)
+                })
+                .unwrap();
+            let stopping = registry
+                .get(key.to_str().unwrap())
+                .is_some_and(Option::is_none);
+            drop(registry);
+            assert!(!stopping);
+            let response = receive.recv().unwrap().unwrap().unwrap();
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(value["id"], 1);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stalled_provider_stdin_does_not_block_session_close() {
+        use std::os::unix::process::CommandExt;
+
+        let repository = Repository::new("runtime-stalled-stdin");
+        repository.configure();
+        let store_path = repository.0.join("approvals.json");
+        let executable = dunce::canonicalize("/usr/bin/yes").unwrap();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let key = project_key(&repository.0).unwrap();
+        let mut child = Command::new(&executable)
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        make_provider_stdin_nonblocking(&stdin).unwrap();
+        let pid = child.id() as i32;
+        let slot: ProviderSlot =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(ProviderProcess {
+                fingerprint: fingerprint.clone(),
+                initialization: None,
+                initialized_notification_sent: false,
+                request_sequence: 0,
+                subscriptions: HashSet::new(),
+                stdout: Some(std::io::BufReader::new(child.stdout.take().unwrap())),
+                output: None,
+                child,
+                stdin: std::sync::Arc::new(std::sync::Mutex::new(stdin)),
+                stderr_tail: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                staged_executable: None,
+            })));
+        PROVIDERS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap()
+            .insert(key, Some(slot.clone()));
+        let capability = sha256(uuid::Uuid::new_v4().as_bytes());
+        let capability_c = std::ffi::CString::new(capability.clone()).unwrap();
+        assert!(unsafe { sail_context_session_activate(capability_c.as_ptr()) });
+        let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"payload":"x".repeat(900_000)}}).to_string();
+        let directory = repository.0.clone();
+        let data_root = repository.0.join("data");
+        let worker = std::thread::spawn(move || {
+            provider_request_at(
+                &directory,
+                &fingerprint,
+                Some(&capability),
+                &request,
+                &store_path,
+                &data_root,
+            )
+        });
+        let start = std::time::Instant::now();
+        while slot.try_lock().is_ok() && start.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let entered_slot = slot.try_lock().is_err();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        unsafe { sail_context_session_deactivate(capability_c.as_ptr()) };
+        let close_elapsed = start.elapsed();
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            entered_slot,
+            "Provider request did not enter its project slot"
+        );
+        assert!(close_elapsed < std::time::Duration::from_millis(100));
+        assert!(worker.join().unwrap().is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_stdin_write_times_out_when_unread() {
+        let mut child = Command::new("/usr/bin/yes")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        make_provider_stdin_nonblocking(&stdin).unwrap();
+        let error = write_provider_request_checked(
+            &mut stdin,
+            &"x".repeat(900_000),
+            std::time::Duration::from_millis(50),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(error.contains("timed out"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queued_request_does_not_launch_after_session_closes() {
+        let repository = Repository::new("runtime-queued-revocation");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let store_path = repository.0.join("approvals.json");
+        let executable = dunce::canonicalize("/bin/cat").unwrap();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let capability = sha256(uuid::Uuid::new_v4().as_bytes());
+        let capability_c = std::ffi::CString::new(capability.clone()).unwrap();
+        assert!(unsafe { sail_context_session_activate(capability_c.as_ptr()) });
+        let providers = PROVIDERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+        let guard = providers.lock().unwrap();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let directory = repository.0.clone();
+        let data_root = directory.join("data");
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            provider_request_at(
+                &directory,
+                &fingerprint,
+                Some(&capability),
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+                &store_path,
+                &data_root,
+            )
+        });
+        waiting.recv().unwrap();
+        unsafe { sail_context_session_deactivate(capability_c.as_ptr()) };
+        drop(guard);
+        assert!(worker
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("session revoked"));
+        assert!(!providers.lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stalled_provider_does_not_block_another_project() {
+        let slow = Repository::new("runtime-slow-project");
+        let fast = Repository::new("runtime-fast-project");
+        slow.configure();
+        fast.configure();
+        let slow_executable = slow.provider_fixture();
+        let fast_executable = fast.provider_fixture();
+        let configure = |repository: &Repository, executable: &Path| {
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            (store_path, fingerprint)
+        };
+        let (slow_store, slow_fingerprint) = configure(&slow, &slow_executable);
+        let (fast_store, fast_fingerprint) = configure(&fast, &fast_executable);
+        let slow_key = project_key(&slow.0).unwrap();
+        let fast_key = project_key(&fast.0).unwrap();
+        let _stop_slow = StopProvider(slow_key.clone());
+        let _stop_fast = StopProvider(fast_key);
+        let slow_data = slow.0.join("data");
+        let waiting_marker = slow_data.join(&slow_key).join("waiting");
+        let slow_dir = slow.0.clone();
+        let worker_fingerprint = slow_fingerprint.clone();
+        let worker_store = slow_store.clone();
+        let worker = std::thread::spawn(move || {
+            provider_request_at(
+                &slow_dir,
+                &worker_fingerprint,
+                None,
+                r#"{"jsonrpc":"2.0","id":1,"method":"wait-for-cancel"}"#,
+                &worker_store,
+                &slow_data,
+            )
+        });
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !waiting_marker.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let slow_ready = waiting_marker.exists();
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let fast_directory = &fast.0;
+            let fast_fingerprint = &fast_fingerprint;
+            let fast_store = &fast_store;
+            let fast_worker = scope.spawn(move || {
+                let result = provider_request_at(
+                    fast_directory,
+                    fast_fingerprint,
+                    None,
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                    fast_store,
+                    &fast_directory.join("data"),
+                );
+                let _ = send.send(result);
+            });
+            let response = receive.recv_timeout(std::time::Duration::from_secs(10));
+            let slow_pending = !worker.is_finished();
+            provider_request_at(
+                &slow.0,
+                &slow_fingerprint,
+                None,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#,
+                &slow_store,
+                &slow.0.join("data"),
+            )
+            .unwrap();
+            fast_worker.join().unwrap();
+            let slow_result = worker.join().unwrap();
+
+            assert!(slow_pending, "Slow provider finished before cancellation");
+            assert!(slow_ready, "Slow provider did not reach its pending call");
+            assert!(response
+                .expect("Other project waited for the stalled provider")
+                .unwrap()
+                .is_some());
+            assert!(slow_result.is_ok());
+        });
     }
 
     #[test]

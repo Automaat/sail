@@ -215,6 +215,7 @@ fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 mod acp;
+mod acp_idle;
 mod acp_terminal;
 mod attention;
 pub mod background_priority;
@@ -223,6 +224,8 @@ pub mod browser_agent;
 #[cfg(unix)]
 mod child_watchdog;
 pub mod context;
+pub mod context_broker;
+pub mod context_broker_mcp;
 pub mod context_output_store;
 mod dev_servers;
 mod diagnostics;
@@ -252,6 +255,7 @@ pub fn exec_with_scratch_owner() -> ! {
     scratch_cleanup::exec_with_scratch_owner()
 }
 mod settings;
+mod settings_records;
 mod shell_command;
 mod ship_actions;
 mod stderr_log;
@@ -2262,6 +2266,23 @@ struct WorktreeRemovalPreview {
     inspection_error: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeCleanupSummary {
+    path: String,
+    branch: Option<String>,
+    generation: String,
+    dirty: bool,
+    active_sessions: Vec<String>,
+}
+
+struct WorktreeRemovalTarget {
+    path: String,
+    canonical: PathBuf,
+    branch: Option<String>,
+    generation: String,
+}
+
 fn worktree_size_bytes(root: &Path) -> Result<u64, String> {
     let mut size = 0_u64;
     let mut remaining = vec![root.to_path_buf()];
@@ -2472,24 +2493,7 @@ where
     F: FnOnce(),
 {
     let revision = git_directory_revision(root)?;
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "status",
-            "--porcelain=v1",
-            "--ignored",
-            "--untracked-files=normal",
-        ])
-        .output()
-        .map_err(|error| format!("Cannot inspect worktree changes: {error}"))?;
-    if !status.status.success() {
-        return Err(format!(
-            "Cannot inspect changes in {}. Refresh before deleting.",
-            root.display()
-        ));
-    }
-    let dirty = !status.stdout.is_empty() || !tracked_worktree_matches_head(root)?;
+    let dirty = worktree_dirty(root)?;
     after_status();
     if git_directory_revision(root)? != revision {
         return Err(format!(
@@ -2500,12 +2504,36 @@ where
     Ok((revision, dirty))
 }
 
-#[tauri::command]
-fn worktree_removal_preview(
+fn worktree_dirty(root: &Path) -> Result<bool, String> {
+    Ok(worktree_summary_dirty(root)? || !tracked_worktree_matches_head(root)?)
+}
+
+fn worktree_summary_dirty(root: &Path) -> Result<bool, String> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--ignored",
+            "--untracked-files=normal",
+            "--no-renames",
+        ])
+        .output()
+        .map_err(|error| format!("Cannot inspect worktree changes: {error}"))?;
+    if !status.status.success() {
+        return Err(format!(
+            "Cannot inspect changes in {}. Refresh before deleting.",
+            root.display()
+        ));
+    }
+    Ok(!status.stdout.is_empty())
+}
+
+fn worktree_removal_targets(
     repository: String,
     paths: Vec<String>,
-    agents: State<'_, acp::AgentManager>,
-) -> Result<Vec<WorktreeRemovalPreview>, String> {
+) -> Result<Vec<WorktreeRemovalTarget>, String> {
     let repository = validate_repository_path(repository)?;
     let main = Path::new(&repository)
         .git_canonical()
@@ -2515,7 +2543,7 @@ fn worktree_removal_preview(
         .into_iter()
         .map(|entry| (PathBuf::from(&entry.path), entry))
         .collect::<std::collections::HashMap<_, _>>();
-    let mut preview = Vec::with_capacity(paths.len());
+    let mut targets = Vec::with_capacity(paths.len());
     for path in paths {
         let canonical = Path::new(&path).git_canonical().map_err(|_| {
             format!(
@@ -2538,25 +2566,114 @@ fn worktree_removal_preview(
                 canonical.display()
             )
         })?;
-        let (revision, dirty) = worktree_preview_state_with_hook(&canonical, || {})?;
-        let active_sessions = agents
-            .sessions_blocking_cleanup_in(&canonical)?
-            .into_iter()
-            .map(|(agent, _, session)| format!("{agent}:{session}"))
-            .collect();
-        let size = worktree_size_bytes(&canonical);
-        preview.push(WorktreeRemovalPreview {
+        targets.push(WorktreeRemovalTarget {
             path,
+            canonical,
             branch: entry.branch.clone(),
             generation,
-            revision,
-            dirty: dirty || size.is_err(),
-            active_sessions,
-            size_bytes: size.as_ref().ok().copied(),
-            inspection_error: size.err(),
         });
     }
-    Ok(preview)
+    Ok(targets)
+}
+
+fn worktree_cleanup_summary_inner(
+    repository: String,
+    paths: Vec<String>,
+    agents: &acp::AgentManager,
+) -> Result<Vec<WorktreeCleanupSummary>, String> {
+    worktree_removal_targets(repository, paths)?
+        .into_iter()
+        .map(|target| {
+            let dirty = worktree_summary_dirty(&target.canonical)?;
+            let active_sessions = agents
+                .sessions_blocking_cleanup_in(&target.canonical)?
+                .into_iter()
+                .map(|(agent, _, session)| format!("{agent}:{session}"))
+                .collect();
+            Ok(WorktreeCleanupSummary {
+                path: target.path,
+                branch: target.branch,
+                generation: target.generation,
+                dirty,
+                active_sessions,
+            })
+        })
+        .collect()
+}
+
+fn worktree_removal_preview_inner(
+    repository: String,
+    paths: Vec<String>,
+    agents: &acp::AgentManager,
+) -> Result<Vec<WorktreeRemovalPreview>, String> {
+    worktree_removal_targets(repository, paths)?
+        .into_iter()
+        .map(|target| {
+            let (revision, dirty) = worktree_preview_state_with_hook(&target.canonical, || {})?;
+            let active_sessions = agents
+                .sessions_blocking_cleanup_in(&target.canonical)?
+                .into_iter()
+                .map(|(agent, _, session)| format!("{agent}:{session}"))
+                .collect();
+            let size = worktree_size_bytes(&target.canonical);
+            Ok(WorktreeRemovalPreview {
+                path: target.path,
+                branch: target.branch,
+                generation: target.generation,
+                revision,
+                dirty: dirty || size.is_err(),
+                active_sessions,
+                size_bytes: size.as_ref().ok().copied(),
+                inspection_error: size.err(),
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn worktree_cleanup_summary(
+    repository: String,
+    paths: Vec<String>,
+    agents: State<'_, acp::AgentManager>,
+) -> Result<Vec<WorktreeCleanupSummary>, String> {
+    let started = std::time::Instant::now();
+    let count = paths.len();
+    let agents = agents.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        worktree_cleanup_summary_inner(repository, paths, &agents)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    diagnostics::record(
+        "worktree_cleanup_summary_finished",
+        serde_json::json!({
+            "elapsedMs":started.elapsed().as_millis(), "targets":count, "ok":result.is_ok(),
+        }),
+    );
+    result
+}
+
+#[tauri::command]
+async fn worktree_removal_preview(
+    repository: String,
+    paths: Vec<String>,
+    agents: State<'_, acp::AgentManager>,
+) -> Result<Vec<WorktreeRemovalPreview>, String> {
+    let started = std::time::Instant::now();
+    let count = paths.len();
+    let agents = agents.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        worktree_removal_preview_inner(repository, paths, &agents)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    diagnostics::record(
+        "worktree_removal_preview_finished",
+        serde_json::json!({
+            "elapsedMs":started.elapsed().as_millis(), "targets":count, "ok":result.is_ok(),
+        }),
+    );
+    result
 }
 
 #[tauri::command]
@@ -4610,16 +4727,59 @@ pub fn run() {
             }
             let cache_directory = _app.path().app_cache_dir().ok();
             if let Some(cache_directory) = cache_directory.as_ref() {
-                worktree_storage::reconcile(cache_directory);
-                git_overlay::initialize(cache_directory);
+                git_overlay::configure(cache_directory);
             }
+            std::thread::Builder::new()
+                .name("sail-startup-maintenance".into())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let started = std::time::Instant::now();
+                    diagnostics::record("startup_maintenance_started", serde_json::json!({}));
+                    let mut phases = serde_json::Map::new();
+                    let mut timed = |name: &str, run: &mut dyn FnMut()| {
+                        let phase_started = std::time::Instant::now();
+                        run();
+                        phases.insert(
+                            format!("{name}Ms"),
+                            serde_json::json!(phase_started.elapsed().as_millis() as u64),
+                        );
+                    };
+                    if let Some(cache_directory) = cache_directory.as_ref() {
+                        timed("worktreeStorage", &mut || {
+                            worktree_storage::reconcile(cache_directory);
+                        });
+                        timed("gitOverlay", &mut || {
+                            git_overlay::restore_registered(cache_directory);
+                        });
+                    }
+                    #[cfg(unix)]
+                    timed("scratchSweep", &mut || {
+                        scratch_cleanup::sweep_on_startup(cache_directory.as_deref());
+                    });
+                    phases.insert(
+                        "elapsedMs".into(),
+                        serde_json::json!(started.elapsed().as_millis() as u64),
+                    );
+                    diagnostics::record(
+                        "startup_maintenance_finished",
+                        serde_json::Value::Object(phases),
+                    );
+                })
+                .map_err(std::io::Error::other)?;
             #[cfg(unix)]
-            std::thread::spawn(move || {
-                scratch_cleanup::sweep_on_startup(cache_directory.as_deref())
-            });
+            {
+                let app = _app.handle().clone();
+                if let Err(error) = scratch_cleanup::spawn_runtime_sweeper(move |root| {
+                    app.try_state::<acp::AgentManager>()
+                        .is_none_or(|manager| acp::runtime_root_in_use(&manager, root))
+                }) {
+                    eprintln!("Sail runtime scratch sweep unavailable: {error}");
+                }
+            }
             let process_directory = _app.path().app_config_dir()?.join("owned-processes");
             owned_processes::init(process_directory).map_err(std::io::Error::other)?;
             browser_agent::start_bridge(_app.handle())?;
+            acp::start_idle_session_sweeper(_app.handle().clone());
             if let Err(error) = hook_activity::start_bridge(_app.handle()) {
                 eprintln!("Sail hook receiver unavailable: {error}");
             }
@@ -4707,6 +4867,7 @@ pub fn run() {
             run_shipping_setup,
             registered_worktrees,
             repository_worktrees,
+            worktree_cleanup_summary,
             worktree_removal_preview,
             restore_pending_worktree,
             retry_removed_worktree_overlay_cleanup,
@@ -4784,6 +4945,8 @@ pub fn run() {
             acp::acp_elicitation,
             acp::acp_pending_inbox,
             acp::acp_activity,
+            acp::acp_session_visible,
+            acp::acp_set_idle_close_timeout,
             acp::acp_native_subagents,
             acp::acp_prepare_restart,
             acp::acp_set_config,
@@ -4884,6 +5047,7 @@ async fn retry_worktree_storage_cleanup(
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
+        worktree_storage::forget_reported_pending();
         app.state::<acp::AgentManager>()
             .retry_turn_temp_cleanup(&app);
         worktree_storage::retry_cleanup(&cache)
@@ -5029,8 +5193,6 @@ async fn clean_pending_worktree_temp(
 mod tests {
     #[cfg(any(unix, windows))]
     use super::working_tree_generation;
-    #[cfg(unix)]
-    use super::worktree_size_bytes;
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
         discover_nested_worktree_terminal_roots, encode_manifest_path,
@@ -5050,6 +5212,8 @@ mod tests {
         NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
+    #[cfg(unix)]
+    use super::{worktree_size_bytes, worktree_summary_dirty};
     use crate::worktree_storage;
     use crate::GitCanonical;
     use std::fs;
@@ -7672,9 +7836,11 @@ mod tests {
         fs::create_dir(&unreadable).unwrap();
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
 
+        let dirty = worktree_summary_dirty(Path::new(&worktree)).unwrap();
         let size = worktree_size_bytes(Path::new(&worktree));
 
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(dirty, "the fast summary still reports ignored content");
         assert!(
             size.is_err(),
             "an unreadable directory needs an unknown size"

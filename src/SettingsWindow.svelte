@@ -1174,6 +1174,26 @@
           <p>Selecting text outside inputs copies it and announces "Copied".</p>
         </section>
         <section class="settings-card">
+          <h2>Worktrees</h2>
+          <label class="attention-setting">
+            <input
+              id="worktree-autodiscovery"
+              type="checkbox"
+              checked={snapshot.worktreeAutodiscoveryEnabled}
+              onchange={(event) =>
+                send({
+                  type: 'worktree-autodiscovery',
+                  value: event.currentTarget.checked,
+                })}
+            />
+            Discover external Git worktrees automatically
+          </label>
+          <p>
+            Off by default. When enabled, Sail shows worktrees created outside Sail and lets you add
+            them. Saved worktrees are always checked for identity and cleanup safety.
+          </p>
+        </section>
+        <section class="settings-card">
           <h2>Performance</h2>
           <label class="attention-setting">
             <input
@@ -1366,7 +1386,7 @@
           Extra work waits in launch order. Zero pauses new work. Lowering a limit leaves active
           work running. The E2E limit applies to this repository's WebdriverIO runner.
         </p>
-        {#each [['agent', 'Running agent turns'], ['browser', 'Browser tabs'], ['e2e', 'E2E test runs']] as const as [kind, label] (kind)}
+        {#each [['agent', 'Running agent turns'], ['browser', 'Browser tabs'], ['validation', 'Validation gates'], ['e2e', 'E2E test runs']] as const as [kind, label] (kind)}
           <label for={`resource-limit-${kind}`}>{label}</label>
           <input
             id={`resource-limit-${kind}`}

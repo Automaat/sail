@@ -47,6 +47,7 @@ export function nativeEnvironment(root, checkout, inherited, port) {
     SAIL_ACP_TEST_AGENT: realpathSync(join(checkout, 'test/e2e/acp-agent.mjs')),
     SAIL_E2E_ATTACH: '1',
     SAIL_E2E_MACHINE_READING: 'healthy',
+    SAIL_E2E_ACP_CLOSE_LOG: join(canonicalRoot, 'acp-close.log'),
     SAIL_E2E_OPEN_URL_LOG: join(canonicalRoot, 'external-link.log'),
     SAIL_E2E_SETUP_REPORT: join(canonicalRoot, 'setup.json'),
     SAIL_HOOK_CONNECTION_FILE: join(canonicalRoot, 'hook-connection.json'),
@@ -58,4 +59,17 @@ export function nativeVerdict(exitCode, setup, cancelled = false) {
   if (cancelled) return 'CANCELLED';
   if (setup?.status !== 'ready') return 'SETUP_FAILED';
   return exitCode === 0 ? 'PASS' : 'FAIL';
+}
+
+export function nativeFailurePhase(setup) {
+  if (setup?.status === 'failed' && typeof setup.precondition === 'string')
+    return setup.precondition;
+  return null;
+}
+
+export function nativePreconditionFailure(precondition, detail, preserveProductFailure = false) {
+  const failure = { precondition, detail };
+  return preserveProductFailure
+    ? { status: 'ready', cleanupFailure: failure }
+    : { status: 'failed', ...failure };
 }

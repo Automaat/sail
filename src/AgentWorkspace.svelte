@@ -83,7 +83,9 @@
   import {
     acpCancelMatchesSession,
     acp,
+    acpCanResume,
     acpDisconnectAffectsSession,
+    acpDisconnectedForIdleness,
     acpFinishedPromptStatus,
     acpPromptInterrupted,
     acpSessionOwner,
@@ -92,7 +94,8 @@
     liveSessionView,
     markLiveMessageBoundary,
     restoredLiveTurnIsCurrent,
-    recoverMissingCodexSession,
+    recoverMissingSession,
+    SESSION_VISIBLE_INTERVAL_MS,
     loadRecentTranscript,
     restoreEntryTimes,
     restoreOwnedEntries,
@@ -529,6 +532,7 @@
   let visibleCount = $state(50);
   let historyLoaded = $state(true);
   let attachedCodexSession = $state(false);
+  let sessionCanResume = false;
   let historyLoading = $state(false);
   let historyAttempted = $state(false);
   let historicalToolIds = $state.raw<ReadonlySet<string>>(new Set());
@@ -599,6 +603,14 @@
         mergeHookActivities(items.map(parseHookActivity).filter((item) => item !== null)),
       )
       .catch(() => undefined);
+  });
+  $effect(() => {
+    const sessionId = activeSessionId;
+    if (!mounted || !sessionId) return;
+    const beat = () => void acp.sessionVisible(agent, directory, sessionId).catch(() => undefined);
+    beat();
+    const timer = setInterval(beat, SESSION_VISIBLE_INTERVAL_MS);
+    return () => clearInterval(timer);
   });
   let disposed = false;
   let stopRequested = false;
@@ -1102,6 +1114,24 @@
       void showEarlier();
   }
 
+  /** Restores a session the adapter dropped; a load-only agent's replay duplicates the shown transcript. */
+  async function reattachSession(id: string, current: number) {
+    if (sessionCanResume) {
+      await acp.resume(agent, directory, id, activeCapabilityProfile);
+      return;
+    }
+    const visible = current === generation;
+    if (visible) setReplaying(true);
+    try {
+      await acp.load(agent, directory, id, activeCapabilityProfile);
+    } finally {
+      if (visible && current === generation) {
+        setReplaying(false);
+        replayEntries = [];
+      }
+    }
+  }
+
   async function loadHistory(requested = false) {
     const id = activeSessionId;
     if (
@@ -1367,6 +1397,7 @@
     visibleCount = 50;
     historyLoaded = !id;
     attachedCodexSession = false;
+    sessionCanResume = false;
     historyLoading = false;
     historyAttempted = false;
     configOptions = [];
@@ -1443,6 +1474,7 @@
       });
       if (current !== generation) return;
       authMethods = (info.authMethods as AgentAuthMethod[] | undefined) ?? [];
+      sessionCanResume = acpCanResume(info.agentCapabilities);
       if (id) {
         const capabilities = info.agentCapabilities;
         const restoreMode = acpRestoreMode(capabilities);
@@ -1473,19 +1505,21 @@
           }
         };
         const needsReplay = restoreMode === 'load';
-        const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
-        if (current !== generation) return;
-        attachedCodexSession =
-          agent === 'codex' && runtime?.alive === true && runtime.sessions.includes(id);
-        const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
+        const [activity, reservation] = await Promise.all([
+          acp.activity(directory).catch(() => null),
+          acp.beginRestore(agent, directory, id, activeCapabilityProfile),
+        ]);
+        const runtime = activity?.[agent];
         if (current !== generation) {
           if (reservation.restoreToken)
             await acp.endRestore(agent, directory, id, reservation.restoreToken);
           return;
         }
+        const attached = runtime?.alive === true && runtime.sessions.includes(id);
+        attachedCodexSession = agent === 'codex' && attached;
         if (reservation.liveTurn) {
           await showLiveTurn(reservation.liveTurn, reservation);
-        } else if (liveView && attachedCodexSession) {
+        } else if (liveView && attached) {
           if (reservation.restoreToken)
             await acp.endRestore(agent, directory, id, reservation.restoreToken);
           await showLiveTurn(null, reservation);
@@ -1538,18 +1572,18 @@
             updateSkills(session.availableCommands);
           if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
         }
-        const waiting = await fencedAcpPermissionInventory(
-          () => acp.pendingPermissions(agent, directory, id),
-          () => permissionInventoryRevision,
-          () => current === generation && activeSessionId === id,
-        );
-        if (waiting) for (const request of waiting) queuePermission(request);
-        const pendingElicitations = await acp
-          .pendingElicitations(agent, directory, id, activeCapabilityProfile)
-          .then(
+        const [waiting, pendingElicitations] = await Promise.all([
+          fencedAcpPermissionInventory(
+            () => acp.pendingPermissions(agent, directory, id),
+            () => permissionInventoryRevision,
+            () => current === generation && activeSessionId === id,
+          ),
+          acp.pendingElicitations(agent, directory, id, activeCapabilityProfile).then(
             (requests) => ({ requests, available: true }),
             () => ({ requests: [], available: false }),
-          );
+          ),
+        ]);
+        if (waiting) for (const request of waiting) queuePermission(request);
         if (current === generation && activeSessionId === id && pendingElicitations.available) {
           const pendingIDs = new Set(
             pendingElicitations.requests.flatMap((request) =>
@@ -1704,6 +1738,8 @@
             ]
           : undefined;
       if (payload.directory !== directory && disconnectedDirectory !== directory) return;
+      // An idle exit is not a failure: the next prompt resumes the session on a fresh agent.
+      if (acpDisconnectedForIdleness(message)) return;
       if (
         message.method === 'sail/disconnected' &&
         acpDisconnectAffectsSession(message, activeSessionId, activeCapabilityProfile)
@@ -2050,7 +2086,11 @@
       if (planRequested || forcePlan) {
         if (!id || !planModeOption)
           throw new Error(`${name} does not expose a planning mode for this session.`);
-        const result = await acp.setConfig(turnAgent, directory, id, planModeOption.id, 'plan');
+        const planModeId = planModeOption.id;
+        const result = await recoverMissingSession(
+          () => acp.setConfig(turnAgent, directory, id, planModeId, 'plan'),
+          () => reattachSession(id, current),
+        );
         configOptions = result.configOptions ?? configOptions;
       }
       if (shipIssue && id && !ephemeral) {
@@ -2121,8 +2161,7 @@
       let result;
       try {
         result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
-          recoverMissingCodexSession(
-            turnAgent,
+          recoverMissingSession(
             () => {
               dispatchingPromptTurnId = turnId;
               return acp.prompt(
@@ -2139,7 +2178,7 @@
             async () => {
               recoveringPromptTurnId = turnId;
               if (current === generation) turnEnded = false;
-              await acp.resume(turnAgent, directory, id!, activeCapabilityProfile);
+              await reattachSession(id!, current);
             },
           ),
         );
@@ -2661,7 +2700,10 @@
     const task = (async () => {
       if (previous) await previous;
       try {
-        const result = await acp.setConfig(agent, directory, sessionId, configId, value);
+        const result = await recoverMissingSession(
+          () => acp.setConfig(agent, directory, sessionId, configId, value),
+          () => reattachSession(sessionId, generation),
+        );
         if (activeSessionId !== sessionId) return;
         configFailure = '';
         error = '';

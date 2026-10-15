@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { getSetting, setSetting, setTranscriptSetting } from './settings.ts';
+import { flushTranscriptWrite, getSetting, setSetting, setTranscriptSetting } from './settings.ts';
 import { resourceQueues } from './resource-limits.ts';
 import { acpPlans } from './acp-plans.ts';
 import { sessionTasks } from './session-tasks.ts';
@@ -135,8 +135,11 @@ export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
   return outcome.stopReason === 'cancelled' || outcome.sailInterrupted === true;
 }
 
-export async function recoverMissingCodexSession<T>(
-  agent: AgentId,
+/** The backend closes a finished thread nobody has seen for 10 minutes; views report in well inside that. */
+export const SESSION_VISIBLE_INTERVAL_MS = 60_000;
+
+/** An attached thread skips restore on open, so a session the adapter dropped is restored here. */
+export async function recoverMissingSession<T>(
   prompt: () => Promise<T>,
   resume: () => Promise<unknown>,
 ): Promise<T> {
@@ -147,7 +150,7 @@ export async function recoverMissingCodexSession<T>(
     const missing =
       /(?:session|thread) (?:not found|missing)/i.test(message) ||
       message === 'Agent session is not connected in this worktree.';
-    if (agent !== 'codex' || !missing) throw cause;
+    if (!missing) throw cause;
     await resume();
     return prompt();
   }
@@ -249,15 +252,23 @@ export function restoreOwnedEntries(history: AgentEntry[], saved: AgentEntry[]):
   return history.length >= saved.length ? restoreEntryTimes(history, saved) : saved;
 }
 
+function sessionCapabilities(capabilities: object): object | null {
+  const session = 'sessionCapabilities' in capabilities ? capabilities.sessionCapabilities : null;
+  return session && typeof session === 'object' ? session : null;
+}
+
+/** Resume reattaches a session without replaying its history. */
+export function acpCanResume(capabilities: unknown): boolean {
+  if (!capabilities || typeof capabilities !== 'object') return false;
+  const session = sessionCapabilities(capabilities);
+  return !!session && 'resume' in session && !!session.resume && typeof session.resume === 'object';
+}
+
 export function acpRestoreMode(capabilities: unknown): 'load' | 'resume' | null {
   if (!capabilities || typeof capabilities !== 'object') return null;
   const canLoad = 'loadSession' in capabilities && capabilities.loadSession === true;
-  const sessionCapabilities =
-    'sessionCapabilities' in capabilities ? capabilities.sessionCapabilities : null;
-  const session =
-    sessionCapabilities && typeof sessionCapabilities === 'object' ? sessionCapabilities : null;
-  const canResume =
-    !!session && 'resume' in session && !!session.resume && typeof session.resume === 'object';
+  const session = sessionCapabilities(capabilities);
+  const canResume = acpCanResume(capabilities);
   const restoresSubagents =
     !!session &&
     'subagents' in session &&
@@ -346,6 +357,11 @@ export function acpDisconnectedSessionIds(message: AgentEvent['message']): strin
   const sessionIds = message.params?.sessionIds;
   if (!Array.isArray(sessionIds)) return null;
   return sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string');
+}
+
+/** The backend stopped an idle agent; attached sessions resume on their next use. */
+export function acpDisconnectedForIdleness(message: AgentEvent['message']): boolean {
+  return message.method === 'sail/disconnected' && message.params?.idle === true;
 }
 
 export function acpSessionOwner(sessionId: string | null): string | null {
@@ -437,6 +453,7 @@ if (typeof window !== 'undefined') {
   window.addEventListener('pagehide', () => {
     for (const pending of pendingTranscripts.values())
       saveRecentTranscript(pending.thread, pending.entries);
+    flushTranscriptWrite();
   });
 }
 
@@ -1096,6 +1113,15 @@ async function acquireTurnSlot(
   }
 }
 
+/** Connections the backend keeps alive. Reconnecting to one spawns nothing, so it skips the job queue. */
+const connectedAgents = new Map<string, AgentId>();
+
+/** The agent's process exited; its next connect spawns again and waits for a job slot. */
+export function forgetAcpConnections(agent: AgentId): void {
+  for (const [connection, connected] of connectedAgents)
+    if (connected === agent) connectedAgents.delete(connection);
+}
+
 async function limitedConnect(
   agent: AgentId,
   directory: string,
@@ -1110,6 +1136,27 @@ async function limitedConnect(
   },
 ): Promise<Record<string, unknown>> {
   if (options?.signal?.aborted) throw new Error('Agent connection was cancelled.');
+  const connection = JSON.stringify([agent, directory, profile ?? null, options?.owner ?? null]);
+  const connect = async () => {
+    try {
+      const info = await invoke<Record<string, unknown>>('acp_connect', {
+        agent,
+        directory,
+        profile,
+        owner: options?.owner,
+        buildLease:
+          options?.buildOwner && options?.buildRevision
+            ? { owner: options.buildOwner, revision: options.buildRevision }
+            : undefined,
+      });
+      connectedAgents.set(connection, agent);
+      return info;
+    } catch (cause) {
+      connectedAgents.delete(connection);
+      throw cause;
+    }
+  };
+  if (connectedAgents.has(connection)) return connect();
   const id = `connect-${crypto.randomUUID()}`;
   const cancel = () => resourceQueues.agent.cancel(id);
   options?.signal?.addEventListener('abort', cancel, { once: true });
@@ -1117,16 +1164,7 @@ async function limitedConnect(
   try {
     release = await acquireTurnSlot(id, options?.onQueue, options?.directory ?? directory);
     if (options?.signal?.aborted) throw new Error('Agent connection was cancelled.');
-    return await invoke<Record<string, unknown>>('acp_connect', {
-      agent,
-      directory,
-      profile,
-      owner: options?.owner,
-      buildLease:
-        options?.buildOwner && options?.buildRevision
-          ? { owner: options.buildOwner, revision: options.buildRevision }
-          : undefined,
-    });
+    return await connect();
   } finally {
     options?.signal?.removeEventListener('abort', cancel);
     release?.();
@@ -1368,6 +1406,8 @@ export const acp = {
     invoke<Record<AgentId, AgentActivity>>('acp_activity', { directory }),
   nativeSubagents: (directory: string) =>
     invoke<NativeSubagentSnapshotSet>('acp_native_subagents', { directory }),
+  sessionVisible: (agent: AgentId, directory: string, sessionId: string) =>
+    invoke<void>('acp_session_visible', { agent, directory, sessionId }),
   turnEvidence: (agent: AgentId, directory: string, sessionId: string, turnId: string) =>
     invoke<AcpTurnEvidence | null>('get_acp_turn_evidence', {
       agent,

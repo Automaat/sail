@@ -261,7 +261,14 @@
   } from './lib/task-economics.ts';
   import DiffPanel from './DiffPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
-  import { createSidebarThreadLoader } from './lib/sidebar-inventory';
+  import {
+    createSidebarThreadLoader,
+    mergeSidebarRefreshPaths,
+    SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS,
+    sidebarFocusRefreshDue,
+    unlistedSidebarPaths,
+    type SidebarRefreshPaths,
+  } from './lib/sidebar-inventory';
   import {
     clampSidebarWidth,
     parseSidebarWidth,
@@ -411,7 +418,6 @@
     listSidebarAcpThreads,
     recordSidebarOpenCodeOutcome,
     sidebarThreadStatus,
-    waitForSidebarInventory,
   } from './lib/sidebar-agents';
   import {
     loadAttention,
@@ -446,6 +452,7 @@
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
     acpSessionOwner,
+    forgetAcpConnections,
     archiveOwnedTranscriptUpdate,
     applyLiveTranscriptUpdate,
     forgetRecentTranscript,
@@ -542,6 +549,7 @@
     isCheckingMachinePressure,
     parseResourceLimit,
     resourceLimitKeys,
+    resourceQueues,
     setResourceLimit,
     setPressureThresholds,
   } from './lib/resource-limits';
@@ -927,6 +935,9 @@
     loadCoordinationMessages(getSetting('sai-coordination-messages')),
   );
   const initialSpawnReceipts = loadSpawnReceipts(getSetting('sai-agent-spawn-receipts'));
+  for (const receipt of initialSpawnReceipts)
+    if (receipt.validation && ['starting', 'working', 'waiting'].includes(receipt.state))
+      resourceQueues.validation.restoreActive(receipt.receiptId);
   let spawnReceipts = $state<SpawnReceipt[]>(initialSpawnReceipts);
   const spawnOutput = new SvelteMap<string, string>();
   const receiptReplayNeeded = new SvelteSet<string>();
@@ -1257,6 +1268,10 @@
       getSetting(resourceLimitKeys.browser),
       defaultResourceLimits.browser,
     ),
+    validation: parseResourceLimit(
+      getSetting(resourceLimitKeys.validation),
+      defaultResourceLimits.validation,
+    ),
     e2e: parseResourceLimit(getSetting(resourceLimitKeys.e2e), defaultResourceLimits.e2e),
   });
   let pressureThresholds = $state({
@@ -1278,6 +1293,9 @@
   );
   let notificationSound = $state(getSetting('sai-notification-sound') !== 'false');
   let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
+  let worktreeAutodiscoveryEnabled = $state(
+    getSetting('sai-worktree-autodiscovery-enabled') === 'true',
+  );
   let copiedStatus = $state('');
   let copiedStatusTimer: ReturnType<typeof setTimeout> | undefined;
   let copiedStatusGeneration = 0;
@@ -1728,6 +1746,17 @@
   let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
+  let sidebarInventoryWaiting: SidebarRefreshPaths | undefined;
+  let sidebarInventoryLastFullListing = 0;
+  let sidebarInventoryDeferred = false;
+  let sidebarFocusPending = false;
+  let sidebarFocusTimer: ReturnType<typeof setTimeout> | undefined;
+  // Directories already listed; only new ones are listed again without a focus change.
+  let sidebarListedDirectories: Record<string, true> = {};
+  const sidebarInventoryDelay = import.meta.env.MODE === 'e2e' ? 250 : 5_000;
+  const foregroundAgentLoading = $derived.by(() =>
+    leaves(paneLayout).some((pane) => pane.agent && agentEntrySnapshots[pane.id]?.ready !== true),
+  );
   let agentDetectionSettled = false;
   let projectLoadGeneration = 0;
 
@@ -2238,6 +2267,7 @@
       notificationPrefs,
       notificationSound,
       autoCopyEnabled,
+      worktreeAutodiscoveryEnabled,
       personalPostTurnChecks,
       agentWorktreesEnabled,
       agentTerminalsEnabled,
@@ -2436,6 +2466,9 @@
         } else if (action.type === 'auto-copy') {
           autoCopyEnabled = action.value;
           setSetting('sai-auto-copy-enabled', String(action.value));
+        } else if (action.type === 'worktree-autodiscovery') {
+          worktreeAutodiscoveryEnabled = action.value;
+          setSetting('sai-worktree-autodiscovery-enabled', String(action.value));
         } else if (action.type === 'personal-post-turn-checks') {
           personalPostTurnChecks = action.value;
           setSetting('sai-post-turn-personal', JSON.stringify(action.value));
@@ -2594,7 +2627,8 @@
     const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
     void tickShippingRuns();
-    const sidebarRefreshTimer = setInterval(scheduleSidebarInventoryRefresh, 30_000);
+    window.addEventListener('focus', refreshSidebarOnFocus);
+    document.addEventListener('visibilitychange', refreshSidebarOnFocus);
     diffPollTimer = setInterval(() => {
       const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
       if (acpAgent && agentChangesOpen && activeSideTab === 'changes' && visible && !diffLoading)
@@ -2617,8 +2651,10 @@
       clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
-      clearInterval(sidebarRefreshTimer);
+      window.removeEventListener('focus', refreshSidebarOnFocus);
+      document.removeEventListener('visibilitychange', refreshSidebarOnFocus);
       clearTimeout(sidebarInventoryTimer);
+      clearTimeout(sidebarFocusTimer);
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
       if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eStopAgentEvents');
@@ -4684,6 +4720,19 @@
   }
 
   async function stopShippingWorker(issue: ShipIssue): Promise<void> {
+    for (const receipt of spawnReceipts.filter(
+      (item) =>
+        item.validation &&
+        item.sourceDirectory === issue.path &&
+        !item.targetId &&
+        !receiptIsSettled(item.state),
+    )) {
+      if (!resourceQueues.validation.cancel(receipt.receiptId)) continue;
+      updateSpawnReceipt(receipt.receiptId, {
+        state: 'interrupted',
+        error: 'Validation capacity request cancelled before launch.',
+      });
+    }
     const primaryThreadId =
       issue.threadId ?? spawnReceipts.find((item) => item.receiptId === issue.receiptId)?.targetId;
     await fenceShippingTaskThreads(
@@ -5429,10 +5478,10 @@
             if (issue.error !== pendingNotice) await update({ error: pendingNotice });
             return;
           }
-          let preview: WorktreeRemovalPreview[] = [];
+          let preview: WorktreeCleanupSummary[] = [];
           let previewFailure: string | null = null;
           try {
-            preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+            preview = await invoke<WorktreeCleanupSummary[]>('worktree_cleanup_summary', {
               repository: run.repository,
               paths: targets.map((worktree) => worktree.path),
             });
@@ -5461,7 +5510,7 @@
               {
                 originalPath: worktree.path,
                 recoveryPath: worktree.path,
-                sizeBytes: state?.sizeBytes ?? null,
+                sizeBytes: null,
                 registeredWorktreesAtMark: registered.map(
                   ({ path: registeredPath, generation }) => ({
                     path: registeredPath,
@@ -5470,15 +5519,13 @@
                 ),
                 reason:
                   previewFailure ??
-                  (state.inspectionError
-                    ? `Cannot verify checkout contents: ${state.inspectionError}`
-                    : state.dirty
-                      ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
-                      : state.activeSessions.length
-                        ? 'Agent sessions are connected. Finish them before retrying cleanup.'
-                        : index === 0
-                          ? 'The merged ship worktree remains registered. Confirm it is unused before cleanup.'
-                          : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.'),
+                  (state.dirty
+                    ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+                    : state.activeSessions.length
+                      ? 'Agent sessions are connected. Finish them before retrying cleanup.'
+                      : index === 0
+                        ? 'The merged ship worktree remains registered. Confirm it is unused before cleanup.'
+                        : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.'),
               },
               worktree.generation,
             );
@@ -5910,6 +5957,8 @@
     for (const pendingReceipt of spawnReceipts)
       if (pendingReceipt.dispatchPending) protectedIds.add(pendingReceipt.receiptId);
     spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
+    if (receipt.validation && receiptIsSettled(receipt.state))
+      resourceQueues.validation.release(receipt.receiptId);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
     if (receipt.state === 'completed' && receiptReplayNeeded.has(receipt.receiptId))
       void recoverAcpSpawnResult(receipt).catch(() => undefined);
@@ -5988,10 +6037,16 @@
       return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
     }
     const receiptActivity = await acp.activity(receipt.targetDirectory).then(
-      (states) => states[receipt.provider],
-      () => null,
+      (states) => ({ resolved: true as const, state: states[receipt.provider] ?? null }),
+      () => ({ resolved: false as const, state: null }),
     );
-    reconcileAcpSpawnReceipt(receipt, receiptActivity);
+    if (
+      !receiptActivity.resolved &&
+      receipt.validation &&
+      resourceQueues.validation.isActive(receipt.receiptId)
+    )
+      return receipt;
+    reconcileAcpSpawnReceipt(receipt, receiptActivity.state);
     return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
   }
 
@@ -7780,15 +7835,42 @@
           },
           actual: null,
         },
-        state: 'starting',
+        state: 'queued',
         created: Date.now(),
         updated: Date.now(),
         result: null,
         error: null,
+        activity: 'Waiting for validation capacity…',
       });
       await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       await saveShipRuns();
       try {
+        const updateCapacityActivity = () => {
+          if (!resourceQueues.validation.isQueued(receiptId)) return;
+          const { active, limit } = resourceQueues.validation.status;
+          updateSpawnReceipt(receiptId, {
+            activity:
+              resourceQueues.validation.reasonFor(receiptId) ??
+              `Waiting for validation capacity (${active}/${limit} running).`,
+          });
+        };
+        const unsubscribeCapacity = resourceQueues.validation.subscribe(updateCapacityActivity);
+        try {
+          await resourceQueues.validation.acquire(receiptId, request.directory);
+        } finally {
+          unsubscribeCapacity();
+        }
+        const reserved = spawnReceipts.find((receipt) => receipt.receiptId === receiptId);
+        if (!reserved || receiptIsSettled(reserved.state)) {
+          resourceQueues.validation.release(receiptId);
+          throw new Error('Validation capacity request was cancelled.');
+        }
+        updateSpawnReceipt(receiptId, {
+          state: 'starting',
+          activity: 'Starting validation gate…',
+        });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        await saveShipRuns();
         await ensureSelected();
         const [revision, mutationGeneration, baseRevision] = await Promise.all([
           invoke<string>('working_tree_revision', { path: request.directory }),
@@ -7866,7 +7948,9 @@
           status: 'started',
         };
       } catch (cause) {
-        updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        const current = spawnReceipts.find((receipt) => receipt.receiptId === receiptId);
+        if (!current || !receiptIsSettled(current.state))
+          updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
         await acp.releaseOwner(request.directory, receiptId);
         if (!(cause instanceof ValidationCandidateUnavailable)) throw cause;
@@ -9128,6 +9212,14 @@
     inspectionError: string | null;
   };
 
+  type WorktreeCleanupSummary = Pick<
+    WorktreeRemovalPreview,
+    'path' | 'branch' | 'generation' | 'dirty' | 'activeSessions'
+  >;
+
+  type WorktreeRemovalExpectation = Pick<WorktreeRemovalPreview, 'generation'> &
+    Partial<Pick<WorktreeRemovalPreview, 'revision' | 'branch'>>;
+
   function pendingRecoveryFromError(cause: unknown): PendingWorktreeCleanup | null {
     const message = describe(cause);
     const prefix = 'SAIL_PENDING_RECOVERY:';
@@ -9208,6 +9300,7 @@
     }
     deletingWorktreeRepositories.add(repository);
     deletingWorktreeRequests.add(path);
+    worktreeDeletions = { ...worktreeDeletions, [path]: 'Inspecting worktree' };
     try {
       const canonicalCatalog = await canonicalizedProjectCatalog(repository);
       if (canonicalCatalog !== projectCatalog) saveProjectCatalog(canonicalCatalog);
@@ -9229,7 +9322,11 @@
           'A live descendant is saved under another repository path. Restore that repository alias before retrying cleanup.',
         );
       const descendants = worktreeDescendants(projectCatalog, repository, registered, path);
-      if (descendants.length) {
+      if (
+        descendants.length ||
+        (import.meta.env.MODE === 'e2e' &&
+          sessionStorage.getItem('sai-e2e-pause-force-cleanup') === 'true')
+      ) {
         await deleteProjectWorktreeWithDescendants(
           repository,
           path,
@@ -9238,13 +9335,30 @@
           registered,
         );
       } else {
-        await deleteProjectWorktreeWithDescendants(repository, path, branch, [], registered);
+        const target = registered.find((worktree) => worktree.path === path);
+        if (!target?.generation)
+          throw new Error('The selected worktree identity cannot be verified. Refresh and retry.');
+        await deleteProjectWorktreeOnce(
+          repository,
+          path,
+          branch,
+          true,
+          true,
+          { generation: target.generation },
+          false,
+          registered,
+        );
       }
     } catch (cause) {
       error = describe(cause);
     } finally {
       deletingWorktreeRequests.delete(path);
       deletingWorktreeRepositories.delete(repository);
+      if (worktreeDeletions[path] === 'Inspecting worktree') {
+        const remaining = { ...worktreeDeletions };
+        delete remaining[path];
+        worktreeDeletions = remaining;
+      }
     }
   }
 
@@ -9266,7 +9380,7 @@
       error = 'Another descendant deletion is in progress. Retry after it finishes.';
       return;
     }
-    const preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+    const preview = await invoke<WorktreeCleanupSummary[]>('worktree_cleanup_summary', {
       repository,
       paths: targets.map((worktree) => worktree.path),
     });
@@ -9287,11 +9401,10 @@
     const lines = targets.map((worktree, index) => {
       const state = preview[index];
       const warnings = [
-        state.inspectionError ? 'files cannot be fully inspected' : null,
         state.dirty ? 'uncommitted changes' : null,
         state.activeSessions.length ? `connected: ${state.activeSessions.join(', ')}` : null,
       ].filter(Boolean);
-      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}\n  Revision: ${state.revision}\n  Retained size: ${state.sizeBytes === null ? 'unknown' : `${state.sizeBytes} bytes`}`;
+      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}`;
     });
     const e2eAnswer =
       import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
@@ -9302,9 +9415,13 @@
         : e2eAnswer === 'No'
           ? false
           : await confirmInApp(
-              'Delete worktree and descendants',
-              `Mark these ${targets.length} worktrees for cleanup? They will remain registered with their files intact. You can review them and explicitly confirm they are unused before physical deletion. Their branches will remain.\n\n${lines.join('\n')}`,
-              `Mark ${targets.length} pending`,
+              targets.length === 1
+                ? 'Force delete worktree'
+                : 'Force delete worktree and descendants',
+              targets.length === 1
+                ? `Force delete this worktree? Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files. Its branch remains. If it cannot be removed safely, it stays visible as pending cleanup. The configured archive command does not run during pending cleanup.\n\n${lines.join('\n')}`
+                : `Force delete these ${targets.length} worktrees? Sail stops agents running in them and permanently removes uncommitted, untracked, and ignored files. Their branches remain. Worktrees that cannot be removed safely stay visible as pending cleanup. Configured archive commands do not run during descendant cleanup.\n\n${lines.join('\n')}`,
+              targets.length === 1 ? 'Force delete' : `Force delete ${targets.length} worktrees`,
               { destructive: true },
             );
     if (!confirmed) return;
@@ -9318,13 +9435,7 @@
       // original path and removal snapshot must survive marking its parent.
       if (worktree.pendingCleanup) continue;
       const state = preview[index];
-      const reason = state.inspectionError
-        ? `Cannot verify checkout contents: ${state.inspectionError}`
-        : state.dirty
-          ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
-          : state.activeSessions.length
-            ? 'Agent sessions are connected. Finish them before retrying cleanup.'
-            : 'Awaiting explicit confirmation that this worktree is unused.';
+      const reason = 'Force deletion confirmed; cleanup is in progress.';
       pendingCatalog = markWorktreeCleanupPending(
         pendingCatalog,
         repository,
@@ -9332,7 +9443,8 @@
         {
           originalPath: worktree.path,
           recoveryPath: worktree.path,
-          sizeBytes: state.sizeBytes,
+          sizeBytes: null,
+          selectedWorktreeCleanupConfirmed: true,
           registeredWorktreesAtMark: registered.map(({ path: registeredPath, generation }) => ({
             path: registeredPath,
             generation,
@@ -9351,7 +9463,87 @@
         cause,
       });
     }
-    error = '';
+    if (
+      import.meta.env.MODE === 'e2e' &&
+      sessionStorage.getItem('sai-e2e-pause-force-cleanup') === 'true'
+    ) {
+      error = '';
+      return;
+    }
+    for (const worktree of descendants) deletingWorktreeRequests.add(worktree.path);
+    const failures: string[] = [];
+    let stopped = false;
+    try {
+      await targets.reduce(
+        (previous, worktree) =>
+          previous.then(async () => {
+            if (stopped) return undefined;
+            let current: RegisteredWorktree[];
+            try {
+              current = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+            } catch (cause) {
+              failures.push(`Could not refresh registered worktrees: ${describe(cause)}`);
+              stopped = true;
+              return undefined;
+            }
+            const catalogued = new Map(
+              (projectCatalog.worktrees[repository] ?? []).map((entry) => [
+                entry.path,
+                entry.generation,
+              ]),
+            );
+            if (
+              current.some(
+                (entry) =>
+                  entry.path !== repository && catalogued.get(entry.path) !== entry.generation,
+              )
+            ) {
+              failures.push(
+                'A registered worktree is not in this catalog. Refresh or adopt it before retrying cleanup.',
+              );
+              stopped = true;
+              return undefined;
+            }
+            const descendantReason = selectedCleanupDescendantReason(
+              repository,
+              worktree.path,
+              current,
+            );
+            if (descendantReason) {
+              const retained = projectCatalog.worktrees[repository]?.find(
+                (entry) => entry.path === worktree.path && entry.pendingCleanup,
+              );
+              if (retained?.pendingCleanup)
+                await saveProjectCatalogDurably(
+                  markWorktreeCleanupPending(projectCatalog, repository, worktree.path, {
+                    ...retained.pendingCleanup,
+                    reason: descendantReason,
+                  }),
+                );
+              failures.push(`${worktree.branch}: ${descendantReason}`);
+              return undefined;
+            }
+            const removed = await deleteProjectWorktreeOnce(
+              repository,
+              worktree.path,
+              worktree.branch,
+              true,
+              true,
+              { generation: worktree.generation! },
+              true,
+              current,
+            );
+            if (!removed) failures.push(`${worktree.branch}: ${error || 'cleanup did not finish'}`);
+            return undefined;
+          }),
+        Promise.resolve(),
+      );
+    } finally {
+      for (const worktree of descendants) deletingWorktreeRequests.delete(worktree.path);
+    }
+    error = failures.length
+      ? `${failures.length} worktree${failures.length === 1 ? '' : 's'} remain pending. ${failures.join(' ')}`
+      : '';
   }
 
   async function checkPendingWorktreeCleanup(repository: string, selectedPath?: string) {
@@ -9950,11 +10142,6 @@
         'A pending worktree changed identity. It remains registered; refresh before retrying.';
       return;
     }
-    if (preview[0].dirty || preview[0].activeSessions.length) {
-      await checkPendingWorktreeCleanup(repository, selectedPath);
-      error = 'Pending worktrees with files or active sessions were kept. Inspect them and retry.';
-      return;
-    }
     let archiveCommand: string;
     try {
       archiveCommand =
@@ -9965,9 +10152,9 @@
       return;
     }
     const confirmed = await confirmInApp(
-      'Confirm unused worktrees',
-      `Confirm this pending worktree and its private storage are unused, and no other process will write to, move, or replace either until cleanup finishes? Sail rechecks Git identity, private storage, and files immediately before removal. Changes Sail detects stop cleanup, and its branch remains. Git can delete files written after the final check, including ignored files.${archiveCommand ? ' The configured archive command will not run during selected cleanup; run it before confirming if needed.' : ''}\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
-      'Remove this worktree',
+      'Force delete pending worktree',
+      `Force delete this pending worktree? Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files. The branch remains.${archiveCommand ? ' The configured archive command will not run during pending cleanup; run it before confirming if needed.' : ''}\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
+      'Force delete',
       { destructive: true },
     );
     if (!confirmed) return;
@@ -9996,19 +10183,6 @@
         error = `${reason} Remaining worktrees were kept.`;
         return;
       }
-      // An inventory request started before this worktree became pending can still
-      // launch an agent runtime. Refuse cleanup if it does not finish promptly.
-      if (!(await waitForSidebarInventory(sidebarInventoryRequests))) {
-        error =
-          'Cleanup stopped: an agent inventory request is still running. This worktree and its private data remain pending; retry when inventory finishes.';
-        saveProjectCatalog(
-          markWorktreeCleanupPending(projectCatalog, repository, target.path, {
-            ...recovery,
-            reason: error,
-          }),
-        );
-        return;
-      }
       const previousCatalog = projectCatalog;
       const confirmedRecovery = { ...recovery, selectedWorktreeCleanupConfirmed: true };
       try {
@@ -10021,16 +10195,29 @@
           cause,
         });
       }
+      if (
+        import.meta.env.MODE === 'e2e' &&
+        sessionStorage.getItem('sai-e2e-pause-selected-force-cleanup') === 'true'
+      ) {
+        error =
+          'Cleanup stopped: Private agent data is retained while temporary data is still in use or cannot be verified.';
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(projectCatalog, repository, target.path, {
+            ...confirmedRecovery,
+            reason: error,
+          }),
+        );
+        return;
+      }
       const removed = await deleteProjectWorktreeOnce(
         repository,
         target.path,
         target.branch,
-        false,
-        false,
-        preview[0],
+        true,
+        true,
+        { generation: target.generation! },
         true,
         current,
-        true,
       );
       if (removed) {
         try {
@@ -10126,7 +10313,7 @@
     branch: string,
     force: boolean,
     stopAgents = false,
-    expected?: WorktreeRemovalPreview,
+    expected?: WorktreeRemovalExpectation,
     preconfirmed = false,
     expectedRegisteredWorktrees?: RegisteredWorktree[],
     confirmedUnused = false,
@@ -10152,14 +10339,14 @@
       import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
     if (e2eAnswer) sessionStorage.removeItem('sai-e2e-delete-worktree');
     const confirmed =
-      preconfirmed || stopAgents || e2eAnswer === 'Yes'
+      preconfirmed || e2eAnswer === 'Yes'
         ? true
         : e2eAnswer === 'No'
           ? false
           : await confirmInApp(
               force ? 'Force delete worktree' : 'Delete worktree',
               force || config
-                ? `Delete worktree “${branch}” at ${path}? This permanently removes uncommitted and ignored files, including copied files. The branch will remain.`
+                ? `Delete worktree “${branch}” at ${path}? Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files, including copied files. The branch will remain.`
                 : `Delete worktree “${branch}” at ${path}? Uncommitted and ignored files block deletion. The branch will remain.`,
               force ? 'Force delete' : 'Delete worktree',
               { destructive: true },
@@ -10171,7 +10358,7 @@
       [path]: config?.archive && !preconfirmed ? 'Archiving' : 'Preparing deletion',
     };
     try {
-      if (config?.archive && !stopAgents && !preconfirmed) {
+      if (config?.archive && !preconfirmed) {
         if (!wasSelected) await loadProject(path);
         const paneId = splitFocusedPane('row', 'terminal', config.archive);
         if (!paneId) return false;
@@ -10327,7 +10514,7 @@
           true,
           true,
           expected,
-          preconfirmed,
+          true,
           expectedRegisteredWorktrees,
         );
     } else if (retryForce)
@@ -10776,6 +10963,7 @@
     const results = await request.finally(() => sidebarInventoryRequests.delete(request));
     if (generation !== sidebarInventoryGeneration || disposed) return null;
     const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
+    for (const path of paths) if (!failed.has(path)) sidebarListedDirectories[path] = true;
     const listed = new Set(paths);
     const retained = sidebarOpenCodeThreads.filter(
       (thread) => !listed.has(thread.directory) || failed.has(thread.directory),
@@ -10801,19 +10989,28 @@
   let sidebarInventoryFailure = '';
 
   function reportSidebarInventoryFailure(failure: string | null) {
-    // The 30 s refresh must not re-raise the same failure over the user's current error.
+    // A repeated refresh must not re-raise the same failure over the user's current error.
     if (failure && failure !== sidebarInventoryFailure) error = failure;
     sidebarInventoryFailure = failure ?? '';
   }
 
-  function scheduleSidebarInventoryRefresh() {
+  function scheduleSidebarInventoryRefresh(
+    delay = sidebarInventoryDelay,
+    paths?: string[] | 'all',
+  ) {
+    sidebarInventoryWaiting = mergeSidebarRefreshPaths(sidebarInventoryWaiting, paths);
     clearTimeout(sidebarInventoryTimer);
     sidebarInventoryReadyKey = '';
     const key = sidebarDirectoryKey;
     const schedule = ++sidebarInventorySchedule;
     sidebarInventoryTimer = setTimeout(() => {
       sidebarInventoryTimer = undefined;
-      void refreshSidebarOpenCodeThreads(JSON.parse(sidebarDirectoryKey)).then(
+      const directories: string[] = JSON.parse(sidebarDirectoryKey);
+      const wanted = sidebarInventoryWaiting;
+      sidebarInventoryWaiting = undefined;
+      if (!wanted) sidebarInventoryLastFullListing = Date.now();
+      const selected = wanted ? directories.filter((path) => wanted.has(path)) : directories;
+      void refreshSidebarOpenCodeThreads(selected.length > 0 ? selected : directories).then(
         (failure) => {
           reportSidebarInventoryFailure(failure);
           if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
@@ -10822,7 +11019,33 @@
         },
         (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
-    }, 250);
+    }, delay);
+  }
+
+  // OpenCode sessions made outside Sail appear when the window regains focus, not by polling.
+  function refreshSidebarOnFocus() {
+    clearTimeout(sidebarFocusTimer);
+    sidebarFocusTimer = undefined;
+    if (
+      document.visibilityState === 'hidden' ||
+      !agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)
+    )
+      return;
+    if (foregroundAgentLoading) {
+      sidebarFocusPending = true;
+      return;
+    }
+    const now = Date.now();
+    if (!sidebarFocusRefreshDue(sidebarInventoryLastFullListing, now)) {
+      // Focus stays put after this event, so check again once the last listing is old enough.
+      sidebarFocusTimer = setTimeout(
+        refreshSidebarOnFocus,
+        SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS - (now - sidebarInventoryLastFullListing),
+      );
+      return;
+    }
+    if (sidebarInventoryTimer === undefined)
+      scheduleSidebarInventoryRefresh(sidebarInventoryDelay, 'all');
   }
 
   if (import.meta.env.MODE === 'e2e') {
@@ -10838,11 +11061,43 @@
   $effect(() => {
     const tracked = sidebarDirectoryKey;
     const available = agentAvailability.some((agent) => agent.id === 'opencode' && agent.available);
-    if (tracked && available) scheduleSidebarInventoryRefresh();
+    const loading = foregroundAgentLoading;
+    if (!tracked) return;
+    if (!available) {
+      // Re-detection must list every directory again.
+      sidebarListedDirectories = {};
+      return;
+    }
+    if (loading) {
+      // A queued request waits for the pane instead of being dropped.
+      if (sidebarInventoryTimer !== undefined) sidebarInventoryDeferred = true;
+      clearTimeout(sidebarInventoryTimer);
+      sidebarInventoryTimer = undefined;
+      sidebarInventoryReadyKey = '';
+      return;
+    }
+    const directories: string[] = JSON.parse(tracked);
+    // A directory that left the catalog is listed again if it returns.
+    sidebarListedDirectories = Object.fromEntries(
+      directories.filter((path) => sidebarListedDirectories[path]).map((path) => [path, true]),
+    );
+    const fresh = unlistedSidebarPaths(directories, sidebarListedDirectories);
+    const deferred = sidebarInventoryDeferred;
+    sidebarInventoryDeferred = false;
+    if (sidebarFocusPending) {
+      sidebarFocusPending = false;
+      refreshSidebarOnFocus();
+    }
+    if (fresh.length === 0 && !deferred) {
+      if (sidebarInventoryTimer === undefined) sidebarInventoryReadyKey = tracked;
+      return;
+    }
+    scheduleSidebarInventoryRefresh(sidebarInventoryDelay, fresh);
   });
 
   function openAgent(agent: AgentId, thread: AgentThread | null = null, preserveCycle = false) {
     if (!directory) return;
+    if (sidebarInventoryTimer !== undefined) scheduleSidebarInventoryRefresh();
     sideChat = null;
     if (!preserveCycle) {
       recentCycleKeys = null;
@@ -12243,7 +12498,7 @@
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
       rememberRecentThread(thread);
-      scheduleSidebarInventoryRefresh();
+      scheduleSidebarInventoryRefresh(250, [thread.directory]);
       return;
     }
     saveAgentThread(thread);
@@ -13019,6 +13274,7 @@
   }
 
   function handleAgentEvent(event: AgentEvent) {
+    if (event.message.method === 'sail/disconnected') forgetAcpConnections(event.agent);
     if (event.message.method === 'sail/disconnected' && !event.directory) {
       const sessionDirectories = event.message.params?.sessionDirectories;
       if (sessionDirectories && typeof sessionDirectories === 'object') {
@@ -13831,6 +14087,7 @@
         worktreeDialogRequest={paletteWorktreeRequest}
         {worktreeCreations}
         {worktreeDeletions}
+        {worktreeAutodiscoveryEnabled}
         onretryworktree={retryWorktreeCreation}
         ondismissworktree={dismissWorktreeCreation}
         onworktreecancelled={(repository) =>
