@@ -184,6 +184,10 @@
     workerStateSettled,
   } from './lib/issue-shipping';
   import type { ShipItIssue } from './lib/implementation-models';
+  import {
+    parseSpawnShipIssue,
+    requireSpawnShipIssueAvailable,
+  } from './lib/spawn-ship-assignment.ts';
   import { checkState } from './lib/pull-request-checks.ts';
   import {
     ciFailurePrompt,
@@ -8009,6 +8013,7 @@
     const target = request.arguments.target;
     const suppliedReceiptId = request.arguments.receiptId;
     const suppliedAccessKey = request.arguments.accessKey;
+    const shipIssue = parseSpawnShipIssue(request.arguments.shipIssue, role);
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (
       (suppliedReceiptId !== undefined || suppliedAccessKey !== undefined) &&
@@ -8055,6 +8060,11 @@
     const path = existing ? selectedTarget?.path : null;
     if (existing && typeof path !== 'string')
       throw new Error('Existing worktree path is required.');
+
+    if (shipIssue) {
+      await assertShipItIssueRepository(request.directory, shipIssue);
+      requireSpawnShipIssueAvailable(shipRuns, project, shipIssue);
+    }
 
     const routeSelection = routed
       ? selectModelRoute(modelRouting, {
@@ -8311,6 +8321,7 @@
           onPressureQueue(limit, reason);
           if (limit === null) updateSpawnReceipt(receiptId, { state: 'working' });
         },
+        shipIssue,
       );
       activeSpawnRequests.delete(receiptId);
       return {
@@ -8348,6 +8359,7 @@
     nativeGeneration?: number,
     promptAuthorization?: DirectShipAuthorization,
     onPromptQueue?: (limit: number | null, reason: string | null) => void,
+    shipIssue?: ShipItIssue,
   ) {
     const receipt = receiptId
       ? spawnReceipts.find((item) => item.receiptId === receiptId)
@@ -8355,6 +8367,7 @@
     const runOwner =
       receiptId &&
       (validation ||
+        shipIssue ||
         receipt?.requestId.startsWith('ship:') ||
         receipt?.requestId.startsWith('handoff:'))
         ? receiptId
@@ -8472,6 +8485,25 @@
       }
       if (receiptId)
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      if (shipIssue) {
+        if (!receipt) throw new Error('Ship assignment requires a launch receipt.');
+        requireSpawnShipIssueAvailable(shipRuns, receipt.project, shipIssue, created.path);
+        promptAuthorization = await adoptDirectShipRunWithAuthorization(
+          shipIssue,
+          created.path,
+          `acp:${source.agent}:${session.sessionId}`,
+          requestedModel ?? reportedModel,
+          true,
+        );
+        if (!promptAuthorization) throw new Error('Ship worker assignment was not saved.');
+        const owner = shipOwner(shipRuns, created.path, `acp:${source.agent}:${session.sessionId}`);
+        if (!owner) throw new Error('Ship worker assignment is unavailable.');
+        await updateShipIssue(owner.run, owner.issue, {
+          receiptId: receipt.receiptId,
+          workerState: 'starting',
+          workerUpdatedAt: Date.now(),
+        });
+      }
       if (receiptId) await saveShipRuns();
       await invoke('record_turn_snapshot', {
         path: created.path,
@@ -8625,6 +8657,14 @@
       };
     } catch (cause) {
       await acp.cancel(source.agent, created.path, session.sessionId, null).catch(() => undefined);
+      if (shipIssue) {
+        const owner = shipOwner(shipRuns, created.path, `acp:${source.agent}:${session.sessionId}`);
+        if (owner)
+          await updateShipIssue(owner.run, owner.issue, {
+            state: 'failed',
+            error: describe(cause),
+          }).catch(() => undefined);
+      }
       if (runOwner) {
         let cleanupError: unknown;
         if (dispatchedTurnId)
