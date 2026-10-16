@@ -40,10 +40,14 @@ void test('dev startup keeps mounting and lazy components on one Svelte runtime'
       assert.ok(button);
       assert.match(
         main.code,
-        /import \{ mount \} from "\/node_modules\/svelte\/src\/index-client.js/,
+        /import \{ mount \} from "[^"\n]*\/node_modules\/svelte\/src\/index-client\.js/,
       );
-      assert.match(app.code, /from "\/node_modules\/svelte\/src\/internal\/client\/index.js/);
-      assert.match(button.code, /from "\/node_modules\/svelte\/src\/internal\/client\/index.js/);
+      const runtimeImport =
+        /from "([^"\n]*\/node_modules\/svelte\/src\/internal\/client\/index\.js[^"\n]*)"/;
+      const appRuntime = runtimeImport.exec(app.code)?.[1];
+      const buttonRuntime = runtimeImport.exec(button.code)?.[1];
+      assert.ok(appRuntime);
+      assert.equal(buttonRuntime, appRuntime);
     } finally {
       await server.close();
     }
