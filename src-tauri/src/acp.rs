@@ -209,6 +209,26 @@ impl NativeSubagentRegistry {
         )
     }
 
+    fn live_descendants(&self, parent: &str) -> HashMap<String, NativeSubagentState> {
+        let mut sessions = HashSet::from([parent.to_string()]);
+        loop {
+            let previous = sessions.len();
+            for (id, child) in &self.0 {
+                if sessions.contains(&child.parent_session_id) {
+                    sessions.insert(id.clone());
+                }
+            }
+            if sessions.len() == previous {
+                break;
+            }
+        }
+        self.0
+            .iter()
+            .filter(|(id, child)| sessions.contains(*id) && Self::is_live(child))
+            .map(|(id, child)| (id.clone(), child.clone()))
+            .collect()
+    }
+
     fn task_connections(&self) -> HashMap<String, NativeSubagentState> {
         let mut connected = self
             .0
@@ -716,6 +736,7 @@ struct Connection {
     last_activity: Mutex<Instant>,
     input: Mutex<ChildStdin>,
     pending: Mutex<HashMap<u64, mpsc::Sender<PendingResponse>>>,
+    native_replays: Mutex<HashMap<u64, NativeReplay>>,
     reader_progress: ReaderProgress,
     permission_state: Mutex<PermissionState>,
     elicitation_state: Mutex<HashMap<String, PendingElicitation>>,
@@ -776,6 +797,22 @@ impl Drop for EndResume<'_> {
     }
 }
 
+struct NativeReplay {
+    sessions: HashSet<String>,
+    live_children: HashMap<String, NativeSubagentState>,
+}
+
+struct NativeReplayGuard<'a> {
+    runtime: &'a Connection,
+    id: u64,
+}
+
+impl Drop for NativeReplayGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime.finish_native_replay(self.id, false);
+    }
+}
+
 struct RestoreClaim {
     token: String,
     expires: Instant,
@@ -819,6 +856,70 @@ struct SessionUiState {
 }
 
 impl Connection {
+    fn native_replay_update(&self, parent: &str, update: &Value) -> Result<bool, String> {
+        let child_id = update.get("subagentSessionId").and_then(Value::as_str);
+        let registered_child = if let Some(child) = child_id {
+            self.native_subagents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .0
+                .get(child)
+                .filter(|child| {
+                    child.parent_session_id == parent && NativeSubagentRegistry::is_live(child)
+                })
+                .cloned()
+        } else {
+            None
+        };
+        let mut replays = self
+            .native_replays
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let Some(replay) = replays
+            .values_mut()
+            .find(|replay| replay.sessions.contains(parent))
+        else {
+            return Ok(false);
+        };
+        if let Some(child) = child_id {
+            // A live spawn can finish registration after the restore snapshot was taken.
+            if let Some(registered) = registered_child {
+                replay
+                    .live_children
+                    .entry(child.to_string())
+                    .or_insert(registered);
+            }
+            replay.sessions.insert(child.to_string());
+            return Ok(!replay.live_children.contains_key(child));
+        }
+        Ok(true)
+    }
+
+    fn finish_native_replay(&self, id: u64, succeeded: bool) {
+        let replay = self
+            .native_replays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+        if !succeeded {
+            if let Some(replay) = replay {
+                self.native_subagents
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0
+                    .extend(replay.live_children);
+            }
+        }
+    }
+
+    fn replaying_live_child(&self, parent: &str, child: &str) -> bool {
+        self.native_replays.lock().is_ok_and(|replays| {
+            replays.values().any(|replay| {
+                replay.sessions.contains(parent) && replay.live_children.contains_key(child)
+            })
+        })
+    }
+
     fn validate_codex_workspace(&self, cwd: Option<&str>) -> Result<(), String> {
         let Some(access) = &self.codex_workspace_access else {
             return Ok(());
@@ -2174,6 +2275,28 @@ impl Connection {
             .map_err(|error| error.to_string())?
             .insert(id, sender);
         drop(temp_gate);
+        let _replay = if matches!(method, "session/load" | "session/resume") {
+            session_id.as_ref().map(|session| {
+                let live_children = self
+                    .native_subagents
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .live_descendants(session);
+                self.native_replays
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        id,
+                        NativeReplay {
+                            sessions: HashSet::from([session.clone()]),
+                            live_children,
+                        },
+                    );
+                NativeReplayGuard { runtime: self, id }
+            })
+        } else {
+            None
+        };
         if let Err(error) =
             write_message(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
         {
@@ -5272,10 +5395,10 @@ fn register_native_task_connections(
         }
     }
     // Settled ancestors only bridge registration of live descendants.
-    for (child_id, child) in children
-        .iter()
-        .filter(|(_, child)| !NativeSubagentRegistry::is_live(child))
-    {
+    for (child_id, child) in native.0.iter().filter(|(child_id, child)| {
+        !NativeSubagentRegistry::is_live(child)
+            && !runtime.replaying_live_child(&child.parent_session_id, child_id)
+    }) {
         browser.prune_native_children(
             &runtime.agent,
             &child.directory,
@@ -5386,6 +5509,9 @@ fn record_native_subagent_update(
     parent_id: &str,
     update: &Value,
 ) -> Result<(), String> {
+    if runtime.native_replay_update(parent_id, update)? {
+        return Ok(());
+    }
     match update.get("sessionUpdate").and_then(Value::as_str) {
         Some("subagent_spawned") => {
             let child_id = update
@@ -5436,7 +5562,7 @@ fn record_native_subagent_update(
             // A replayed spawn of a settled child must not hold the parent's task identity.
             if child_live {
                 browser.register_native_child(agent, &directory, parent_id, child_id, provider_id);
-            } else {
+            } else if !runtime.replaying_live_child(parent_id, child_id) {
                 browser.prune_native_children(agent, &directory, &[child_id.to_string()]);
             }
             let generation = fence.generations.entry(directory).or_default();
@@ -5495,8 +5621,11 @@ fn record_native_subagent_update(
             let generation = fence.generations.entry(directory.clone()).or_default();
             *generation = generation.saturating_add(1);
             if matches!(outcome, "completed" | "failed" | "cancelled") {
-                app.state::<crate::browser_agent::BrowserManager>()
-                    .settle_native_child(agent, &directory, parent_id, child_id);
+                // History can complete and revive a child that is still running.
+                if !runtime.replaying_live_child(parent_id, child_id) {
+                    app.state::<crate::browser_agent::BrowserManager>()
+                        .settle_native_child(agent, &directory, parent_id, child_id);
+                }
                 runtime
                     .permission_state
                     .lock()
@@ -6728,6 +6857,7 @@ fn connect_blocking_inner(
         last_activity: Mutex::new(Instant::now()),
         input: Mutex::new(input),
         pending: Mutex::new(HashMap::new()),
+        native_replays: Mutex::new(HashMap::new()),
         reader_progress: ReaderProgress::default(),
         permission_state: Mutex::new(PermissionState::default()),
         elicitation_state: Mutex::new(HashMap::new()),
@@ -6899,7 +7029,11 @@ fn connect_blocking_inner(
                             json!({"agent":agent_id,"sessionId":session_id,"error":error}),
                         );
                     }
-                    if let Some((activity, active)) = native_activity_fence(update) {
+                    if let Some((activity, active)) = native_activity_fence(update).filter(|_| {
+                        !reader
+                            .native_replay_update(session_id, update)
+                            .unwrap_or(false)
+                    }) {
                         if let Some(directory) = reader
                             .session_directories
                             .lock()
@@ -7134,6 +7268,7 @@ fn connect_blocking_inner(
                     },
                 );
             } else if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                reader.finish_native_replay(id, message.get("error").is_none());
                 if let Some(sender) = reader
                     .pending
                     .lock()
@@ -8239,6 +8374,7 @@ fn restore_session_blocking(
                 &session_id,
             );
             let result = runtime.request(method, params, Duration::from_secs(60));
+            register_native_task_connections(&runtime, browser)?;
             browser.clear_unattributed_native_activity(
                 &agent,
                 &canonical_directory(&cwd),
@@ -10467,6 +10603,7 @@ time.sleep(10)
             last_activity: Mutex::new(Instant::now()),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
+            native_replays: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
             permission_state: Mutex::new(PermissionState::default()),
             elicitation_state: Mutex::new(HashMap::from([(
@@ -11375,6 +11512,7 @@ time.sleep(10)
                 last_activity: Mutex::new(Instant::now()),
                 input: Mutex::new(input),
                 pending: Mutex::new(HashMap::new()),
+                native_replays: Mutex::new(HashMap::new()),
                 reader_progress: ReaderProgress::default(),
                 permission_state: Mutex::new(PermissionState::default()),
                 elicitation_state: Mutex::new(HashMap::new()),
@@ -12655,6 +12793,183 @@ mod native_subagent_fence_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn native_restore_replay_does_not_recreate_historical_child_fences() {
+        let runtime = super::session_config_tests::test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            Path::new("/repo"),
+            "parent",
+            None,
+        );
+        runtime.native_replays.lock().unwrap().insert(
+            7,
+            NativeReplay {
+                sessions: HashSet::from(["parent".into()]),
+                live_children: HashMap::new(),
+            },
+        );
+        let spawn = json!({"sessionUpdate":"subagent_spawned","subagentSessionId":"historical"});
+        assert!(runtime.native_replay_update("parent", &spawn).unwrap());
+        assert!(runtime
+            .native_replay_update("historical", &json!({"sessionUpdate":"tool_call"}))
+            .unwrap());
+        assert!(!runtime.native_replay_update("unrelated", &spawn).unwrap());
+        assert!(runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .task_connections()
+            .is_empty());
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .spawn("parent", "live", PathBuf::from("/repo"), false)
+            .unwrap();
+        let live = runtime.native_subagents.lock().unwrap().0["live"].clone();
+        runtime
+            .native_replays
+            .lock()
+            .unwrap()
+            .get_mut(&7)
+            .unwrap()
+            .live_children
+            .insert("live".into(), live);
+        assert!(!runtime.native_replay_update("parent", &json!({"sessionUpdate":"subagent_state_update","subagentSessionId":"live","state":"completed"})).unwrap());
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .update("parent", "live", "completed")
+            .unwrap();
+        assert!(runtime.replaying_live_child("parent", "live"));
+        assert!(!runtime.native_replay_update("parent", &json!({"sessionUpdate":"subagent_spawned","subagentSessionId":"live","revive":true})).unwrap());
+        runtime.native_subagents.lock().unwrap().revive("live");
+        assert!(runtime.replaying_live_child("parent", "live"));
+        assert!(runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .task_connections()
+            .contains_key("live"));
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .update("parent", "live", "completed")
+            .unwrap();
+        {
+            let _guard = NativeReplayGuard {
+                runtime: &runtime,
+                id: 7,
+            };
+        }
+        assert_eq!(
+            runtime.native_subagents.lock().unwrap().0["live"].outcome,
+            "working"
+        );
+        assert!(!runtime.native_replay_update("parent", &spawn).unwrap());
+        assert!(!runtime.native_replay_update("historical", &spawn).unwrap());
+        for method in ["session/load", "session/resume"] {
+            let result = runtime.request_response_around_write(
+                method,
+                json!({"sessionId":"parent"}),
+                Duration::from_secs(1),
+                |_| {
+                    assert!(runtime.native_replay_update("parent", &spawn).unwrap());
+                    Err("write failed".into())
+                },
+                || {},
+            );
+            assert!(result.is_err());
+            assert!(!runtime.native_replay_update("parent", &spawn).unwrap());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_replay_activation_reconciles_new_live_children() {
+        for classified_before_activation in [false, true] {
+            let runtime = super::session_config_tests::test_runtime(
+                "codex",
+                CapabilityProfile::Build,
+                Path::new("/repo"),
+                "parent",
+                None,
+            );
+            let spawn = json!({"sessionUpdate":"subagent_spawned","subagentSessionId":"new-live"});
+            let live_children = runtime
+                .native_subagents
+                .lock()
+                .unwrap()
+                .live_descendants("parent");
+            if classified_before_activation {
+                assert!(!runtime.native_replay_update("parent", &spawn).unwrap());
+            } else {
+                runtime
+                    .native_subagents
+                    .lock()
+                    .unwrap()
+                    .spawn("parent", "new-live", PathBuf::from("/repo"), false)
+                    .unwrap();
+            }
+            runtime.native_replays.lock().unwrap().insert(
+                7,
+                NativeReplay {
+                    sessions: HashSet::from(["parent".into()]),
+                    live_children,
+                },
+            );
+            if classified_before_activation {
+                runtime
+                    .native_subagents
+                    .lock()
+                    .unwrap()
+                    .spawn("parent", "new-live", PathBuf::from("/repo"), false)
+                    .unwrap();
+            }
+            let completed = json!({"sessionUpdate":"subagent_state_update","subagentSessionId":"new-live","state":"completed"});
+            assert!(!runtime.native_replay_update("parent", &completed).unwrap());
+            assert!(runtime.replaying_live_child("parent", "new-live"));
+            runtime
+                .native_subagents
+                .lock()
+                .unwrap()
+                .update("parent", "new-live", "completed")
+                .unwrap();
+            assert!(runtime.replaying_live_child("parent", "new-live"));
+            runtime.finish_native_replay(7, true);
+            assert!(!runtime.replaying_live_child("parent", "new-live"));
+            assert!(runtime
+                .native_subagents
+                .lock()
+                .unwrap()
+                .task_connections()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn replay_live_snapshot_excludes_unrelated_sessions_and_includes_nested_children() {
+        let mut native = NativeSubagentRegistry::default();
+        for (parent, child) in [
+            ("parent", "child"),
+            ("child", "nested"),
+            ("other", "unrelated"),
+        ] {
+            native
+                .spawn(parent, child, PathBuf::from("/repo"), false)
+                .unwrap();
+        }
+        native.update("parent", "child", "completed").unwrap();
+        let children = native.live_descendants("parent");
+        assert_eq!(children.len(), 1);
+        assert!(children.contains_key("nested"));
+        assert!(!children.contains_key("unrelated"));
+    }
+
+    #[test]
     fn replayed_spawn_reports_whether_the_child_is_still_live() {
         let mut registry = NativeSubagentRegistry::default();
         let directory = PathBuf::from("/repo");
@@ -12925,6 +13240,7 @@ mod native_subagent_fence_tests {
             last_activity: Mutex::new(Instant::now()),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
+            native_replays: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
             permission_state: Mutex::new(PermissionState::default()),
             elicitation_state: Mutex::new(HashMap::new()),
