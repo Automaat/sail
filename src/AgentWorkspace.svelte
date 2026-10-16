@@ -3188,7 +3188,7 @@
   }
   .agent-header .agent-heading {
     min-width: 0;
-    flex: 1;
+    flex: 1 1 12rem;
   }
   .agent-heading strong {
     flex: none;
