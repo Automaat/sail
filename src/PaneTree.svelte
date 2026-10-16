@@ -8,8 +8,10 @@
   import PlanPanel from './PlanPanel.svelte';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import TasksPanel from './TasksPanel.svelte';
+  import Markdown from './Markdown.svelte';
+  import type { NativePlan } from './lib/native-plan';
   import { sessionTasks } from './lib/session-tasks';
-  import { revealsPlanReview } from './lib/details-plan';
+  import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
   import WorkspaceActivity from './WorkspaceActivity.svelte';
   import ShipPanel from './ShipPanel.svelte';
   import type { ShipActionId } from './lib/ship-actions';
@@ -279,6 +281,7 @@
   let tasksTick = $state(0);
   let acpPlanTick = $state(0);
   let planRevealed = false;
+  let nativePlan = $state<NativePlan | null>(null);
   const emptySnapshot: PlanSnapshot = { plan: null, questions: null };
   const acpScope = $derived.by((): PlanScope | null => {
     if ('direction' in pane || !pane.agent || !pane.thread) return null;
@@ -840,6 +843,14 @@
               {directory}
               {taskLocation}
               thread={pane.thread}
+              onnativeplan={(plan, live) => {
+                if (revealsNativePlanReview(plan, nativePlan, live ?? false)) {
+                  planRevealed = true;
+                  acpTab = 'plan';
+                  onrevealplan(pane.id);
+                }
+                nativePlan = plan;
+              }}
               usage={pane.thread
                 ? { ...agentUsage[threadKey(pane.thread)], rates: agentRates[pane.thread.agent] }
                 : undefined}
@@ -911,7 +922,7 @@
                       aria-selected={acpTab === 'tasks'}
                       onclick={() => (acpTab = 'tasks')}>Tasks ({taskSnapshot.tasks.length})</button
                     >
-                    {#if acpSnapshot.plan || acpSnapshot.questions}<button
+                    {#if nativePlan || acpSnapshot.plan || acpSnapshot.questions}<button
                         class:active={acpTab === 'plan'}
                         role="tab"
                         aria-selected={acpTab === 'plan'}
@@ -981,6 +992,20 @@
                       acpTab = 'changes';
                     }}
                   />
+                {:else if acpTab === 'plan' && nativePlan}
+                  <div
+                    class="native-plan-panel"
+                    aria-label="Native plan"
+                    role="tabpanel"
+                    tabindex="0"
+                  >
+                    <Markdown source={nativePlan.markdown} />
+                    {#if nativePlan.tasks.length}<ul>
+                        {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
+                            {task.status}: {task.title}
+                          </li>{/each}
+                      </ul>{/if}
+                  </div>
                 {:else if acpTab === 'history'}
                   <PlanHistoryPanel
                     events={acpPlanHistory}
