@@ -1923,7 +1923,10 @@
     const match = /^acp:([^:]+):(.+)$/.exec(receipt.targetId);
     if (!match) throw new Error('This subagent cannot be stopped safely.');
     await acp.cancel(match[1]!, receipt.targetDirectory, match[2]!, receipt.turnId);
-    updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
+    updateSpawnReceipt(receipt.receiptId, {
+      state: 'interrupted',
+      error: 'Worker cancelled by an explicit stop request.',
+    });
   }
   async function stopAllSubagents(receipts: SpawnReceipt[]) {
     const targets = stoppableSubagents(receipts, shipOwnedThreads);
@@ -4722,7 +4725,11 @@
       if (!shippingWorkerGone(cause)) throw cause;
     }
     if (receipt && issue.path) await acp.releaseOwner(issue.path, receipt.receiptId);
-    if (receipt) updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
+    if (receipt)
+      updateSpawnReceipt(receipt.receiptId, {
+        state: 'interrupted',
+        error: 'Worker cancelled by an explicit stop request.',
+      });
   }
 
   async function stopShippingWorker(issue: ShipIssue): Promise<void> {
@@ -6122,6 +6129,7 @@
           const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
           updateSpawnReceipt(receipt.receiptId, {
             state: acpPromptInterrupted(outcome) ? 'interrupted' : 'completed',
+            ...(outcome.sailInterruptionReason ? { error: outcome.sailInterruptionReason } : {}),
             result: spawnOutput.get(receipt.receiptId) ?? current?.result ?? null,
           });
           spawnOutput.delete(receipt.receiptId);
@@ -6212,7 +6220,7 @@
         state,
         result: spawnOutput.get(receipt.receiptId) ?? receipt.result,
         error:
-          state === 'failed' && outcome?.turnId === receipt.turnId
+          (state === 'failed' || state === 'interrupted') && outcome?.turnId === receipt.turnId
             ? (outcome.error ?? receipt.error)
             : receipt.error,
       });
@@ -6587,6 +6595,9 @@
               if (shippingReceipt) {
                 updateSpawnReceipt(shippingReceipt.receiptId, {
                   state: acpPromptInterrupted(outcome) ? 'interrupted' : 'completed',
+                  ...(outcome.sailInterruptionReason
+                    ? { error: outcome.sailInterruptionReason }
+                    : {}),
                   result:
                     spawnOutput.get(shippingReceipt.receiptId) ?? shippingReceipt.result ?? null,
                 });
@@ -6616,7 +6627,7 @@
               if (shippingReceipt) {
                 updateSpawnReceipt(shippingReceipt.receiptId, {
                   state: interrupted ? 'interrupted' : 'failed',
-                  error: interrupted ? null : describe(cause),
+                  error: describe(cause),
                 });
                 spawnOutput.delete(shippingReceipt.receiptId);
                 if (
@@ -8594,6 +8605,7 @@
             const current = spawnReceipts.find((item) => item.receiptId === receiptId);
             updateSpawnReceipt(receiptId, {
               state: acpPromptInterrupted(outcome) ? 'interrupted' : 'completed',
+              ...(outcome.sailInterruptionReason ? { error: outcome.sailInterruptionReason } : {}),
               result: spawnOutput.get(receiptId) ?? current?.result ?? null,
             });
             spawnOutput.delete(receiptId);
@@ -8629,7 +8641,7 @@
           if (receiptId) {
             updateSpawnReceipt(receiptId, {
               state: interrupted ? 'interrupted' : 'failed',
-              error: interrupted ? null : describe(cause),
+              error: describe(cause),
             });
             spawnOutput.delete(receiptId);
             if (
