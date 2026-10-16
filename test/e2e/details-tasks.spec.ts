@@ -130,6 +130,50 @@ describe('Tasks default details tab', () => {
     });
   });
 
+  it('exposes split native plans without replacing the selected tab on progress', async () => {
+    await browser.setWindowSize(1920, 1200);
+    await browser.execute((directory) => {
+      localStorage.clear();
+      localStorage.setItem('sai-directory', directory);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+      );
+    }, realpathSync(repository));
+    await browser.refresh();
+    await chooseTopbarAction('New agent', 'Claude');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.keys(['Meta', 'd']);
+    await $('.pane-leaf.focused [data-pane-picker]').click();
+    await $('.pane-leaf.focused [data-agent-choice]*=Codex').click();
+    await expect($('.pane-leaf.focused .agent-header')).toHaveText(
+      expect.stringContaining('Ready'),
+    );
+    await toggleDetails();
+    const root = '.pane-leaf.focused .native-details';
+    await expect($(`${root} button[role="tab"]*=Tasks`)).toHaveAttribute('aria-selected', 'true');
+    await expect($(`${root} button[role="tab"]*=Plan`)).not.toExist();
+    await $(`${root} button[role="tab"]*=Activity`).click();
+    await $('.pane-leaf.focused .agent-composer [data-pane-prompt]').setValue(
+      'Plan revision fixture',
+    );
+    await $('.pane-leaf.focused .agent-actions button:last-child').click();
+    await expect($('.pane-leaf.focused .agent-conversation [aria-label="Native plan"]')).toHaveText(
+      expect.stringContaining('Initial plan'),
+    );
+    await expect($(`${root} button[role="tab"]*=Activity`)).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await $(`${root} button[role="tab"]*=Plan`).click();
+    await expect($(`${root} [aria-label="Native plan"]`)).toHaveText(
+      expect.stringContaining('Initial plan'),
+    );
+    await toggleDetails();
+    await toggleDetails();
+    await expect($(`${root} button[role="tab"]*=Tasks`)).toHaveAttribute('aria-selected', 'true');
+  });
+
   it('resets main and split details to Tasks on each open and preserves tab selection', async () => {
     await browser.setWindowSize(1920, 1200);
     await browser.execute((directory) => {

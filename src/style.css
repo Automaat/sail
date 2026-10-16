@@ -1645,12 +1645,17 @@ time {
 .native-details > .diff-panel,
 .native-details > .history-panel,
 .native-details > .plan-panel,
+.native-details > .native-plan-panel,
 .native-details > .tasks-view {
   flex: 1;
   min-height: 0;
 }
 .tasks-view {
   overflow: auto;
+}
+.native-details > .native-plan-panel {
+  overflow: auto;
+  padding: 16px;
 }
 .tasks-view:focus-visible {
   box-shadow: inset 3px 0 var(--sui-muted);
