@@ -489,12 +489,16 @@
   import { copyCompletedSelection, copyStatusHost } from './lib/auto-copy';
   import {
     coordinationKey,
+    coordinationDeliveryProject,
     coordinationSourceThread,
+    coordinationTarget,
     coordinationPrompt,
     enqueueCoordinationMessage,
     loadCoordinationMessages,
     projectWorktreeInfo,
+    projectReceiptThreads,
     type CoordinationMessage,
+    type CoordinationThread,
     type RegisteredWorktree,
   } from './lib/coordination';
   import {
@@ -909,12 +913,6 @@
       | 'capability_check';
     arguments: Record<string, unknown>;
     expiresAt: number;
-  };
-  type CoordinationThread = {
-    id: string;
-    directory: string;
-    title: string;
-    agent: string;
   };
   type CoordinationSource = {
     kind: 'acp';
@@ -6356,6 +6354,9 @@
         title: thread.title,
         agent: thread.agent,
       }));
+    for (const thread of projectReceiptThreads(spawnReceipts, project)) {
+      if (!threads.some((item) => item.id === thread.id)) threads.push(thread);
+    }
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available))
       return threads;
     const known = new Set(threads.map((thread) => thread.id));
@@ -6672,7 +6673,8 @@
       if (split < 0) continue;
       const targetDirectory = message.target.slice(0, split);
       const id = message.target.slice(split + 1);
-      if (!coordinationProject(targetDirectory)) continue;
+      if (!coordinationDeliveryProject(projectCatalog, spawnReceipts, targetDirectory, id))
+        continue;
       coordinationAttempts.set(message.id, Date.now());
       queueCoordinationDelivery({ id, directory: targetDirectory, title: '', agent: '' }, message);
     }
@@ -6911,8 +6913,7 @@
       if (typeof targetId !== 'string' || typeof text !== 'string' || !text.trim())
         throw new Error('Choose a project thread and enter a message.');
       if (text.length > 2000) throw new Error('Agent message must be at most 2000 characters.');
-      const target = threads.find((thread) => thread.id === targetId);
-      if (!target) throw new Error('Target thread is not in this project.');
+      const target = coordinationTarget(threads, spawnReceipts, project, targetId);
       const message: CoordinationMessage = {
         id: crypto.randomUUID(),
         target: coordinationKey(target.directory, target.id),
