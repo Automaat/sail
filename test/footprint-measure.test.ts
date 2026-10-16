@@ -180,7 +180,7 @@ const verdictFor = (
     samples,
     launchedAt: 0,
     maintenance: elapsed === null ? null : { elapsedMs: elapsed },
-    options: { ...defaults, ...(overrides.tolerance ? { tolerance: overrides.tolerance } : {}) },
+    options: { ...defaults, tolerance: overrides.tolerance ?? defaults.tolerance },
   });
 };
 
@@ -329,6 +329,37 @@ await test('the tolerance is configurable for memory windows', () => {
   assert.equal(verdictFor(grow, { tolerance: 0.25 }).rss.pass, true);
 });
 
+await test('RSS judges positive growth and accepts flat or falling memory', () => {
+  for (const [lateMb, pass] of [
+    [0, true],
+    [70, true],
+    [100, true],
+    [109, true],
+    [110, false],
+    [111, false],
+  ] as const) {
+    const verdict = verdictFor(series((at) => ({ children: 0, rssMb: at < 60 ? 100 : lateMb })));
+    assert.equal(verdict.rss.pass, pass, `100 → ${lateMb} MB`);
+    assert.equal(verdict.pass, pass, `whole verdict, 100 → ${lateMb} MB`);
+  }
+});
+
+await test('zero RSS and zero tolerance retain a strict positive-growth limit', () => {
+  for (const [earlyMb, lateMb, pass] of [
+    [0, 0, true],
+    [0, 1, false],
+    [100, 100, true],
+    [100, 99, true],
+    [100, 101, false],
+  ] as const) {
+    const verdict = verdictFor(
+      series((at) => ({ children: 0, rssMb: at < 60 ? earlyMb : lateMb })),
+      { tolerance: 0 },
+    );
+    assert.equal(verdict.rss.pass, pass, `${earlyMb} → ${lateMb} MB`);
+  }
+});
+
 const finished = (timestampMs: number, elapsedMs: number) =>
   JSON.stringify({
     timestampMs,
@@ -389,9 +420,40 @@ await test('the report prints the windows, the phases, the difference and the ve
   assert.match(report, /active\s+150\.0 MB \(240\)\s+156\.0 MB \(240\)\s+\+6\.0 MB\s+\+4\.0%/);
   assert.match(report, /idle\s+n\/a \(0\)\s+n\/a \(0\)\s+not compared\s+n\/a/);
   assert.match(report, /PASS\s+child processes \+0\.0%/);
-  assert.match(report, /PASS\s+total RSS active \+4\.0% \(limit ±10%\)/);
+  assert.match(report, /PASS\s+total RSS active \+4\.0% \(growth <10%\)/);
   assert.match(report, /PASS\s+startup maintenance 21\.5 s \(limit 30 s\); scratchSweep 21400 ms/);
   assert.match(report, /RESULT: PASS$/);
+});
+
+await test('a flat physical footprint is reported without masking RSS growth', () => {
+  const samples = series((at) => ({ children: 0, rssMb: at < 60 ? 50 : 100 })).map((sample) => ({
+    time: sample.time,
+    children: sample.children,
+    rssBytes: sample.rssBytes,
+    appRssBytes: sample.rssBytes,
+    appFootprintBytes: 40 * MB,
+  }));
+  const maintenance = { elapsedMs: 1000 };
+  const verdict = evaluate({ samples, launchedAt: 0, maintenance, options: defaults });
+
+  const report = formatReport({
+    first: snap(0, 50 * MB, 10 * minute),
+    second: snap(0, 100 * MB, 120 * minute),
+    verdict,
+    maintenance,
+    options: defaults,
+    launchedAt: 0,
+  });
+
+  assert.equal(verdict.rss.pass, false);
+  assert.equal(verdict.pass, false);
+  assert.match(
+    report,
+    /Sail process only: physical footprint includes compressed or swapped memory/,
+  );
+  assert.match(report, /idle\s+50\.0 MB\s+100\.0 MB\s+40\.0 MB\s+40\.0 MB/);
+  assert.match(report, /FAIL\s+total RSS idle \+100\.0%/);
+  assert.match(report, /RESULT: FAIL$/);
 });
 
 await test('a failing report names the failed threshold', () => {
