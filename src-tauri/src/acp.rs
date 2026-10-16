@@ -8312,7 +8312,10 @@ fn listing_connection(
     Ok((runtime, capabilities))
 }
 
-fn profiled_session_history(mut listing: Value, known: &[(String, CapabilityProfile)]) -> Value {
+fn profiled_session_history(
+    mut listing: Value,
+    known: &[(String, CapabilityProfile, PathBuf)],
+) -> Value {
     let Some(sessions) = listing.get_mut("sessions").and_then(Value::as_array_mut) else {
         return listing;
     };
@@ -8323,10 +8326,16 @@ fn profiled_session_history(mut listing: Value, known: &[(String, CapabilityProf
                 return vec![session];
             };
             let (_, wire_id) = session_profile(id);
+            let directory = session
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(canonical_directory);
             let mut identities = known
                 .iter()
-                .filter(|(id, _)| session_profile(id).1 == wire_id)
-                .cloned()
+                .filter(|(id, _, cwd)| {
+                    session_profile(id).1 == wire_id && directory.as_ref() == Some(cwd)
+                })
+                .map(|(id, profile, _)| (id.clone(), *profile))
                 .collect::<Vec<_>>();
             // History lookup grants listing access, not ownership of persisted conversations.
             if identities.is_empty() {
@@ -8395,14 +8404,23 @@ pub async fn acp_list_sessions(
                         && connection.alive.load(Ordering::Acquire)
                 })
             {
-                known.extend(
-                    connection
-                        .session_profiles
-                        .lock()
-                        .map_err(|error| error.to_string())?
-                        .iter()
-                        .map(|(id, profile)| (id.clone(), *profile)),
-                );
+                let profiles = connection
+                    .session_profiles
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                let directories = connection
+                    .session_directories
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                known.extend(profiles.iter().filter_map(|(id, profile)| {
+                    directories.get(id).map(|cwd| {
+                        (
+                            id.clone(),
+                            *profile,
+                            canonical_directory(&cwd.to_string_lossy()),
+                        )
+                    })
+                }));
             }
             return Ok(profiled_session_history(result, &known));
         }
@@ -13977,8 +13995,21 @@ mod capability_profile_tests {
             {"sessionId":profile_session_id(CapabilityProfile::Explore, "unbound"),"cwd":"/repo"}
         ],"nextCursor":"next"}),
             &[
-                (build.clone(), CapabilityProfile::Build),
-                (review.clone(), CapabilityProfile::Review),
+                (
+                    build.clone(),
+                    CapabilityProfile::Build,
+                    PathBuf::from("/repo"),
+                ),
+                (
+                    review.clone(),
+                    CapabilityProfile::Review,
+                    PathBuf::from("/repo"),
+                ),
+                (
+                    profile_session_id(CapabilityProfile::Explore, "1"),
+                    CapabilityProfile::Explore,
+                    PathBuf::from("/repo/other"),
+                ),
             ],
         );
         assert_eq!(listed["sessions"][0]["sessionId"], build);
@@ -13997,7 +14028,11 @@ mod capability_profile_tests {
     fn history_listing_keeps_registered_legacy_session_identity() {
         let listed = profiled_session_history(
             json!({"sessions":[{"sessionId":profile_session_id(CapabilityProfile::Explore, "legacy"),"cwd":"/repo"}]}),
-            &[("legacy".into(), CapabilityProfile::Review)],
+            &[(
+                "legacy".into(),
+                CapabilityProfile::Review,
+                PathBuf::from("/repo"),
+            )],
         );
         assert_eq!(listed["sessions"][0]["sessionId"], "legacy");
         assert_eq!(listed["sessions"][0]["capabilityProfile"], "review");
