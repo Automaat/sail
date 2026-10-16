@@ -13,7 +13,7 @@ import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
 import { taskCheckpointSchema } from './task-checkpoint.ts';
 import { taskEconomicsSchema, type TaskEconomics } from './task-economics.ts';
-import type { ContextHandoff } from './context-handoff.ts';
+import { pendingPhaseHandoff, type ContextHandoff } from './context-handoff.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
@@ -1033,6 +1033,8 @@ export function shipBlock(issue: ShipIssue): string | null {
 export function shipPullRequestReady(issue: ShipIssue): boolean {
   const ci = ciStatus(issue.checks);
   return (
+    issue.checkpoint?.status !== 'blocked' &&
+    !pendingPhaseHandoff(issue) &&
     !!issue.pullRequest &&
     issue.pullRequestState === 'OPEN' &&
     issue.pullRequestMergeable === true &&
@@ -1557,6 +1559,8 @@ const shipIssueSchema = z.object({
       z.object({
         id: z.string().min(1),
         provider: z.enum(['claude', 'codex', 'opencode']),
+        boundary: z.enum(['draft-published', 'before-pr-loop']).optional(),
+        brief: z.string().min(1).max(1999).optional(),
         fromThreadId: z.string().min(1),
         toThreadId: z.string().nullable(),
         context: z.number().min(0).max(100),

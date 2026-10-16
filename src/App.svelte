@@ -170,6 +170,7 @@
     shipOwnerReleaseReady,
     shipWorkerPrompt,
     parseMergeOwner,
+    mergeOwnerRule,
     type MergeOwner,
     shippingSetupAction,
     settledLostClaimFence,
@@ -206,6 +207,9 @@
   import {
     contextCheckpointLead,
     contextHandoffPrompt,
+    phaseHandoffRequest,
+    phaseHandoffPrompt,
+    pendingPhaseHandoff,
     contextPressureStage,
     parseContextHandoffThreshold,
     reconcileHandoffOutcomes,
@@ -3599,16 +3603,18 @@
         const settledRevision = await invoke<string>('working_tree_revision', { path: issue.path });
         if (issue.checkpoint.revision !== settledRevision)
           throw new Error('The settled checkpoint must match the current worktree revision.');
-        const prompt = contextHandoffPrompt({
-          checkpoint: issue.checkpoint,
-          branch: issue.branch,
-          revision: settledRevision,
-          pullRequest: issue.pullRequest,
-          gates: (issue.gates ?? []).map(
-            (gate) =>
-              `${gate.gate}: ${gate.verdict ?? gate.state}${gate.reason ? ` (${gate.reason})` : ''}`,
-          ),
-        });
+        const prompt = offer.brief
+          ? `${phaseHandoffPrompt(offer.brief)}\n${mergeOwnerRule(mergeOwner)}`
+          : contextHandoffPrompt({
+              checkpoint: issue.checkpoint,
+              branch: issue.branch,
+              revision: settledRevision,
+              pullRequest: issue.pullRequest,
+              gates: (issue.gates ?? []).map(
+                (gate) =>
+                  `${gate.gate}: ${gate.verdict ?? gate.state}${gate.reason ? ` (${gate.reason})` : ''}`,
+              ),
+            });
         saveSpawnReceipt({
           receiptId,
           accessKey,
@@ -3668,6 +3674,16 @@
               contextWindow: undefined,
               handoffRecoveryRequired: false,
               state: 'working',
+              blockedReason: null,
+              ...(offer.boundary && issue.checkpoint?.status === 'blocked'
+                ? {
+                    checkpoint: updateTaskCheckpoint(
+                      issue.checkpoint,
+                      { status: 'active', blocker: null },
+                      Date.now(),
+                    ),
+                  }
+                : {}),
               error: null,
               refreshError: null,
               workerSettled: false,
@@ -3769,6 +3785,39 @@
       }
     } finally {
       contextHandoffsInFlight.delete(offer.id);
+    }
+  }
+
+  async function startPhaseHandoff(run: ShipRun, issue: ShipIssue): Promise<void> {
+    const pending = pendingPhaseHandoff(issue);
+    if (
+      !pending ||
+      contextHandoffsInFlight.has(pending.id) ||
+      issue.checkpoint?.status === 'blocked' ||
+      issue.state !== 'working'
+    )
+      return;
+    try {
+      await handoffShipIssue(run, issue);
+    } catch (cause) {
+      const reason = `Phase handoff paused: ${describe(cause)}`;
+      await updateShipIssue(run, issue, {
+        blockedReason: reason,
+        error: reason,
+        ...(issue.checkpoint
+          ? {
+              checkpoint: updateTaskCheckpoint(
+                issue.checkpoint,
+                {
+                  status: 'blocked',
+                  blocker: reason,
+                  nextAction: 'Retry the pending phase handoff.',
+                },
+                Date.now(),
+              ),
+            }
+          : {}),
+      });
     }
   }
 
@@ -5667,6 +5716,10 @@
           spawnReceipts.find((item) => item.receiptId === replacement.receiptId) ?? replacement;
       }
     }
+    if (issue.state === 'working' && pendingPhaseHandoff(issue)) {
+      await startPhaseHandoff(run, issue);
+      return;
+    }
     if (issue.state === 'failed') {
       const currentReceipt =
         receipt && !shippingWorkerSettled(receipt.state)
@@ -7194,7 +7247,48 @@
           Date.now(),
           await cleanCheckpointCommit(request.directory, execution.revision),
         );
-        await updateShipIssue(owner.run, owner.issue, { checkpoint: updated });
+        const phaseHandoff = phaseHandoffRequest(
+          request.arguments.handoff,
+          updated,
+          owner.issue.contextHandoffs,
+          `${owner.run.id}:${owner.issue.id}`,
+        );
+        if (phaseHandoff && (sourceId !== owner.issue.threadId || !owner.issue.pullRequest))
+          throw new Error(
+            'Only the primary worker with a published PR can request a phase handoff.',
+          );
+        await updateShipIssue(owner.run, owner.issue, {
+          checkpoint: updated,
+          ...(phaseHandoff
+            ? {
+                contextHandoffs: [
+                  ...(owner.issue.contextHandoffs ?? []),
+                  {
+                    ...phaseHandoff,
+                    provider: contextProvider(sourceId),
+                    fromThreadId: sourceId,
+                    toThreadId: null,
+                    context: owner.issue.contextPercent ?? 0,
+                    compactions: 0,
+                    checkpointSequence: updated.sequence - 1,
+                    revision: updated.revision,
+                    offeredAt: Date.now(),
+                    startedAt: null,
+                    retriesBefore: owner.issue.retryCount ?? 0,
+                    lostStateFailuresBefore: owner.issue.lostStateFailures ?? 0,
+                    retriesAfter: null,
+                    lostStateFailuresAfter: null,
+                    outcome: 'pending' as const,
+                    error: null,
+                  },
+                ],
+              }
+            : {}),
+        });
+        if (phaseHandoff)
+          setTimeout(() => {
+            void startPhaseHandoff(owner.run, owner.issue);
+          }, 0);
       } else if (!owner.issue.checkpoint) {
         await updateShipIssue(owner.run, owner.issue, { checkpoint });
       }
