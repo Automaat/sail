@@ -1,3 +1,4 @@
+import { findThread, openThread } from './thread-navigation';
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
 import {
@@ -11,7 +12,8 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-async function openSidebarThreadWithin(title: string) {
+async function openPaletteThreadWithin(title: string) {
+  await findThread(title);
   await browser.execute((threadTitle) => {
     Reflect.set(window, '__switchStart', performance.now());
     const visible = () =>
@@ -22,8 +24,8 @@ async function openSidebarThreadWithin(title: string) {
       observer.disconnect();
     });
     observer.observe(document.body, { subtree: true, childList: true, characterData: true });
-    [...document.querySelectorAll<HTMLButtonElement>('.project-agent-row')]
-      .find((row) => row.getAttribute('aria-label')?.includes(threadTitle))
+    [...document.querySelectorAll<HTMLButtonElement>('.palette-entry[data-kind="thread"]')]
+      .find((row) => row.querySelector('strong')?.textContent === threadTitle)
       ?.click();
     if (visible()) {
       Reflect.set(window, '__switchVisible', performance.now());
@@ -37,9 +39,9 @@ async function openSidebarThreadWithin(title: string) {
   const result = await browser.execute(() => ({
     elapsed:
       Number(Reflect.get(window, '__switchVisible')) - Number(Reflect.get(window, '__switchStart')),
-    selected: document.querySelector('.project-agent-row.active')?.getAttribute('aria-label'),
+    selected: document.querySelector('.agent-header')?.textContent,
   }));
-  console.log('OpenCode ACP sidebar switch', { title, ...result });
+  console.log('OpenCode ACP session switch', { title, ...result });
   expect(result.selected).toContain(title);
   expect(result.elapsed).toBeLessThan(500);
   await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
@@ -113,22 +115,12 @@ describe('agent switching', () => {
         });
     }, sessions);
     await browser.refresh();
-    await expect($('.project-agent-row[aria-label*="OpenCode worker one"]')).toBeDisplayed();
-    await expect($('.project-agent-row[aria-label*="OpenCode worker two"]')).toBeDisplayed();
-    await expect($('.project-agent-row[aria-label*="OpenCode worker three"]')).toBeDisplayed();
-    await browser.waitUntil(
-      async () =>
-        browser.execute(() =>
-          [...document.querySelectorAll('.project-agent-row')]
-            .filter((row) => row.getAttribute('aria-label')?.includes('OpenCode worker'))
-            .every((row) => row.getAttribute('aria-label')?.includes('Working')),
-        ),
-      { timeoutMsg: 'OpenCode workers did not remain working before the sidebar timing check' },
-    );
+    await expect($('.project-default-worktree-select')).toBeDisplayed();
+    await expect($('.project-agent-row')).not.toExist();
 
-    await openSidebarThreadWithin(openCodeWorkers[0]);
-    await openSidebarThreadWithin(openCodeWorkers[1]);
-    await openSidebarThreadWithin(openCodeWorkers[2]);
+    await openPaletteThreadWithin(openCodeWorkers[0]);
+    await openPaletteThreadWithin(openCodeWorkers[1]);
+    await openPaletteThreadWithin(openCodeWorkers[2]);
     await browser.tauri.execute(
       async ({ core }, created) =>
         Promise.all(
@@ -167,12 +159,8 @@ function restarts(directory: string): number {
   return existsSync(file) ? Number(readFileSync(file, 'utf8')) : 0;
 }
 
-async function openThread(title: string) {
-  await $(`.project-agent-row[aria-label*="${title}"]`).click();
-  await expect($('.agent-header')).toHaveText(expect.stringContaining(title));
-}
-
 async function openLiveThreadWithin(title: string) {
+  await findThread(title);
   await browser.execute((threadTitle) => {
     Reflect.deleteProperty(window, '__liveSwitchVisible');
     const started = performance.now();
@@ -185,8 +173,8 @@ async function openLiveThreadWithin(title: string) {
       observer.disconnect();
     });
     observer.observe(document.body, { subtree: true, childList: true, characterData: true });
-    [...document.querySelectorAll<HTMLButtonElement>('.project-agent-row')]
-      .find((row) => row.getAttribute('aria-label')?.includes(threadTitle))
+    [...document.querySelectorAll<HTMLButtonElement>('.palette-entry[data-kind="thread"]')]
+      .find((row) => row.querySelector('strong')?.textContent === threadTitle)
       ?.click();
     if (visible()) {
       Reflect.set(window, '__liveSwitchVisible', performance.now() - started);
@@ -195,7 +183,7 @@ async function openLiveThreadWithin(title: string) {
   }, title);
   await browser.waitUntil(() => browser.execute(() => Reflect.has(window, '__liveSwitchVisible')));
   const elapsed = await browser.execute(() => Number(Reflect.get(window, '__liveSwitchVisible')));
-  console.log('Live Codex sidebar switch', { elapsedMs: elapsed });
+  console.log('Live Codex session switch', { elapsedMs: elapsed });
   expect(elapsed).toBeLessThan(500);
   await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
 }
@@ -309,7 +297,8 @@ describe('agent sessions survive thread switches', () => {
       [first, second, codex],
     );
     await browser.refresh();
-    await expect($('.project-agent-row[aria-label*="Continuity main"]')).toBeDisplayed();
+    await findThread('Continuity main');
+    await browser.keys('Escape');
   });
 
   after(async () => {
@@ -546,18 +535,16 @@ describe('agent sessions survive thread switches', () => {
     await openThread('Continuity main');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await sendPrompt('Live native subagent');
-    const child = '.project-agent-row[aria-label*="Inspect live delegation"]';
-    await expect($(child)).toHaveAttribute('aria-label', expect.stringContaining('Working'));
+    const child = '.spawn-response:has(.spawn-task[title="Inspect live delegation"])';
+    await expect($(child).$('.activity-status')).toHaveAttribute('data-state', 'working');
     await switchAwayAndBack('Continuity main', 'Continuity sibling', 2);
-    await expect($(child)).toHaveAttribute('aria-label', expect.stringContaining('Working'));
+    await expect($(child).$('.activity-status')).toHaveAttribute('data-state', 'working');
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Live subagent finished.'),
       { wait: 15_000 },
     );
     await switchAwayAndBack('Continuity main', 'Continuity sibling', 1);
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    const toggle = $('button[aria-label*="for Continuity main"]');
-    if (await toggle.isExisting()) await toggle.click();
     await expect($(child)).toBeDisplayed();
     expect(await $$(child).length).toBe(1);
     await expect($('.sidebar')).not.toHaveText(expect.stringContaining('Disconnected'));
@@ -697,9 +684,9 @@ describe('agent sessions survive thread switches', () => {
     await openThread('Continuity main');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await sendPrompt('Second live subagent');
-    const child = '.project-agent-row[aria-label*="Inspect second delegation"]';
-    await expect($(child)).toHaveAttribute('aria-label', expect.stringContaining('Working'));
-    await $(child).click();
+    const child = '.spawn-response:has(.spawn-task[title="Inspect second delegation"])';
+    await expect($(child).$('.activity-status')).toHaveAttribute('data-state', 'working');
+    await $(child).$('.spawn-response-open').click();
     await expect($('.agent-header')).toHaveText(
       expect.stringContaining('Inspect second delegation'),
     );

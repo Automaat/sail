@@ -1,3 +1,4 @@
+import { findThread, openThread } from './thread-navigation';
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -96,18 +97,20 @@ describe('OpenCode in the ACP pane', () => {
     expect(migrated.receipts).toContain('acp:opencode:ses_outside_2');
     expect(migrated.receipts).not.toContain('"opencode:ses_outside_2"');
 
-    await browser.waitUntil(async () => (await $$('.project-agent-row')).length >= 3, {
-      timeoutMsg: 'paged OpenCode sessions did not all reach the sidebar',
-    });
-    await Promise.all(
-      ['Started in terminal', 'Second outside', 'Third outside'].map((title) =>
-        expect($(`.project-agent-row[aria-label*="${title}"]`)).toBeDisplayed(),
-      ),
-    );
+    await chooseTopbarAction('More actions', 'Switch thread');
+    const search = $('[aria-label="Search command palette"]');
+    await search.setValue('OpenCode');
+    await browser.keys('Enter');
+    await expect($$('.palette-entry[data-kind="thread"]')).toBeElementsArrayOfSize(3);
+    await expect($('.command-palette')).toHaveText(expect.stringContaining('Started in terminal'));
+    await expect($('.command-palette')).toHaveText(expect.stringContaining('Second outside'));
+    await expect($('.command-palette')).toHaveText(expect.stringContaining('Third outside'));
+    await browser.keys('Escape');
+    await expect($('.project-agent-row')).not.toExist();
   });
 
   it('switches the pane on click and keeps a Sail-local rename', async () => {
-    await $('.project-agent-row[aria-label*="Third outside"]').click();
+    await openThread('Third outside');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Third outside'));
     await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
     await expect($('.agent-error')).not.toExist();
@@ -118,15 +121,21 @@ describe('OpenCode in the ACP pane', () => {
     await title.setValue('Renamed in Sail');
     await $('.rename-session-dialog button[type="submit"]').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Renamed in Sail'));
-    await expect($('.project-agent-row[aria-label*="Renamed in Sail"]')).toBeDisplayed();
+    await findThread('Renamed in Sail');
+    await browser.keys('Escape');
 
     await browser.refresh();
-    await expect($('.project-agent-row[aria-label*="Renamed in Sail"]')).toBeDisplayed();
-    await expect($('.project-agent-row[aria-label*="Third outside"]')).not.toExist();
+    await chooseTopbarAction('More actions', 'Switch thread');
+    const search = $('[aria-label="Search command palette"]');
+    await search.setValue('OpenCode');
+    await browser.keys('Enter');
+    await expect($('.command-palette')).toHaveText(expect.stringContaining('Renamed in Sail'));
+    await expect($('.command-palette')).not.toHaveText(expect.stringContaining('Third outside'));
+    await browser.keys('Escape');
   });
 
   it('lists each OpenCode session once in the Switch thread palette after opening it', async () => {
-    await $('.project-agent-row[aria-label*="Second outside"]').click();
+    await openThread('Second outside');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Second outside'));
     await chooseTopbarAction('More actions', 'Switch thread');
     const search = $('[aria-label="Search command palette"]');

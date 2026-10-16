@@ -77,7 +77,7 @@ function activateFocused() {
   });
 }
 
-describe('keyboard activation of the palette, thread menu and shortcut sheet', () => {
+describe('keyboard activation of the palette, repository menu and shortcut sheet', () => {
   let repository = '';
 
   before(async () => {
@@ -123,9 +123,9 @@ describe('keyboard activation of the palette, thread menu and shortcut sheet', (
     await expect($('.command-palette[open]')).not.toExist();
   });
 
-  it('keeps the sidebar thread menu button keyboard-ready and opens the menu', async () => {
+  it('keeps the sidebar repository menu button keyboard-ready and opens the menu', async () => {
     expect(
-      await keyboardReadiness('.project-agent-menu[aria-label="Manage thread Keyboard thread"]'),
+      await keyboardReadiness('.project-repository-row .project-icon-button:last-child'),
     ).toEqual(ready);
     await activateFocused();
     await expect($('.project-menu[role="menu"]')).toBeDisplayed();

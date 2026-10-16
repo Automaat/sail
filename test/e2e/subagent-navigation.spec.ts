@@ -95,7 +95,7 @@ describe('subagent navigation and control', () => {
     await expect($('.spawn-permission')).toBeDisplayed();
   }
 
-  it('lists a cross-worktree child as a reference row under its parent', async () => {
+  it('keeps cross-worktree child references out of the worktree list', async () => {
     const parentPath = realpathSync(repository);
     const childPath = realpathSync(other);
     await browser.execute(
@@ -143,14 +143,11 @@ describe('subagent navigation and control', () => {
     );
     await browser.refresh();
     await browser.pause(2000);
-    const reference = $('.project-agent-row[data-reference]');
-    await expect(reference).toBeDisplayed();
-    await expect(reference).toHaveText(expect.stringContaining('in worktree'));
-    await expect($$('.project-agent-row[data-depth="1"]')[0]).toBeDisplayed();
-    await expect($('.project-agent-descendants')).toHaveText('(+1)');
-    await expect($('.project-agent-origin')).toHaveText(
-      expect.stringContaining('spawned by Planner'),
-    );
+    await expect($('.project-default-worktree-select')).toBeDisplayed();
+    await expect($$('.project-default-worktree-select')).toBeElementsArrayOfSize(2);
+    await expect($('.project-agent-row')).not.toExist();
+    await expect($('.project-agent-list')).not.toExist();
+    await expect($('.sidebar')).not.toHaveText(expect.stringContaining('Reviewer'));
   });
 
   it('answers a child permission inline from the parent and shows it answered', async () => {
@@ -277,10 +274,7 @@ describe('subagent navigation and control', () => {
         return Math.round(note.getBoundingClientRect().left - prompt.getBoundingClientRect().left);
       }),
     ).toBe(16);
-    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
-      'data-state',
-      'waiting',
-    );
+    await expect($('.agent-header .activity-status')).not.toHaveAttribute('data-state', 'waiting');
     await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
     await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
     expect(await answerOutsideUi(request, 'allow')).toContain('no longer pending');
@@ -313,17 +307,11 @@ describe('subagent navigation and control', () => {
     expect(await answerOutsideUi(request, 'allow')).toBe('ok');
     await expect($('.agent-permission-answered')).toHaveText(expect.stringContaining('Answered'));
     await expect($('[data-topbar-inbox]')).toHaveText('Inbox (1)');
-    await expect($('.project-agent-row[data-depth="1"] .activity-status')).toHaveAttribute(
-      'data-state',
-      'waiting',
-    );
+    await expect($('.agent-header .activity-status')).toHaveAttribute('data-state', 'waiting');
     await expect($('.agent-status-bar')).toHaveText(expect.stringContaining('1 need attention'));
     await $('.elicitation').$('button=Decline').click();
     await expect($('.elicitation')).not.toExist();
-    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
-      'data-state',
-      'waiting',
-    );
+    await expect($('.agent-header .activity-status')).not.toHaveAttribute('data-state', 'waiting');
     await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
     await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
   });
@@ -334,10 +322,7 @@ describe('subagent navigation and control', () => {
     const request = await childRequest();
     expect(await answerOutsideUi(request, 'allow')).toBe('ok');
     await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
-    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
-      'data-state',
-      'waiting',
-    );
+    await expect($('.agent-header .activity-status')).not.toHaveAttribute('data-state', 'waiting');
     await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
   });
 
@@ -374,10 +359,7 @@ describe('subagent navigation and control', () => {
     expect(await browser.execute(() => Reflect.get(window, '__sailPendingInboxFailures')())).toBe(
       2,
     );
-    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
-      'data-state',
-      'waiting',
-    );
+    await expect($('.agent-header .activity-status')).not.toHaveAttribute('data-state', 'waiting');
     await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
   });
 });

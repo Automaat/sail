@@ -269,9 +269,11 @@ describe('palette actions and accessibility', () => {
     await expect($('.shortcuts-dialog[open]')).not.toExist();
   });
 
-  it('puts every sidebar thread menu in the tab order and opens it with focus inside', async () => {
+  it('puts every sidebar repository menu in the tab order and opens it with focus inside', async () => {
     const reachable = await browser.execute(() => {
-      const button = document.querySelector<HTMLButtonElement>('.project-agent-menu');
+      const button = document.querySelector<HTMLButtonElement>(
+        '.project-repository-row .project-icon-button:last-child',
+      );
       if (!button) return null;
       button.focus();
       return {
@@ -286,11 +288,13 @@ describe('palette actions and accessibility', () => {
       focused: true,
       disabled: false,
       tabIndex: 0,
-      name: 'Manage thread Accessibility thread',
+      name: expect.stringMatching(/^Manage sail-a11y-repo-/),
       popup: 'menu',
     });
     await browser.execute(() =>
-      document.querySelector<HTMLButtonElement>('.project-agent-menu')?.click(),
+      document
+        .querySelector<HTMLButtonElement>('.project-repository-row .project-icon-button:last-child')
+        ?.click(),
     );
     await expect($('.project-menu[role="menu"]')).toBeDisplayed();
     await browser.waitUntil(() =>

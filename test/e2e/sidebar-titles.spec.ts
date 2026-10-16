@@ -4,7 +4,7 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-describe('sidebar agent rows', () => {
+describe('worktree-only sidebar', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-sidebar-titles-'));
   const other = mkdtempSync(join(tmpdir(), 'sail-sidebar-reference-'));
 
@@ -19,7 +19,7 @@ describe('sidebar agent rows', () => {
     rmSync(other, { recursive: true, force: true });
   });
 
-  it('shows agent icons without provider names or thread descriptions', async () => {
+  it('keeps native children, nested children and cross-worktree references out of the worktree list', async () => {
     await browser.setWindowSize(1280, 850);
     await browser.execute(
       (path: string, otherPath: string) => {
@@ -101,44 +101,15 @@ describe('sidebar agent rows', () => {
       realpathSync(other),
     );
     await browser.refresh();
-    await expect($('.project-agent-row.subagent')).toBeDisplayed();
-    expect(await $$('.project-agent-row .activity-status').length).toBeGreaterThan(1);
-
-    const rows = await browser.execute(() =>
-      [...document.querySelectorAll<HTMLElement>('.project-agent-row')].map((row) => ({
-        provider: row.querySelector('.project-agent-provider')?.textContent?.trim() ?? '',
-        subagent: !!row.querySelector('.project-subagent-tag'),
-        title: row.querySelector('.project-agent-title')?.textContent?.trim() ?? '',
-        status: row.querySelector<HTMLElement>('.activity-status')?.offsetWidth ?? 0,
-      })),
-    );
-    expect(rows.length).toBeGreaterThanOrEqual(4);
-    expect(rows.map((row) => row.provider)).toContain('↳Subagent');
-    expect(rows.every((row) => row.title === '' && row.status > 0)).toBe(true);
-    await expect($('.project-agent-row[data-depth="2"]')).toBeDisplayed();
-    await expect($('.project-agent-row[data-reference="true"]')).toBeDisplayed();
-    const longStatus = $('.project-agent-row[aria-label*="4 active, 3 waiting"]');
-    await expect(longStatus).toBeDisplayed();
-    expect(await longStatus.getAttribute('data-depth')).toBe('1');
-    await expect(longStatus.$('.project-subagent-tag')).toHaveText('Subagent');
-    const visibleStart = await longStatus.execute((row) => {
-      const provider = row.querySelector<HTMLElement>('.project-agent-provider')!;
-      const tag = row.querySelector<HTMLElement>('.project-subagent-tag')!;
-      const status = row.querySelector<HTMLElement>('.activity-status')!;
-      const providerRect = provider.getBoundingClientRect();
-      const tagRect = tag.getBoundingClientRect();
-      const statusRect = status.getBoundingClientRect();
-      return {
-        providerWidth: providerRect.width,
-        tagVisible: tagRect.left >= providerRect.left && tagRect.left < providerRect.right,
-        statusWidth: statusRect.width,
-        rowWidth: row.getBoundingClientRect().width,
-        gap: statusRect.left - providerRect.left,
-      };
-    });
-    expect(visibleStart.providerWidth).toBeGreaterThan(20);
-    expect(visibleStart.tagVisible).toBe(true);
-    expect(visibleStart.statusWidth).toBeLessThanOrEqual(visibleStart.rowWidth / 2);
-    expect(visibleStart.gap).toBeGreaterThan(20);
+    await expect($$('.project-default-worktree-select')).toBeElementsArrayOfSize(2);
+    await expect($('.project-agent-row')).not.toExist();
+    await expect($('.project-agent-list')).not.toExist();
+    await expect($('.project-agent-history')).not.toExist();
+    await expect($('.sidebar')).not.toHaveText(expect.stringContaining('Subagent'));
+    await expect($('.project-default-worktree-select')).not.toHaveAttribute('aria-expanded');
+    await $('.project-default-worktree-select').click();
+    await expect($('.project-agent-row')).not.toExist();
+    await browser.refresh();
+    await expect($('.project-agent-row')).not.toExist();
   });
 });

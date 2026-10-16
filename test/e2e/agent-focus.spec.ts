@@ -58,8 +58,7 @@ describe('reported agent focus', () => {
     );
     await expect($('.task-card-focus time')).toExist();
     await $('.task-card-focus').click();
-    await $('.project-agent-menu').click();
-    await $('[role="menuitem"]*=Remove from sidebar').click();
+    await expect($('.project-agent-row')).not.toExist();
     await $('.agent-status-summary').click();
     await expect($('.agent-status-popover [data-focus-source="Agent report"]')).toHaveText(
       expect.stringContaining('Test live tasks'),
@@ -71,7 +70,7 @@ describe('reported agent focus', () => {
       { timeout: 25_000 },
     );
   });
-  it('retains current Tasks focus when the working session is hidden and reopened through Agents', async () => {
+  it('retains current Tasks focus when the working session is reopened through Agents', async () => {
     await $('.agent-composer [data-pane-prompt]').setValue('Report session focus');
     const send = $('.agent-actions button:last-child');
     await send.waitForEnabled();
@@ -83,8 +82,7 @@ describe('reported agent focus', () => {
     const reportedAt = await panel.$('time').getAttribute('datetime');
     const storedReport = await browser.execute(() => localStorage.getItem('sai-session-tasks'));
     expect(storedReport).toBeTruthy();
-    await $('.project-agent-menu').click();
-    await $('[role="menuitem"]*=Remove from sidebar').click();
+    await expect($('.project-agent-row')).not.toExist();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
     await expect(panel.$('[data-focus-source="Agent report"]')).toHaveText(
       expect.stringContaining('Test live tasks'),

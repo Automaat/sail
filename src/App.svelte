@@ -11953,14 +11953,6 @@
     return true;
   }
 
-  async function selectSidebarThread(key: string) {
-    try {
-      if (!(await jumpToRecentThread(key)) && jumpFailure) error = jumpFailure;
-    } catch (cause) {
-      error = describe(cause);
-    }
-  }
-
   async function openShipTarget(path: string, threadId?: string | null, prefill?: string | null) {
     try {
       await invoke('validate_repository', { path });
@@ -14336,12 +14328,6 @@
         {directory}
         disabled={!agentAvailability.some((agent) => agent.available)}
         agents={agentAvailability}
-        threads={sidebarThreads}
-        attention={threadAttention}
-        openCodeOutcomes={sidebarOpenCodeOutcomes}
-        spawnReceipts={navigableReceipts}
-        {acpActivityReady}
-        selectedThread={focusedThreadKey()}
         worktreeDialogRequest={paletteWorktreeRequest}
         {worktreeCreations}
         {worktreeDeletions}
@@ -14356,9 +14342,6 @@
         }}
         onadoptworktree={(repository, worktree) => void adoptExternalWorktree(repository, worktree)}
         onselectdefault={(path) => void selectDefaultWorktree(path)}
-        onselectthread={(key) => void selectSidebarThread(key)}
-        onremovethread={removeSidebarThread}
-        oncopied={() => void announceCopied(null)}
         onaddrepository={(groupID) => void chooseProject(groupID)}
         onaddgroup={addProjectGroup}
         onrenamegroup={renameProjectGroup}

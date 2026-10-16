@@ -38,11 +38,11 @@ suite(`real native child Tasks (${provider ?? 'requires explicit provider enviro
       'Test native child session task identity. Do not edit files, use terminal tools, inspect credentials, or access network services. First call Sail sail_tasks_read and sail_tasks_report for your own parent-only task, title Parent task identity, status done, focus null, with the current turnId and expectedRevision. Then spawn exactly one native child using your provider native subagent tool, not sail agent_spawn. Child prompt: Call Sail sail_tasks_read. If available, report child-only, title Child task identity, status in_progress, focus child-only with the read turnId/revision. Read again, then attempt one report with turnId stale-child-turn, the fresh expectedRevision, and a negative-only task title Rejected stale child report. Require an explicit different-turn error. Read again and verify negative-only is absent, then update child-only to done, focus null. Include the tool error in your final response. If identity or tools are unavailable, report the precise limitation in your final response and do not report through the parent. Wait for the child to finish. Do not make task calls on behalf of the child. Reply Native child identity check complete.',
     );
     await $('.agent-actions button:last-child').click();
-    await expect($('.project-agent-row[data-depth="1"]')).toBeDisplayed();
+    await expect($('.spawn-response-open, .spawn-open')).toBeDisplayed();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Native child identity check complete'),
     );
-    await $('.project-agent-row[data-depth="1"]').click();
+    await $('.spawn-response-open, .spawn-open').click();
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
     await $('button[role="tab"]*=Tasks').click();
     const panel = $('#session-details [aria-label="Session tasks"]');

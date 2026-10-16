@@ -551,11 +551,10 @@ describe('ACP agent threads', () => {
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
     await $('.agent-composer [data-pane-prompt]').setValue('Native subagents');
     await $(sendButton).click();
-    await expect($('button[aria-label*="for Native subagents"]')).toHaveText(
-      expect.stringContaining('1 historical'),
-    );
-    await $('button[aria-label*="for Native subagents"]').click();
-    await expect($('.sidebar')).toHaveText(expect.stringContaining('Inspect native delegation'));
+    await expect(
+      $('.spawn-response-open[aria-label*="Inspect native delegation"]'),
+    ).toBeDisplayed();
+    await expect($('.project-agent-row')).not.toExist();
     // The child's result shows on its subagent card; its transcript stays out of the parent's.
     expect(
       await browser.execute(() => {
@@ -570,28 +569,21 @@ describe('ACP agent threads', () => {
       }),
     ).toMatch(/^card(,card)*$/);
 
-    await $(
-      "//button[contains(@class,'project-agent-row') and contains(.,'Inspect native delegation')]",
-    ).click();
+    await $('.spawn-response-open[aria-label*="Inspect native delegation"]').click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Child transcript stays separate.'),
     );
-    await expect($('button[aria-label*="for Inspect native delegation"]')).toHaveText(
-      expect.stringContaining('1 historical'),
-    );
-    await $('button[aria-label*="for Inspect native delegation"]').click();
-    await expect($('.sidebar')).toHaveText(expect.stringContaining('Inspect nested delegation'));
+    await expect(
+      $('.spawn-response-open[aria-label*="Inspect nested delegation"]'),
+    ).toBeDisplayed();
 
     await browser.refresh();
     await selectClaudeThread('Native subagents');
-    await expect($('button[aria-label*="for Native subagents"]')).toHaveText(
-      expect.stringContaining('1 historical'),
-    );
-    await $('button[aria-label*="for Native subagents"]').click();
-    await expect($('.sidebar')).toHaveText(expect.stringContaining('Inspect native delegation'));
-    await $(
-      "//button[contains(@class,'project-agent-row') and contains(.,'Inspect native delegation')]",
-    ).click();
+    await expect(
+      $('.spawn-response-open[aria-label*="Inspect native delegation"]'),
+    ).toBeDisplayed();
+    await expect($('.project-agent-row')).not.toExist();
+    await $('.spawn-response-open[aria-label*="Inspect native delegation"]').click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Child transcript stays separate.'),
     );
