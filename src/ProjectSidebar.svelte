@@ -1,30 +1,10 @@
 <script lang="ts">
-  import { locationName } from './lib/command-palette';
   import { checkState } from './lib/pull-request-checks';
-  import { onMount, tick, untrack } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import PathPicker from './PathPicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
-  import ActivityStatus from './ActivityStatus.svelte';
-  import type { AgentAvailability, AgentThread } from './lib/acp';
-  import type { AttentionMap, ThreadStatus } from './lib/attention';
-  import { activityState } from './lib/activity-state';
-  import { threadKey } from './lib/recent-threads';
-  import {
-    advanceFailedChildNotices,
-    failedChildCount,
-    failedChildLabel,
-    openedFailedChildren,
-    sidebarThreadRows,
-    sidebarThreadStatus,
-    type FailedChildNotices,
-  } from './lib/sidebar-agents';
-  import {
-    isSubagentThread,
-    receiptSourceId,
-    runningSubagentsForSource,
-    type SpawnReceipt,
-  } from './lib/agent-results';
+  import type { AgentAvailability } from './lib/acp';
   import type { ProjectCatalog, ProjectWorktree, WorktreeCreation } from './lib/projects';
   import {
     externalGitWorktrees,
@@ -60,13 +40,7 @@
     directory: string;
     disabled: boolean;
     agents: AgentAvailability[];
-    threads: Record<string, AgentThread[]>;
-    attention: AttentionMap;
-    openCodeOutcomes: Record<string, ThreadStatus>;
-    spawnReceipts: SpawnReceipt[];
-    acpActivityReady: boolean;
     compact?: boolean;
-    selectedThread: string | null;
     worktreeDialogRequest: { id: string; path: string; fromPalette: boolean } | null;
     worktreeCreations: WorktreeCreation[];
     worktreeDeletions: Record<string, string>;
@@ -77,9 +51,6 @@
     onselect: (path: string) => void;
     onadoptworktree: (repository: string, worktree: ProjectWorktree) => void;
     onselectdefault: (path: string) => void;
-    onselectthread: (key: string) => void;
-    onremovethread: (thread: AgentThread) => void;
-    oncopied: () => void;
     onaddrepository: (groupID: string | null) => void;
     onaddgroup: (name: string) => void;
     onrenamegroup: (id: string, name: string) => void;
@@ -117,8 +88,7 @@
   type MenuTarget =
     | { kind: 'group'; id: string; name: string }
     | { kind: 'repository'; path: string; groupID: string | null }
-    | { kind: 'worktree'; repository: string; worktree: ProjectWorktree }
-    | { kind: 'agent'; thread: AgentThread };
+    | { kind: 'worktree'; repository: string; worktree: ProjectWorktree };
 
   let {
     catalog,
@@ -126,12 +96,6 @@
     directory,
     disabled,
     agents,
-    threads,
-    attention,
-    openCodeOutcomes,
-    spawnReceipts,
-    acpActivityReady,
-    selectedThread,
     worktreeDialogRequest,
     worktreeCreations,
     worktreeDeletions,
@@ -142,9 +106,6 @@
     onselect,
     onadoptworktree,
     onselectdefault,
-    onselectthread,
-    onremovethread,
-    oncopied,
     onaddrepository,
     onaddgroup,
     onrenamegroup,
@@ -166,7 +127,6 @@
   let addGroupButton: HTMLButtonElement;
   let groupNameInput = $state<HTMLInputElement>();
   let menu = $state<MenuTarget | null>(null);
-  let copyError = $state(false);
   let menuElement = $state<HTMLDivElement>();
   let menuX = $state(0);
   let menuY = $state(0);
@@ -222,129 +182,12 @@
   let sendingCheck = $state<string | null>(null);
   let checking = false;
   let collapsedRepositoryPaths = $derived(new Set(catalog.collapsedRepositories ?? []));
-  const collapsedAgentPathsSetting = 'sai-collapsed-agent-worktrees';
-  let collapsedAgentPaths = $state<string[]>(loadCollapsedAgentPaths());
-  let expandedHistoricalParents = $state<string[]>([]);
-  let failedChildNotices = $state<FailedChildNotices>({});
-
-  function loadCollapsedAgentPaths(): string[] {
-    try {
-      const saved: unknown = JSON.parse(getSetting(collapsedAgentPathsSetting) ?? '[]');
-      return Array.isArray(saved)
-        ? saved.filter((path): path is string => typeof path === 'string')
-        : [];
-    } catch {
-      return [];
-    }
-  }
-
-  function agentListCollapsed(path: string): boolean {
-    return collapsedAgentPaths.includes(path);
-  }
-
-  function setAgentListCollapsed(path: string, collapsed: boolean) {
-    collapsedAgentPaths = collapsed
-      ? [...collapsedAgentPaths, path]
-      : collapsedAgentPaths.filter((item) => item !== path);
-    setSetting(collapsedAgentPathsSetting, JSON.stringify(collapsedAgentPaths));
-  }
-
-  function selectAgentWorktree(path: string, select: () => void) {
-    const selected = path === directory;
-    select();
-    if (!threads[path]?.length) return;
-    if (selected) setAgentListCollapsed(path, !agentListCollapsed(path));
-    else if (agentListCollapsed(path)) setAgentListCollapsed(path, false);
-  }
-
-  function agentListID(path: string): string {
-    return `project-agents-${encodeURIComponent(path)}`;
-  }
-
   function repositoryCollapsed(path: string): boolean {
     return collapsedRepositoryPaths.has(path);
   }
 
   function repositoryWorktreesID(path: string): string {
     return `project-worktrees-${encodeURIComponent(path)}`;
-  }
-
-  function threadStatus(thread: AgentThread): ThreadStatus | null {
-    return sidebarThreadStatus(
-      thread,
-      attention,
-      openCodeOutcomes,
-      acpActivityReady,
-      spawnReceipts,
-    );
-  }
-
-  $effect(() => {
-    const parents = Object.values(threads).flat();
-    const busy = (sourceId: string, parentDirectory: string) => {
-      const parent = parents.find(
-        (thread) =>
-          thread.directory === parentDirectory &&
-          receiptSourceId(thread.agent, thread.sessionId) === sourceId,
-      );
-      const status = parent ? threadStatus(parent) : null;
-      return status === 'working' || status === 'waiting';
-    };
-    const selected = parents.find((thread) => threadKey(thread) === selectedThread) ?? null;
-    const previous = untrack(() => failedChildNotices);
-    const next = advanceFailedChildNotices(
-      previous,
-      spawnReceipts,
-      busy,
-      openedFailedChildren(spawnReceipts, selected),
-    );
-    if (next !== previous) failedChildNotices = next;
-  });
-
-  function failedChildren(thread: AgentThread): number {
-    return failedChildCount(
-      failedChildNotices,
-      spawnReceipts,
-      receiptSourceId(thread.agent, thread.sessionId),
-      thread.directory,
-    );
-  }
-
-  function subagentCounts(thread: AgentThread): { active: number; waiting: number } {
-    const children = runningSubagentsForSource(
-      spawnReceipts,
-      receiptSourceId(thread.agent, thread.sessionId),
-      thread.directory,
-    );
-    return {
-      active: children.filter((child) => child.state === 'working').length,
-      waiting: children.filter((child) => child.state === 'waiting').length,
-    };
-  }
-
-  function subagentThread(thread: AgentThread): boolean {
-    return isSubagentThread(
-      spawnReceipts,
-      receiptSourceId(thread.agent, thread.sessionId),
-      thread.directory,
-    );
-  }
-
-  function toggleHistoricalChildren(thread: AgentThread) {
-    const key = threadKey(thread);
-    expandedHistoricalParents = expandedHistoricalParents.includes(key)
-      ? expandedHistoricalParents.filter((item) => item !== key)
-      : [...expandedHistoricalParents, key];
-  }
-
-  function statusLabel(status: ThreadStatus | null): string {
-    return activityState(status).label;
-  }
-
-  function providerName(thread: AgentThread): string {
-    return thread.agent === 'opencode'
-      ? 'OpenCode'
-      : (agents.find((agent) => agent.id === thread.agent)?.name ?? thread.agent);
   }
 
   function hasActionsLog(url: string) {
@@ -518,13 +361,8 @@
     return externalWorktrees(repository).some((worktree) => worktree.path === path);
   }
 
-  function railLocations(path: string): string[] {
-    return repositoryCollapsed(path) ? [] : [path, ...railWorktrees(path).map((w) => w.path)];
-  }
-
   function closeMenu(restoreFocus = false) {
     menu = null;
-    copyError = false;
     if (restoreFocus) menuTrigger?.focus();
     menuTrigger = null;
   }
@@ -532,7 +370,6 @@
   function menuKey(target: MenuTarget) {
     if (target.kind === 'group') return `group:${target.id}`;
     if (target.kind === 'repository') return `repository:${target.path}`;
-    if (target.kind === 'agent') return `agent:${threadKey(target.thread)}`;
     return `worktree:${target.worktree.path}`;
   }
 
@@ -544,7 +381,6 @@
       return;
     }
     menu = target;
-    copyError = false;
     menuTrigger =
       trigger ??
       (event.target instanceof Element ? event.target.closest<HTMLElement>('button') : null);
@@ -573,16 +409,6 @@
             ? (index + 1) % items.length
             : (index - 1 + items.length) % items.length;
     items[next].focus();
-  }
-
-  async function copySessionId(thread: AgentThread) {
-    try {
-      await navigator.clipboard.writeText(thread.sessionId);
-      closeMenu();
-      oncopied();
-    } catch {
-      copyError = true;
-    }
   }
 
   function repositoryName(path: string) {
@@ -899,92 +725,6 @@
   {/each}
 {/snippet}
 
-{#snippet agentRows(path: string)}
-  {#if threads[path]?.length}
-    <div
-      class="project-agent-list"
-      id={agentListID(path)}
-      aria-label={`Agent threads in ${path}`}
-      hidden={agentListCollapsed(path)}
-    >
-      {#each sidebarThreadRows(threads[path], spawnReceipts, expandedHistoricalParents, Object.values(threads).flat()) as row (row.key)}
-        {@const thread = row.thread}
-        {@const key = threadKey(thread)}
-        {@const status = threadStatus(thread)}
-        {@const child = subagentThread(thread) || row.reference}
-        {@const childCounts = subagentCounts(thread)}
-        {@const failed = failedChildren(thread)}
-        {@const childSummary = [
-          childCounts.active ? `${childCounts.active} active` : '',
-          childCounts.waiting ? `${childCounts.waiting} waiting` : '',
-          failed ? failedChildLabel(failed) : '',
-        ]
-          .filter(Boolean)
-          .join(', ')}
-        {@const selectable = agents.some((agent) => agent.id === thread.agent && agent.available)}
-        <div
-          class="project-agent-line"
-          style:margin-left={`${row.depth * 12}px`}
-          style:width={`calc(100% - ${row.depth * 12}px)`}
-        >
-          <button
-            class:active={selectedThread === key && !row.reference}
-            class:subagent={child}
-            class="project-agent-row"
-            class:reference={row.reference}
-            class:nested={row.depth > 0}
-            data-depth={row.depth}
-            data-reference={row.reference || undefined}
-            aria-current={selectedThread === key && !row.reference ? 'page' : undefined}
-            aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}${row.reference ? `, in worktree ${locationName(thread.directory)}` : ''}, ${statusLabel(status)}${childSummary ? `, subagents: ${childSummary}` : ''}`}
-            title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
-            aria-disabled={!selectable}
-            oncontextmenu={(event) => openMenu({ kind: 'agent', thread }, event)}
-            onmousedown={(event) => {
-              if (event.button === 2) void openMenu({ kind: 'agent', thread }, event);
-            }}
-            onclick={() => {
-              if (selectable) onselectthread(key);
-            }}
-          >
-            <span class="project-agent-provider"
-              >{#if child}<span aria-hidden="true">↳</span>{/if}<HarnessIcon
-                agent={thread.agent}
-                size={13}
-              />{#if child}<span class="project-subagent-tag">Subagent</span>{/if}</span
-            >
-            <ActivityStatus
-              {status}
-              label={childSummary
-                ? `${statusLabel(status)} · ${childSummary}`
-                : statusLabel(status)}
-              compact
-            />
-          </button>
-          <button
-            class="project-icon-button project-agent-menu"
-            aria-label={`Manage ${child ? 'subagent' : 'thread'} ${thread.title}`}
-            aria-haspopup="menu"
-            aria-expanded={menu?.kind === 'agent' && threadKey(menu.thread) === key}
-            onclick={(event) => openMenu({ kind: 'agent', thread }, event, event.currentTarget)}
-            >⋯</button
-          >
-        </div>
-        {#if row.historicalChildren}<button
-            class="project-agent-history"
-            style:margin-left={`${(row.depth + 1) * 12}px`}
-            aria-expanded={row.historicalExpanded}
-            aria-label={`${row.historicalExpanded ? 'Collapse' : 'Show'} ${row.historicalChildren} historical subagent${row.historicalChildren === 1 ? '' : 's'} for ${thread.title}`}
-            onclick={() => toggleHistoricalChildren(thread)}
-            >{row.historicalExpanded ? '▾' : '▸'}
-            {row.historicalExpanded ? 'Hide' : 'Show'}
-            {row.historicalChildren} historical</button
-          >{/if}
-      {/each}
-    </div>
-  {/if}
-{/snippet}
-
 {#snippet railRepository(path: string)}
   <button
     class="rail-repository"
@@ -1006,25 +746,6 @@
           : onselect(worktree.path)}
       ><span aria-hidden="true">⑂{worktree.branch.charAt(0)}</span></button
     >
-  {/each}
-  {#each railLocations(path) as location (location)}
-    {#each threads[location] ?? [] as thread (threadKey(thread))}
-      {@const status = threadStatus(thread)}
-      {@const state = activityState(status)}
-      {@const key = threadKey(thread)}
-      <button
-        class="rail-thread"
-        class:active={selectedThread === key}
-        data-state={state.state}
-        aria-current={selectedThread === key ? 'page' : undefined}
-        aria-label={`${providerName(thread)}: ${thread.title}, ${statusLabel(status)}`}
-        title={`${providerName(thread)} · ${thread.title} · ${statusLabel(status)}`}
-        onclick={() => onselectthread(key)}
-      >
-        <HarnessIcon agent={thread.agent} size={20} />
-        <span class="rail-thread-state" aria-hidden="true">{state.icon}</span>
-      </button>
-    {/each}
   {/each}
 {/snippet}
 
@@ -1229,17 +950,12 @@
                     class="project-worktree-select project-default-worktree-select"
                     aria-label={`Open default worktree for ${repositoryName(path)}`}
                     aria-current={path === directory ? 'page' : undefined}
-                    aria-expanded={threads[path]?.length ? !agentListCollapsed(path) : undefined}
-                    aria-controls={threads[path]?.length ? agentListID(path) : undefined}
                     title={path}
                     {disabled}
-                    onclick={() => selectAgentWorktree(path, () => onselectdefault(path))}
-                    ><span aria-hidden="true"
-                      >{threads[path]?.length ? (agentListCollapsed(path) ? '▸' : '▾') : ''}</span
+                    onclick={() => onselectdefault(path)}
                     ><span aria-hidden="true">⑂</span><span>Default</span></button
                   >
                 </div>
-                {@render agentRows(path)}
                 {#each worktreeAncestry(catalog, path, registeredWorktrees[path] ?? []) as row (row.worktree.path)}
                   {@const worktree = row.worktree}
                   <div
@@ -1258,12 +974,6 @@
                       class="project-worktree-select"
                       style:padding-left={`${32 + row.depth * 16}px`}
                       aria-current={worktree.path === directory ? 'page' : undefined}
-                      aria-expanded={threads[worktree.path]?.length
-                        ? !agentListCollapsed(worktree.path)
-                        : undefined}
-                      aria-controls={threads[worktree.path]?.length
-                        ? agentListID(worktree.path)
-                        : undefined}
                       title={worktree.path}
                       disabled={disabled ||
                         !!worktreeDeletions[worktree.path] ||
@@ -1276,14 +986,7 @@
                         )
                           void openMenu({ kind: 'worktree', repository: path, worktree }, event);
                       }}
-                      onclick={() =>
-                        selectAgentWorktree(worktree.path, () => onselect(worktree.path))}
-                      ><span aria-hidden="true"
-                        >{threads[worktree.path]?.length
-                          ? agentListCollapsed(worktree.path)
-                            ? '▸'
-                            : '▾'
-                          : ''}</span
+                      onclick={() => onselect(worktree.path)}
                       ><span aria-hidden="true">⑂</span><span>{worktree.branch}</span></button
                     >
                     {#if worktreeDeletions[worktree.path]}<span
@@ -1306,7 +1009,6 @@
                         )}>⋯</button
                     >
                   </div>
-                  {@render agentRows(worktree.path)}
                   {#if row.origin}<p
                       class="project-worktree-origin"
                       style:margin-left={`${45 + row.depth * 16}px`}
@@ -1442,17 +1144,12 @@
                   class="project-worktree-select project-default-worktree-select"
                   aria-label={`Open default worktree for ${repositoryName(path)}`}
                   aria-current={path === directory ? 'page' : undefined}
-                  aria-expanded={threads[path]?.length ? !agentListCollapsed(path) : undefined}
-                  aria-controls={threads[path]?.length ? agentListID(path) : undefined}
                   title={path}
                   {disabled}
-                  onclick={() => selectAgentWorktree(path, () => onselectdefault(path))}
-                  ><span aria-hidden="true"
-                    >{threads[path]?.length ? (agentListCollapsed(path) ? '▸' : '▾') : ''}</span
+                  onclick={() => onselectdefault(path)}
                   ><span aria-hidden="true">⑂</span><span>Default</span></button
                 >
               </div>
-              {@render agentRows(path)}
               {#each worktreeAncestry(catalog, path, registeredWorktrees[path] ?? []) as row (row.worktree.path)}
                 {@const worktree = row.worktree}
                 <div
@@ -1471,12 +1168,6 @@
                     class="project-worktree-select"
                     style:padding-left={`${32 + row.depth * 16}px`}
                     aria-current={worktree.path === directory ? 'page' : undefined}
-                    aria-expanded={threads[worktree.path]?.length
-                      ? !agentListCollapsed(worktree.path)
-                      : undefined}
-                    aria-controls={threads[worktree.path]?.length
-                      ? agentListID(worktree.path)
-                      : undefined}
                     title={worktree.path}
                     disabled={disabled ||
                       !!worktreeDeletions[worktree.path] ||
@@ -1489,14 +1180,7 @@
                       )
                         void openMenu({ kind: 'worktree', repository: path, worktree }, event);
                     }}
-                    onclick={() =>
-                      selectAgentWorktree(worktree.path, () => onselect(worktree.path))}
-                    ><span aria-hidden="true"
-                      >{threads[worktree.path]?.length
-                        ? agentListCollapsed(worktree.path)
-                          ? '▸'
-                          : '▾'
-                        : ''}</span
+                    onclick={() => onselect(worktree.path)}
                     ><span aria-hidden="true">⑂</span><span>{worktree.branch}</span></button
                   >
                   {#if worktreeDeletions[worktree.path]}<span
@@ -1519,7 +1203,6 @@
                       )}>⋯</button
                   >
                 </div>
-                {@render agentRows(worktree.path)}
                 {#if row.origin}<p
                     class="project-worktree-origin"
                     style:margin-left={`${45 + row.depth * 16}px`}
@@ -1605,9 +1288,7 @@
       ? `Manage ${target.name}`
       : target.kind === 'repository'
         ? `Manage ${repositoryName(target.path)}`
-        : target.kind === 'agent'
-          ? `Manage ${providerName(target.thread)} thread ${target.thread.title}`
-          : `Manage worktree ${target.worktree.branch}`}
+        : `Manage worktree ${target.worktree.branch}`}
     style={`left: ${menuX}px; top: ${menuY}px`}
     bind:this={menuElement}
     onkeydown={navigateMenu}
@@ -1678,22 +1359,6 @@
             : 'Remove from sidebar'}
         onclick={() => {
           onremoverepository(target.path);
-          closeMenu();
-        }}>Remove from sidebar</button
-      >
-    {:else if target.kind === 'agent'}
-      <div class="project-menu-title" title={target.thread.title}>{target.thread.title}</div>
-      <button role="menuitem" onclick={() => void copySessionId(target.thread)}
-        >Copy session ID</button
-      >
-      {#if copyError}<div role="alert">Could not copy session ID</div>{/if}
-      <div class="project-menu-divider"></div>
-      <button
-        role="menuitem"
-        class="danger"
-        aria-label={`Remove ${providerName(target.thread)} thread ${target.thread.title} from sidebar`}
-        onclick={() => {
-          onremovethread(target.thread);
           closeMenu();
         }}>Remove from sidebar</button
       >

@@ -146,23 +146,8 @@ describe('resizable left pane', () => {
     expect(await sidebarWidth()).toBe(64);
     await expect($('.sidebar-rail .rail-repository')).toBeDisplayed();
     await expect($('.sidebar .projects')).not.toBeDisplayed();
-    expect(
-      await Promise.all(
-        ['completed', 'interrupted', 'failed'].map((state) =>
-          $(`.sidebar-rail .rail-thread[data-state="${state}"]`).isDisplayed(),
-        ),
-      ),
-    ).toEqual([true, true, true]);
-    expect(
-      await browser.execute(() =>
-        [...document.querySelectorAll<HTMLButtonElement>('.sidebar-rail .rail-thread')].every(
-          (thread) =>
-            thread.scrollWidth <= thread.clientWidth &&
-            thread.scrollHeight <= thread.clientHeight &&
-            !/Working|Interrupted|Failed/.test(thread.textContent ?? ''),
-        ),
-      ),
-    ).toBe(true);
+    await expect($('.sidebar-rail .rail-thread')).not.toExist();
+    await expect($('.project-agent-row')).not.toExist();
     await shot('2560-rail');
     const sidebarScreenshot = await takeElementScreenshot('.sidebar');
     expect(sidebarScreenshot.readUInt32BE(16)).toBeLessThan(300);
@@ -214,7 +199,7 @@ describe('resizable left pane', () => {
     expect(
       await browser.execute(() => {
         const sidebar = document.querySelector('.sidebar')!.getBoundingClientRect();
-        return [...document.querySelectorAll('.sidebar-rail .rail-thread')].every((thread) => {
+        return [...document.querySelectorAll('.sidebar-rail button')].every((thread) => {
           const bounds = thread.getBoundingClientRect();
           return bounds.left >= sidebar.left && bounds.right <= sidebar.right;
         });

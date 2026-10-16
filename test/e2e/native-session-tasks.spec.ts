@@ -38,8 +38,8 @@ describe('native child Tasks identity', () => {
       await startAgent(provider);
       await $('.agent-composer [data-pane-prompt]').setValue('Native child task reports');
       await $('.agent-actions button:last-child').click();
-      await expect($('.project-agent-row[data-depth="1"]')).toBeDisplayed();
-      await $('.project-agent-row[data-depth="1"]').click();
+      await expect($('.spawn-response-open, .spawn-open')).toBeDisplayed();
+      await $('.spawn-response-open, .spawn-open').click();
       await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
       await $('button[role="tab"]*=Tasks').click();
       const panel = $('#session-details [aria-label="Session tasks"]');
@@ -73,7 +73,7 @@ describe('native child Tasks identity', () => {
         'Native child settles then parent reports',
       );
       await $('.agent-actions button:last-child').click();
-      await expect($('.project-agent-row[data-depth="1"]')).toBeDisplayed();
+      await expect($('.spawn-response-open, .spawn-open')).toBeDisplayed();
       await expect($('.agent-conversation')).toHaveText(
         expect.stringContaining('Parent result: Task reporting passed'),
       );

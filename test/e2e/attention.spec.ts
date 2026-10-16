@@ -1,3 +1,4 @@
+import { openThread } from './thread-navigation';
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
 import {
@@ -22,6 +23,27 @@ const waitForComposer = () =>
       ),
     { timeout: 15000, timeoutMsg: 'Agent composer did not become ready' },
   );
+
+async function expectThreadOutcome(title: string, status: string) {
+  await browser.waitUntil(
+    () =>
+      browser.execute(
+        (expectedTitle, expectedStatus) => {
+          const threads = JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]');
+          const thread = threads.find((item: { title: string }) => item.title === expectedTitle);
+          if (!thread) return false;
+          const key = JSON.stringify([thread.agent, thread.directory, thread.sessionId]);
+          return (
+            JSON.parse(localStorage.getItem('sai-thread-attention') ?? '{}')[key]?.status ===
+            expectedStatus
+          );
+        },
+        title,
+        status,
+      ),
+    { timeoutMsg: 'Expected persisted thread outcome: ' + title + ' / ' + status },
+  );
+}
 
 const sendButton = () => $('.agent-actions button:last-child');
 
@@ -128,215 +150,100 @@ describe('agent thread attention', () => {
     await waitForComposer();
     await $('.agent-composer [data-pane-prompt]').setValue('Stop during setup');
     await submitPrompt();
-    const stoppedDuringSetup = $('.project-agent-row[aria-label*="Stop during setup"]');
-    await expect(stoppedDuringSetup).toBeDisplayed();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Stop during setup'));
     await waitForStopButton();
     await $('.agent-busy button').click();
-    await expect(stoppedDuringSetup.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'interrupted',
-    );
+    await expectThreadOutcome('Stop during setup', 'interrupted');
     await expect($('.agent-composer [data-pane-prompt]')).toHaveText('Stop during setup');
 
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer [data-pane-prompt]').setValue('Delayed approval');
     await submitPrompt();
-    const row = $('.project-agent-row[aria-label*="Delayed approval"]');
-    await expect(row).toBeDisplayed();
     await $('.agent-launches button').click();
-    await expect(row).toHaveText(expect.stringContaining('Needs input'));
-    const sidebarRow = $('.project-agent-row[aria-label*="Delayed approval"]');
-    await expect(sidebarRow).toHaveText(expect.stringContaining('Needs input'));
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (1)');
     const worktree = $('.project-default-worktree-select');
-    await expect(worktree).toHaveAttribute('aria-expanded', 'true');
+    await expect(worktree).not.toHaveAttribute('aria-expanded');
     await worktree.click();
-    await expect(worktree).toHaveAttribute('aria-expanded', 'false');
-    await expect(sidebarRow).not.toBeDisplayed();
+    await expect($('.project-agent-row')).not.toExist();
     await browser.refresh();
-    await expect(worktree).toHaveAttribute('aria-expanded', 'false');
-    await expect(sidebarRow).not.toBeDisplayed();
-    await worktree.click();
-    await expect(sidebarRow).toHaveText(expect.stringContaining('Needs input'));
-    await browser.refresh();
-    await expect(row).toHaveText(expect.stringContaining('Needs input'));
-    await expect(sidebarRow).toHaveText(expect.stringContaining('Needs input'));
-
-    await sidebarRow.click();
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (1)');
+    await expect($('.project-agent-row')).not.toExist();
+    await openThread('Delayed approval');
     await expect($('.agent-permission')).toBeDisplayed();
     await expect($('.agent-header .activity-status')).toHaveAttribute('data-state', 'waiting');
-    await expect($('.agent-header .activity-status')).toHaveText(
-      expect.stringContaining('Needs input'),
-    );
     await $('.agent-permission button').click();
-    await expect(row).toHaveText(expect.stringContaining('Completed'));
-    await expect(sidebarRow).toHaveText(expect.stringContaining('Completed'));
-
     await waitForTurnIdle();
+
     await $('.agent-composer [data-pane-prompt]').setValue('Delayed completion');
     await submitPrompt();
     await expect($('.agent-permission')).toBeDisplayed();
     await $('.agent-permission button').click();
     await $('.agent-launches button').click();
-    await expect(row).toHaveText(expect.stringContaining('Completed'));
-    await row.click();
+    await browser.waitUntil(() =>
+      browser.execute(() => {
+        const threads = JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]');
+        const thread = threads.find((item: { title: string }) => item.title === 'Delayed approval');
+        if (!thread) return false;
+        const key = JSON.stringify([thread.agent, thread.directory, thread.sessionId]);
+        return (
+          JSON.parse(localStorage.getItem('sai-thread-attention') ?? '{}')[key]?.status === 'done'
+        );
+      }),
+    );
+    await openThread('Delayed approval');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Delayed completion'),
+    );
 
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer [data-pane-prompt]').setValue('Slow cancel');
     await submitPrompt();
-    const cancelled = $('.project-agent-row[aria-label*="Slow cancel"]');
     await expect($('.agent-permission')).toBeDisplayed();
     await browser.refresh();
     await expect($('.agent-permission')).toBeDisplayed();
-    await expect($('.agent-busy button')).toBeDisplayed();
     await $('.agent-busy button').click();
-    await $('.agent-launches button').click();
-    await expect(cancelled).toHaveText(expect.stringContaining('Interrupted'));
-    const cancelledSidebar = $('.project-agent-row[aria-label*="Slow cancel"]');
-    await expect(cancelledSidebar.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'interrupted',
-    );
-
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue('Cancel error');
-    await submitPrompt();
-    await expect($('.agent-permission')).toBeDisplayed();
-    await $('.agent-busy button').click();
-    await $('.agent-launches button').click();
-    const cancelledWithError = $('.project-agent-row[aria-label*="Cancel error"]');
-    await expect(cancelledWithError.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'interrupted',
-    );
-    await expect(cancelledWithError).toHaveText(expect.stringContaining('Interrupted'));
-
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue('Cancel ignored');
-    await submitPrompt();
-    await expect($('.agent-permission')).toBeDisplayed();
-    await $('.agent-busy button').click();
-    await $('.agent-launches button').click();
-    const completedAfterCancel = $('.project-agent-row[aria-label*="Cancel ignored"]');
-    await expect(completedAfterCancel.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'completed',
-    );
-    await expect(completedAfterCancel).toHaveText(expect.stringContaining('Completed'));
-
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue('Agent interrupted');
-    await submitPrompt();
-    const agentInterrupted = $('.project-agent-row[aria-label*="Agent interrupted"]');
-    await expect(agentInterrupted.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'interrupted',
-    );
-    await expect(agentInterrupted).toHaveText(expect.stringContaining('Interrupted'));
-    await $('.agent-launches button').click();
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue('Agent error interrupted');
-    await submitPrompt();
-    const errorInterrupted = $('.project-agent-row[aria-label*="Agent error interrupted"]');
-    await expect(errorInterrupted.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'interrupted',
-    );
-    await expect(errorInterrupted).toHaveText(expect.stringContaining('Interrupted'));
-    const interruptedColor = await browser.execute(() => {
-      const status = document.querySelector(
-        '.project-agent-row[aria-label*="Agent interrupted"] .activity-status',
-      );
-      const reference = document.createElement('span');
-      reference.style.color = 'var(--activity-failed)';
-      document.body.append(reference);
-      const colors = [getComputedStyle(status!).color, getComputedStyle(reference).color];
-      reference.remove();
-      return colors;
+    await expectThreadOutcome('Slow cancel', 'interrupted');
+    await browser.refresh();
+    await expectThreadOutcome('Slow cancel', 'interrupted');
+  });
+  for (const fixture of [
+    { prompt: 'Cancel error', action: 'stop', state: 'interrupted' },
+    { prompt: 'Cancel ignored', action: 'stop', state: 'done' },
+    { prompt: 'Agent interrupted', action: 'complete', state: 'interrupted' },
+    { prompt: 'Agent error interrupted', action: 'complete', state: 'interrupted' },
+    { prompt: 'Agent text interrupted', action: 'complete', state: 'interrupted' },
+    { prompt: 'Agent text interrupted error', action: 'complete', state: 'interrupted' },
+    { prompt: 'Agent text interrupted unrelated error', action: 'complete', state: 'failed' },
+    { prompt: 'Discuss interruption', action: 'complete', state: 'done' },
+    { prompt: 'Continue after interruption', action: 'complete', state: 'done' },
+    { prompt: 'Crash on cancel', action: 'stop', state: 'failed' },
+  ]) {
+    it('preserves the outcome of ' + fixture.prompt, async () => {
+      await $('.agent-launches button').click();
+      await waitForComposer();
+      await $('.agent-composer [data-pane-prompt]').setValue(fixture.prompt);
+      await submitPrompt();
+      if (fixture.action === 'stop') {
+        await expect($('.agent-permission')).toBeDisplayed();
+        await $('.agent-busy button').click();
+      }
+      await expectThreadOutcome(fixture.prompt, fixture.state);
+      await expect($('.project-agent-row')).not.toExist();
+      await browser.refresh();
+      await expectThreadOutcome(fixture.prompt, fixture.state);
     });
-    expect(interruptedColor[0]).toBe(interruptedColor[1]);
-    await browser.refresh();
-    await expect(agentInterrupted.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'interrupted',
-    );
+  }
 
-    await $('.agent-launches button').click();
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue('Agent text interrupted');
-    await submitPrompt();
-    const textInterrupted = $('.project-agent-row[aria-label*="Agent text interrupted"]');
-    await expect(textInterrupted.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'interrupted',
-    );
-    await expect(textInterrupted).toHaveText(expect.stringContaining('Interrupted'));
-
-    await $('.agent-launches button').click();
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue('Agent text interrupted error');
-    await submitPrompt();
-    const textInterruptedWithError = $(
-      '.project-agent-row[aria-label*="Agent text interrupted error"]',
-    );
-    await expect(textInterruptedWithError.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'interrupted',
-    );
-    await expect(textInterruptedWithError).toHaveText(expect.stringContaining('Interrupted'));
-
-    await $('.agent-launches button').click();
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue(
-      'Agent text interrupted unrelated error',
-    );
-    await submitPrompt();
-    const unrelatedError = $(
-      '.project-agent-row[aria-label*="Agent text interrupted unrelated error"]',
-    );
-    await expect(unrelatedError.$('.activity-status')).toHaveAttribute('data-state', 'failed');
-    await expect(unrelatedError).toHaveText(expect.stringContaining('Failed'));
-
-    await $('.agent-launches button').click();
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue('Discuss interruption');
-    await submitPrompt();
-    const discussed = $('.project-agent-row[aria-label*="Discuss interruption"]');
-    await expect(discussed.$('.activity-status')).toHaveAttribute('data-state', 'completed');
-    await expect(discussed).toHaveText(expect.stringContaining('Completed'));
-
-    await $('.agent-launches button').click();
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue('Continue after interruption');
-    await submitPrompt();
-    const continued = $('.project-agent-row[aria-label*="Continue after interruption"]');
-    await expect(continued.$('.activity-status')).toHaveAttribute('data-state', 'completed');
-    await expect(continued).toHaveText(expect.stringContaining('Completed'));
-
+  it('shows an interrupted native child on its transcript card', async () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer [data-pane-prompt]').setValue('Native interrupted subagent');
     await submitPrompt();
-    const nativeChildren = $('button[aria-label*="for Native interrupted subagent"]');
-    await expect(nativeChildren).toHaveText(expect.stringContaining('1 historical'));
-    await nativeChildren.click();
-    const nativeInterrupted = $('.project-agent-row[aria-label*="Inspect interrupted delegation"]');
-    await expect(nativeInterrupted.$('.activity-status')).toHaveAttribute(
-      'data-state',
-      'interrupted',
-    );
-    await expect(nativeInterrupted).toHaveText(expect.stringContaining('Interrupted'));
-
-    await $('.agent-launches button').click();
-    await waitForComposer();
-    await $('.agent-composer [data-pane-prompt]').setValue('Crash on cancel');
-    await submitPrompt();
-    await expect($('.agent-permission')).toBeDisplayed();
-    await $('.agent-busy button').click();
-    const crashed = $('.project-agent-row[aria-label*="Crash on cancel"]');
-    await expect(crashed.$('.activity-status')).toHaveAttribute('data-state', 'failed');
-    await expect(crashed).toHaveText(expect.stringContaining('Failed'));
+    const child = $('.spawn-response:has(.spawn-task[title="Inspect interrupted delegation"])');
+    await expect(child.$('.activity-status')).toHaveAttribute('data-state', 'interrupted');
+    await expect($('.project-agent-row')).not.toExist();
   });
 });
 

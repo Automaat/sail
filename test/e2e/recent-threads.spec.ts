@@ -1,3 +1,4 @@
+import { openThread } from './thread-navigation';
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
@@ -137,7 +138,7 @@ describe('recent thread shortcuts', () => {
     await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
     await expect($('.agent-composer [data-pane-prompt]')).toBeFocused();
     await expect($('.agent-error')).not.toExist();
-    await $('.project-agent-row[aria-label*="Thread one"]').click();
+    await openThread('Thread one');
     await browser.waitUntil(
       async () =>
         (await browser.execute(() => localStorage.getItem('sai-directory'))) === firstPath,
@@ -145,7 +146,7 @@ describe('recent thread shortcuts', () => {
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Thread one'));
   });
 
-  it('hides a thread until it is reopened without deleting its conversation', async () => {
+  it('keeps sessions out of the sidebar while preserving recent-thread navigation', async () => {
     await browser.setWindowSize(1280, 850);
     const path = realpathSync(first);
     await browser.execute((directory) => {
@@ -162,21 +163,17 @@ describe('recent thread shortcuts', () => {
     await browser.refresh();
     await expect($('.agent-launches button')).toBeEnabled();
     await createThread('Hidden thread');
-    const row = $('.project-agent-row[aria-label*="Hidden thread"]');
-    await expect(row).toBeDisplayed();
-
-    await row.click({ button: 'right' });
-    await expect($('.project-menu')).toBeDisplayed();
-    await $('.project-menu button[role="menuitem"]').click();
-    await expect(row).not.toExist();
+    await expect($('.project-agent-row')).not.toExist();
     const saved = await browser.execute(() => localStorage.getItem('sail-agent-threads'));
     expect(saved).toContain('Hidden thread');
-
     await browser.refresh();
-    await expect(row).not.toExist();
+    await expect($('.project-agent-row')).not.toExist();
     await expect($('.agent-launches button')).toBeEnabled();
     await browser.keys(['Meta', '1']);
-    await expect(row).toBeDisplayed();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Hidden thread'));
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Hidden thread'),
+    );
+    await expect($('.project-agent-row')).not.toExist();
   });
 });
