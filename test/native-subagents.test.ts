@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { AgentEvent } from '../src/lib/acp.ts';
 import { acpToolFailure } from '../src/lib/acp-tool-failure.ts';
 import { automaticPermissionPolicy } from '../src/lib/capability-profiles.ts';
+import { workspaceActivityItems } from '../src/lib/workspace-activity.ts';
 import {
   disconnectNativeSubagents,
   finalizeNativeSubagentRestore,
@@ -588,12 +589,61 @@ await test('a claude child spawned while its session replays stays live', () => 
   assert.equal(finalizeNativeSubagentRestore(store, 'claude', '/repo', 'root', 2), store);
 });
 
+await test('historical Claude tool activity settles without counting as current work', () => {
+  const historical = {
+    ...spawnEvent('root', 'root:claude-subagent:unfinished'),
+    agent: 'claude' as const,
+  };
+  historical.message.params = { ...historical.message.params, sailHistoricalActivity: true };
+  const live = { ...spawnEvent('root', 'root:claude-subagent:live'), agent: 'claude' as const };
+  let store = updateNativeSubagents({}, historical, '/repo', 1, true);
+  store = updateNativeSubagents(store, live, '/repo', 2, true);
+  store = finalizeNativeSubagentRestore(store, 'claude', '/repo', 'root', 3);
+  const receipts = nativeSubagentReceipts(store);
+  assert.equal(
+    receipts.find((receipt) => receipt.targetId?.endsWith(':unfinished'))?.state,
+    'unavailable',
+  );
+  assert.equal(receipts.find((receipt) => receipt.targetId?.endsWith(':live'))?.state, 'working');
+  assert.deepEqual(nativeSubagentCounts(store, 'claude', 'root'), { active: 1, waiting: 0 });
+  assert.equal(
+    workspaceActivityItems({ children: receipts }).filter((item) => item.section === 'now').length,
+    1,
+  );
+});
+
 await test('an adapter without replay markers still restores its children', () => {
   const store = updateNativeSubagents({}, spawnEvent('root', 'thread-7'), '/repo', 1, true);
   assert.equal(store[nativeSubagentId('codex', '/repo', 'thread-7')]?.restored, true);
   const finalized = finalizeNativeSubagentRestore(store, 'codex', '/repo', 'root', 2);
   assert.equal(finalized[nativeSubagentId('codex', '/repo', 'thread-7')]?.outcome, 'unknown');
   assert.equal(finalized[nativeSubagentId('codex', '/repo', 'thread-7')]?.activity, 'Disconnected');
+});
+
+await test('backend-confirmed live children stay active during a concurrent restore', () => {
+  for (const agent of ['codex', 'claude', 'opencode'] as const) {
+    const live = { ...spawnEvent('root', 'live-child'), agent };
+    live.message.params = { ...live.message.params, sailHistoricalActivity: false };
+    const store = updateNativeSubagents({}, live, '/repo', 1, true);
+    const finalized = finalizeNativeSubagentRestore(store, agent, '/repo', 'root', 2);
+    assert.equal(finalized, store);
+    assert.equal(nativeSubagentCounts(finalized, agent, 'root').active, 1);
+  }
+});
+
+await test('authoritative live provenance replaces a prior historical marker', () => {
+  for (const agent of ['codex', 'claude', 'opencode'] as const) {
+    const historical = { ...spawnEvent('root', 'child'), agent };
+    historical.message.params = { ...historical.message.params, sailHistoricalActivity: true };
+    let store = updateNativeSubagents({}, historical, '/repo', 1, true);
+    store = finalizeNativeSubagentRestore(store, agent, '/repo', 'root', 2);
+    const live = { ...spawnEvent('root', 'child'), agent };
+    live.message.params = { ...live.message.params, sailHistoricalActivity: false };
+    store = updateNativeSubagents(store, live, '/repo', 3, true);
+    assert.equal(store[nativeSubagentId(agent, '/repo', 'child')].restored, false);
+    assert.equal(finalizeNativeSubagentRestore(store, agent, '/repo', 'root', 4), store);
+    assert.equal(nativeSubagentCounts(store, agent, 'root').active, 1);
+  }
 });
 
 await test('a first replay still restores historical children', () => {

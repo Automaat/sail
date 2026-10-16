@@ -290,9 +290,12 @@ export function updateNativeSubagents(
     const id = nativeSubagentId(event.agent, directory, sessionId);
     const previous = store[id];
     const prompt = typeof update.prompt === 'string' ? update.prompt : previous?.prompt;
-    // Only claude-agent-acp marks replayed children, so its live children stay live while a
-    // session replays. Other adapters replay under plain ids, where the replay itself decides.
-    const replayed = restored && (event.agent !== 'claude' || isReplaySubagent(sessionId));
+    // The backend identifies synthetic Claude history without treating concurrent live spawns
+    // as replay. Older adapters use replay ids or the session replay boundary.
+    const replayed =
+      typeof params?.sailHistoricalActivity === 'boolean'
+        ? params.sailHistoricalActivity
+        : restored && (event.agent !== 'claude' || isReplaySubagent(sessionId));
     const malformed =
       replayed &&
       (!(typeof update.name === 'string' && update.name.trim()) ||
@@ -334,7 +337,10 @@ export function updateNativeSubagents(
         ...(previous?.toolIds ? { toolIds: previous.toolIds } : {}),
         created: previous?.created ?? now,
         updated: now,
-        restored: previous?.restored || replayed,
+        restored:
+          typeof params?.sailHistoricalActivity === 'boolean'
+            ? replayed
+            : previous?.restored || replayed,
         taskIdentity: previous?.taskIdentity ?? 'observed',
         taskTurnId: previous?.taskTurnId ?? null,
         capabilityProfile: replayed
