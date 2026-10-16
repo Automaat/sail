@@ -8,7 +8,10 @@
   import OptionPicker from './OptionPicker.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import { getSetting } from './lib/settings';
-  import { defaultContextHandoffThreshold } from './lib/context-handoff';
+  import {
+    defaultContextHandoffThreshold,
+    parseContextHandoffThreshold,
+  } from './lib/context-handoff';
   import { loadProjectCatalog } from './lib/projects';
   import {
     parseThemePreference,
@@ -1569,13 +1572,16 @@
           type="number"
           min="20000"
           max="10000000"
-          step="1000"
+          step="1"
           value={snapshot?.contextHandoffThreshold ?? defaultContextHandoffThreshold}
-          onchange={(event) =>
+          onchange={(event) => {
+            const threshold = parseContextHandoffThreshold(event.currentTarget.value);
+            event.currentTarget.value = String(threshold);
             send({
               type: 'context-handoff-threshold',
-              value: Number(event.currentTarget.value),
-            })}
+              value: threshold,
+            });
+          }}
         />
         <p>
           Context percentages use each thread’s provider-reported token window. Claude, Codex, and

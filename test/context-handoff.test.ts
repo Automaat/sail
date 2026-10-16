@@ -14,7 +14,7 @@ import { initialTaskCheckpoint } from '../src/lib/task-checkpoint.ts';
 
 void test('validates an absolute token threshold without interpreting old percentages as tokens', () => {
   assert.equal(parseContextHandoffThreshold('80000'), 80_000);
-  for (const value of ['85', '19999', '10000001', 'not-a-number', '', null])
+  for (const value of ['85', '19999', '10000001', '-1', '1.5', 'not-a-number', '', null])
     assert.equal(parseContextHandoffThreshold(value), 100_000);
 });
 
