@@ -187,7 +187,7 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   const progress = sailModeRule('Progress');
   assert.match(progress, /NEEDS_FIXES, FAIL and CI fix rounds stay `running`/);
   assert.match(progress, /when the convergence budget stops the run, report `status: "blocked"`/);
-  assert.match(sailContract, /When they reject it because Sail does not track this thread/);
+  assert.match(sailContract, /When native tools reject it because Sail does not track this thread/);
   assert.match(
     readFileSync(skillPath('sail', 'SKILL.md'), 'utf8'),
     /delivery-state mismatch, unless\s+the user merged a pull request you left mergeable for them/,
@@ -230,6 +230,65 @@ void test('Sail mode names only Ship tool fields and values the tools accept', (
     assert.ok(quotedValues(schema[2]).includes(status), status);
 });
 
+void test('ordinary threads continue shipping through the portable workflow', () => {
+  const boundary = sailModeRule('Assignment boundary');
+  assert.match(
+    boundary,
+    /ordinary thread has no Ship worker or gate assignment and no local Ship claim/,
+  );
+  for (const rejection of [
+    'This thread cannot access a Ship task checkpoint.',
+    'Only the assigned Ship worker can report issue progress.',
+  ])
+    assert.ok(boundary.includes(rejection), rejection);
+  assert.match(boundary, /continue the user-authorized task through the portable workflow/);
+  assert.match(boundary, /Do not ask the user to assign it to Ship just to continue/);
+  assert.match(boundary, /portable claims policy and fresh-subagent review\/test routes/);
+  assert.match(
+    boundary,
+    /Native tools being absent also leaves ordinary threads on the portable workflow/,
+  );
+
+  const claims = sailModeRule('Claims');
+  assert.match(claims, /ordinary thread follows the portable bookkeeping policy/i);
+  assert.match(claims, /with claims disabled keep `claim: null`/);
+  assert.match(
+    claims,
+    /with claims enabled acquire and reconcile its own GitHub claim through `claims\.md` before writes/,
+  );
+  assert.match(claims, /Native Ship ownership is not required for that portable task/);
+  const merge = sailModeRule('Merge owner');
+  assert.match(merge, /For native Ship assignments, never post a GitHub comment/);
+  assert.match(
+    merge,
+    /Ordinary threads on the portable workflow follow its resolved claims and release policy, including permitted GitHub claim and bot-merge comments, subject to session capabilities and permissions/,
+  );
+});
+
+void test('portable fallback never replaces an assigned Ship worker ownership check', () => {
+  const boundary = sailModeRule('Assignment boundary');
+  assert.match(
+    boundary,
+    /assigned Ship worker or gate follows its native Sail assignment, ownership and validation rules/,
+  );
+  assert.match(
+    boundary,
+    /missing or expired claim, access denial, or revision\/delivery mismatch for an assigned worker is a blocker, never permission to switch to portable mode/,
+  );
+  assert.match(
+    boundary,
+    /Do not access another worker's checkpoint, report its progress, or assume its claim or assignment/,
+  );
+  assert.match(
+    sailModeRule('Claims'),
+    /assigned worker without a valid Sail claim must ask Sail for ownership before repository writes/,
+  );
+  assert.match(
+    sailContract,
+    /Native Ship checkpoint, evidence, validation and progress steps below apply\s+to assigned Ship workers and gates/,
+  );
+});
+
 void test('an installed ship-it skill keeps Sail stage reporting without the bundled contract', () => {
   const installed = [{ id: 'native', name: 'ship-it', description: 'Installed' }];
   const merged = mergeSkills(installed, bundled);
@@ -243,6 +302,34 @@ void test('an installed ship-it skill keeps Sail stage reporting without the bun
   assert.doesNotMatch(prompt, /Follow this bundled Sail skill/);
   assert.doesNotMatch(prompt, /## Sail mode/);
 });
+
+for (const installed of [[], [{ id: 'native', name: 'ship-it', description: 'Installed' }]]) {
+  void test(`shipping prompt scopes native instructions with ${installed.length ? 'installed' : 'bundled'} skill`, () => {
+    const prompt = resolveSkillPrompt(mergeSkills(installed, bundled), '/ship-it #859');
+    assert.match(
+      prompt,
+      /Native Ship progress and validation_gate instructions in this prompt, including any configured cross-validation policy, apply only to assigned Ship workers and gates/,
+    );
+    assert.match(
+      prompt,
+      /ordinary thread has no Ship worker or gate assignment and no local Ship claim/,
+    );
+    assert.match(
+      prompt,
+      /continues user-authorized shipping through portable bookkeeping, claims policy and fresh-subagent review\/test routes/,
+    );
+    assert.match(
+      prompt,
+      /Assigned workers with missing or expired ownership, access denial or revision\/delivery mismatch must stop/,
+    );
+    assert.match(
+      prompt,
+      /portable fallback never grants another worker's checkpoint, progress or claim/,
+    );
+    assert.ok(prompt.indexOf('Sail Ship assignment boundary:') < prompt.indexOf('Sail gate rule:'));
+    assert.match(prompt, /For assigned Ship workers and gates, Sail progress reporting:/);
+  });
+}
 
 void test('bundled scheduling fills capacity before waiting and keeps Sail gates authoritative', () => {
   const scheduling = read('ship-it', 'references/orchestration.md');
