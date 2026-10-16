@@ -105,7 +105,13 @@ export function mergeAgentThreadListing(previous: AgentThread, incoming: AgentTh
 }
 
 export interface AgentSessionListing {
-  sessions: { sessionId: string; cwd: string; title?: string | null; updatedAt?: string | null }[];
+  sessions: {
+    sessionId: string;
+    cwd: string;
+    title?: string | null;
+    updatedAt?: string | null;
+    capabilityProfile?: CapabilityProfile;
+  }[];
   nextCursor?: string | null;
 }
 

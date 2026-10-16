@@ -8312,6 +8312,43 @@ fn listing_connection(
     Ok((runtime, capabilities))
 }
 
+fn profiled_session_history(mut listing: Value, known: &[(String, CapabilityProfile)]) -> Value {
+    let Some(sessions) = listing.get_mut("sessions").and_then(Value::as_array_mut) else {
+        return listing;
+    };
+    *sessions = std::mem::take(sessions)
+        .into_iter()
+        .flat_map(|session| {
+            let Some(id) = session.get("sessionId").and_then(Value::as_str) else {
+                return vec![session];
+            };
+            let (_, wire_id) = session_profile(id);
+            let mut identities = known
+                .iter()
+                .filter(|(id, _)| session_profile(id).1 == wire_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            // History lookup grants listing access, not ownership of persisted conversations.
+            if identities.is_empty() {
+                identities.push((
+                    profile_session_id(CapabilityProfile::Build, wire_id),
+                    CapabilityProfile::Build,
+                ));
+            }
+            identities
+                .into_iter()
+                .map(|(id, profile)| {
+                    let mut session = session.clone();
+                    session["sessionId"] = json!(id);
+                    session["capabilityProfile"] = json!(profile.as_str());
+                    session
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    listing
+}
+
 /// One page of the agent's own session history for a working directory.
 #[tauri::command]
 pub async fn acp_list_sessions(
@@ -8344,7 +8381,30 @@ pub async fn acp_list_sessions(
             if result.is_err() && attempts < 2 && !runtime.reusable() {
                 continue;
             }
-            return result;
+            let result = result?;
+            let mut known = Vec::new();
+            for connection in manager
+                .0
+                .lock()
+                .map_err(|error| error.to_string())?
+                .values()
+                .filter(|connection| {
+                    connection.agent == agent
+                        && connection.worktree == runtime.worktree
+                        && connection.owner.is_none()
+                        && connection.alive.load(Ordering::Acquire)
+                })
+            {
+                known.extend(
+                    connection
+                        .session_profiles
+                        .lock()
+                        .map_err(|error| error.to_string())?
+                        .iter()
+                        .map(|(id, profile)| (id.clone(), *profile)),
+                );
+            }
+            return Ok(profiled_session_history(result, &known));
         }
     })
     .await
@@ -13905,6 +13965,42 @@ mod capability_profile_tests {
             .is_err());
         }
         manager.shutdown();
+    }
+
+    #[test]
+    fn history_listing_uses_live_owners_and_default_build_for_unbound_history() {
+        let build = profile_session_id(CapabilityProfile::Build, "1");
+        let review = profile_session_id(CapabilityProfile::Review, "1");
+        let listed = profiled_session_history(
+            json!({"sessions":[
+            {"sessionId":profile_session_id(CapabilityProfile::Explore, "1"),"cwd":"/repo"},
+            {"sessionId":profile_session_id(CapabilityProfile::Explore, "unbound"),"cwd":"/repo"}
+        ],"nextCursor":"next"}),
+            &[
+                (build.clone(), CapabilityProfile::Build),
+                (review.clone(), CapabilityProfile::Review),
+            ],
+        );
+        assert_eq!(listed["sessions"][0]["sessionId"], build);
+        assert_eq!(listed["sessions"][0]["capabilityProfile"], "build");
+        assert_eq!(listed["sessions"][1]["sessionId"], review);
+        assert_eq!(listed["sessions"][1]["capabilityProfile"], "review");
+        assert_eq!(
+            listed["sessions"][2]["sessionId"],
+            profile_session_id(CapabilityProfile::Build, "unbound")
+        );
+        assert_eq!(listed["sessions"][2]["capabilityProfile"], "build");
+        assert_eq!(listed["nextCursor"], "next");
+    }
+
+    #[test]
+    fn history_listing_keeps_registered_legacy_session_identity() {
+        let listed = profiled_session_history(
+            json!({"sessions":[{"sessionId":profile_session_id(CapabilityProfile::Explore, "legacy"),"cwd":"/repo"}]}),
+            &[("legacy".into(), CapabilityProfile::Review)],
+        );
+        assert_eq!(listed["sessions"][0]["sessionId"], "legacy");
+        assert_eq!(listed["sessions"][0]["capabilityProfile"], "review");
     }
 
     #[test]
