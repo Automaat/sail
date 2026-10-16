@@ -267,6 +267,9 @@ export interface ShipIssue {
   contextHandoffOfferedAt?: number;
   contextHandoffOfferedSequence?: number;
   contextPercent?: number;
+  contextTokens?: number;
+  contextWindow?: number;
+  contextTokensByThread?: Record<string, number>;
   contextPercentByThread?: Record<string, number>;
   handoffRecoveryRequired?: boolean;
   retryCount?: number;

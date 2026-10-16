@@ -8,6 +8,7 @@
   import OptionPicker from './OptionPicker.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import { getSetting } from './lib/settings';
+  import { defaultContextHandoffThreshold } from './lib/context-handoff';
   import { loadProjectCatalog } from './lib/projects';
   import {
     parseThemePreference,
@@ -1559,23 +1560,28 @@
       <section class="settings-card">
         <h2>Context handoff</h2>
         <p>
-          Ask Ship workers to checkpoint ten percentage points before this limit, then offer a
-          fresh-thread handoff at the limit.
+          Ask Ship workers to checkpoint 10,000 tokens before this limit, then offer a fresh-thread
+          handoff at the limit or the provider-reported window, whichever is smaller.
         </p>
-        <label for="context-handoff-threshold">Context threshold (%)</label>
+        <label for="context-handoff-threshold">Context threshold (tokens)</label>
         <input
           id="context-handoff-threshold"
           type="number"
-          min="60"
-          max="95"
-          step="1"
-          value={snapshot?.contextHandoffThreshold ?? 85}
+          min="20000"
+          max="10000000"
+          step="1000"
+          value={snapshot?.contextHandoffThreshold ?? defaultContextHandoffThreshold}
           onchange={(event) =>
             send({
               type: 'context-handoff-threshold',
               value: Number(event.currentTarget.value),
             })}
         />
+        <p>
+          Context percentages use each thread’s provider-reported token window. Claude, Codex, and
+          OpenCode report their own window; Sail does not assume a model’s advertised maximum. The
+          thread header shows the used tokens and denominator when reported.
+        </p>
       </section>
       <section class="settings-card hook-inspector">
         <h2>Runtime hook integration</h2>
