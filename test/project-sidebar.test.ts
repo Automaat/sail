@@ -48,15 +48,17 @@ after(async () => {
   await vite?.close();
 });
 
-for (const grouped of [false, true]) {
-  for (const compact of [false, true]) {
-    await test(`worktree navigation excludes sessions: grouped=${grouped}, compact=${compact}`, () => {
-      const html = renderSidebar(grouped, compact);
+await Promise.all(
+  [false, true].flatMap((grouped) =>
+    [false, true].map((compact) =>
+      test(`worktree navigation excludes sessions: grouped=${grouped}, compact=${compact}`, () => {
+        const html = renderSidebar(grouped, compact);
 
-      assert.match(html, /feature/);
-      assert.match(html, /aria-current="page"/);
-      assert.doesNotMatch(html, /Parent session|Child session|project-agent|rail-thread/);
-      assert.doesNotMatch(html, /project-agents-|historical subagent/);
-    });
-  }
-}
+        assert.match(html, /feature/);
+        assert.match(html, /aria-current="page"/);
+        assert.doesNotMatch(html, /Parent session|Child session|project-agent|rail-thread/);
+        assert.doesNotMatch(html, /project-agents-|historical subagent/);
+      }),
+    ),
+  ),
+);
