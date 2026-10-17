@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { canExecutePlan, executionSummary, skippedSteps, type Plan } from '../src/lib/plan.ts';
+import {
+  approveAllSteps,
+  canExecutePlan,
+  executionSummary,
+  skippedSteps,
+  type Plan,
+  type PlanDecision,
+} from '../src/lib/plan.ts';
+import { review } from '../src/lib/plan-engine.ts';
 
 const plan: Plan = {
   title: 'Plan',
@@ -51,6 +59,53 @@ await test('execution requires unfinished approved work and lists skipped steps'
   assert.equal(canExecutePlan(plan, decisions), true);
   assert.deepEqual(skippedSteps(plan, decisions), ['s2']);
   assert.equal(canExecutePlan(plan, { s1: { stepID: 's1', verdict: 'reject' } }), false);
+});
+
+await test('accepting all starts every unfinished step and preserves review feedback', () => {
+  const draft: Record<string, PlanDecision> = {
+    s1: { stepID: 's1', verdict: 'revise', comment: 'Keep this note' },
+    s2: { stepID: 's2', verdict: 'reject', edit: { title: 'Edited second' } },
+    s3: { stepID: 's3', comment: 'Already complete' },
+  };
+
+  const decisions = approveAllSteps(plan, draft);
+  const result = review(plan, {
+    version: plan.version,
+    action: 'execute',
+    decisions: Object.values(decisions),
+  });
+
+  assert.equal(canExecutePlan(plan, decisions), true);
+  assert.deepEqual(skippedSteps(plan, decisions), []);
+  assert.deepEqual(decisions, {
+    s1: { stepID: 's1', verdict: 'approve', comment: 'Keep this note' },
+    s2: { stepID: 's2', verdict: 'approve', edit: { title: 'Edited second' } },
+    s3: { stepID: 's3', comment: 'Already complete' },
+  });
+  assert.equal(draft.s1.verdict, 'revise');
+  assert.equal(draft.s2.verdict, 'reject');
+  assert.ok(result.ok);
+  assert.equal(result.value.state, 'executing');
+  assert.deepEqual(
+    result.value.steps.map((step) => step.status),
+    ['approved', 'approved', 'done'],
+  );
+  assert.equal(result.value.steps[1].title, 'Edited second');
+});
+
+await test('accepting all leaves completed and skipped work settled', () => {
+  const settled: Plan = {
+    ...plan,
+    steps: [
+      { ...plan.steps[0], status: 'done' },
+      { ...plan.steps[1], status: 'skipped' },
+    ],
+  };
+
+  const decisions = approveAllSteps(settled, {});
+
+  assert.equal(canExecutePlan(settled, decisions), false);
+  assert.deepEqual(skippedSteps(settled, decisions), []);
 });
 
 await test('execution summary keeps blocked work and failed checks visible after restart', () => {
