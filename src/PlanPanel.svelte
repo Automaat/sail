@@ -6,6 +6,7 @@
   import IssueGraphPanel from './IssueGraphPanel.svelte';
   import Markdown from './Markdown.svelte';
   import {
+    approveAllSteps,
     canExecutePlan,
     executionSummary,
     skippedSteps,
@@ -87,6 +88,9 @@
     diagramTargets.every((diagram) => diagramValidity[diagram.id] === true),
   );
   let canExecute = $derived(!!plan && diagramsValid && canExecutePlan(plan, decisions));
+  let canAcceptAll = $derived(
+    !!plan && diagramsValid && canExecutePlan(plan, approveAllSteps(plan, decisions)),
+  );
   let skipped = $derived(plan ? skippedSteps(plan, decisions) : []);
   let execution = $derived(plan ? executionSummary(plan, directory) : null);
 
@@ -386,8 +390,19 @@
     }
   }
 
-  async function sendReview(action: 'revise' | 'execute') {
-    if (!backend || !plan || pending || (action === 'execute' && !canExecute)) return;
+  async function sendReview(action: 'revise' | 'execute', acceptAll = false) {
+    if (
+      !backend ||
+      !plan ||
+      pending ||
+      (action === 'execute' && !(acceptAll ? canAcceptAll : canExecute))
+    )
+      return;
+    if (acceptAll) {
+      decisions = approveAllSteps(plan, decisions);
+      confirming = false;
+      savePlanDraft();
+    }
     if (!validateReview()) return;
     const submitted = plan;
     const key = currentPlan;
@@ -873,6 +888,11 @@
         </div>{/if}
       <div class="panel-actions split">
         <Button
+          onclick={() => sendReview('execute', true)}
+          disabled={!canAcceptAll || pending}
+          loading={pending}>Accept all and start</Button
+        >
+        <Button
           variant="secondary"
           onclick={() => sendReview('revise')}
           disabled={pending}
@@ -1212,6 +1232,7 @@
   }
   .panel-actions {
     display: flex;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: var(--space-8);
     padding: 16px 20px;

@@ -183,6 +183,20 @@ export interface PlanDecision {
   edit?: { title?: string; detail?: string };
 }
 
+export function approveAllSteps(
+  plan: Plan,
+  decisions: Record<string, PlanDecision>,
+): Record<string, PlanDecision> {
+  return Object.fromEntries(
+    plan.steps.map((step) => [
+      step.id,
+      step.status === 'done' || step.status === 'skipped'
+        ? { ...decisions[step.id], stepID: step.id }
+        : { ...decisions[step.id], stepID: step.id, verdict: 'approve' },
+    ]),
+  );
+}
+
 export function canExecutePlan(plan: Plan, decisions: Record<string, PlanDecision>): boolean {
   const status = (step: PlanStep) => {
     if (step.status === 'done' || step.status === 'skipped') return step.status;
