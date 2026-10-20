@@ -83,7 +83,7 @@ async function restoreReview(inSplit: boolean, withInvalidDiagram = false) {
   await browser.refresh();
   if (inSplit && (await browser.execute(() => innerWidth)) <= 850) {
     await browser.keys('F6');
-    await browser.keys(['Meta', 'l']);
+    await $('[aria-label="Workspace panels"]').$('button=Details').click();
   }
   try {
     await expect($('[aria-label="Plan review"]')).toBeDisplayed();
