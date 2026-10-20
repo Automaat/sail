@@ -25,7 +25,12 @@ async function restoreReview(inSplit: boolean, withInvalidDiagram = false) {
       };
       localStorage.setItem('sail-agent-threads', JSON.stringify([thread]));
       const agent = { id: split ? 'review-pane' : 'main', agent: 'codex', thread };
-      const terminal = { id: split ? 'main' : 'terminal-pane', kind: 'terminal' };
+      const terminal = {
+        id: split ? 'main' : 'terminal-pane',
+        kind: 'terminal',
+        agent: null,
+        thread: null,
+      };
       localStorage.setItem(
         'sai-pane-layouts',
         JSON.stringify({
@@ -76,7 +81,25 @@ async function restoreReview(inSplit: boolean, withInvalidDiagram = false) {
     { directory: realpathSync(repository), split: inSplit, invalidDiagram: withInvalidDiagram },
   );
   await browser.refresh();
-  await expect($('[aria-label="Plan review"]')).toBeDisplayed();
+  if (inSplit && (await browser.execute(() => innerWidth)) <= 850) {
+    await browser.keys('F6');
+    await browser.keys(['Meta', 'l']);
+  }
+  try {
+    await expect($('[aria-label="Plan review"]')).toBeDisplayed();
+  } catch (cause) {
+    console.error(
+      'Restored plan diagnostic',
+      await browser.execute(() => ({
+        body: document.body.innerText.slice(0, 6000),
+        directory: localStorage.getItem('sai-directory'),
+        threads: localStorage.getItem('sail-agent-threads'),
+        panes: localStorage.getItem('sai-pane-layouts'),
+        plans: localStorage.getItem('sai-acp-plans'),
+      })),
+    );
+    throw cause;
+  }
 }
 
 describe('pending structured plan review', () => {
@@ -95,7 +118,7 @@ describe('pending structured plan review', () => {
         expect.stringContaining('Approve at least one step'),
       );
       await expect(panel.$('button=Execute approved steps')).toBeDisabled();
-      const firstApprove = panel.$('.step-card button=Approve');
+      const firstApprove = panel.$('[aria-label="Approve resume-prior-judgment"]');
       await firstApprove.scrollIntoView();
       await firstApprove.click();
       const execute = panel.$('button=Execute approved steps');
@@ -141,7 +164,6 @@ describe('pending structured plan review', () => {
         await browser.execute((value) => {
           document.documentElement.dataset.suiTheme = value;
         }, theme);
-        if (width === 390) await browser.keys(['Meta', 'l']);
         const panel = $('[aria-label="Plan review"]');
         await expect(panel).toBeDisplayed();
         const bounds = await browser.execute(() => {
