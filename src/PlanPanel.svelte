@@ -945,6 +945,7 @@
     min-width: 0;
     min-height: 0;
     height: 100%;
+    overflow: auto;
     background: var(--sui-surface);
     border-left: 1px solid var(--shell-divider);
   }
@@ -978,7 +979,7 @@
   }
   .panel-scroll {
     flex: 1;
-    min-height: 0;
+    min-height: 128px;
     overflow: auto;
     padding: 20px;
   }

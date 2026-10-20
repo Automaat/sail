@@ -1,6 +1,6 @@
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, realpathSync } from 'node:fs';
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const root = process.env.SAIL_E2E_CONFIG_DIR;
@@ -111,6 +111,16 @@ describe('pending structured plan review', () => {
   before(() => {
     mkdirSync(repository, { recursive: true });
     execFileSync('git', ['init', '-q', repository]);
+    writeFileSync(
+      join(repository, '.acp-external-sessions.json'),
+      JSON.stringify([
+        {
+          sessionId: 'plan-review',
+          title: 'Pending Codex plan',
+          updatedAt: new Date().toISOString(),
+        },
+      ]),
+    );
   });
 
   for (const split of [false, true]) {
@@ -132,6 +142,9 @@ describe('pending structured plan review', () => {
       await panel.$('button=Confirm execution').click();
       const auth = $('.agent-auth button');
       if (await auth.isExisting()) await auth.click();
+      await expect($('.agent-permission')).toHaveText(expect.stringContaining('Run test action'));
+      await $('.agent-permission button').click();
+      await expect(panel).toHaveText(expect.stringContaining('Execution approved.'));
       await browser.waitUntil(async () =>
         browser.execute(() => {
           const saved = JSON.parse(localStorage.getItem('sai-acp-plans') ?? '[]');
@@ -155,6 +168,28 @@ describe('pending structured plan review', () => {
     );
     await expect(panel.$('button=Accept all and start')).toBeDisabled();
     await expect(panel.$('button=Execute approved steps')).toBeDisabled();
+  });
+
+  it('allows scrolling to review actions in a short split pane', async () => {
+    await browser.setWindowSize(960, 550);
+    await restoreReview(true);
+    const bounds = await browser.execute(() => {
+      const panel = document.querySelector<HTMLElement>('.plan-panel')!;
+      panel.scrollTo(0, panel.scrollHeight);
+      const rect = panel.getBoundingClientRect();
+      const button = [...panel.querySelectorAll<HTMLButtonElement>('button')]
+        .find((element) => element.textContent?.includes('Execute approved steps'))!
+        .getBoundingClientRect();
+      return {
+        top: button.top,
+        bottom: button.bottom,
+        panelTop: rect.top,
+        panelBottom: rect.bottom,
+        height: innerHeight,
+      };
+    });
+    expect(bounds.top).toBeGreaterThanOrEqual(bounds.panelTop);
+    expect(bounds.bottom).toBeLessThanOrEqual(Math.min(bounds.panelBottom, bounds.height));
   });
 
   for (const theme of ['light', 'dark']) {
