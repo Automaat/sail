@@ -87,8 +87,7 @@ async function restoreReview(inSplit: boolean, withInvalidDiagram = false, appea
     },
   );
   await browser.refresh();
-  if (inSplit && (await browser.execute(() => innerWidth)) <= 850) {
-    await browser.keys('F6');
+  if ((await browser.execute(() => innerWidth)) <= 850) {
     await $('[aria-label="Workspace panels"]').$('button=Details').click();
   }
   try {
@@ -166,7 +165,7 @@ describe('pending structured plan review', () => {
     ]) {
       it(`keeps review actions reachable at ${width}px in ${theme}`, async () => {
         await browser.setWindowSize(width, height);
-        await restoreReview(true, false, theme);
+        await restoreReview(width > 850, false, theme);
         const panel = $('[aria-label="Plan review"]');
         await expect(panel).toBeDisplayed();
         const bounds = await browser.execute(() => {
