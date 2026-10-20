@@ -7,10 +7,11 @@ const root = process.env.SAIL_E2E_CONFIG_DIR;
 if (!root) throw new Error('Plan reviews require an isolated SAIL_E2E_CONFIG_DIR.');
 const repository = join(root, 'plan-review-repository');
 
-async function restoreReview(inSplit: boolean, withInvalidDiagram = false) {
+async function restoreReview(inSplit: boolean, withInvalidDiagram = false, appearance = 'light') {
   await browser.execute(
-    ({ directory, split, invalidDiagram }) => {
+    ({ directory, split, invalidDiagram, theme }) => {
       localStorage.clear();
+      localStorage.setItem('sai-theme', theme);
       localStorage.setItem('sai-directory', directory);
       localStorage.setItem(
         'sai-project-catalog',
@@ -78,7 +79,12 @@ async function restoreReview(inSplit: boolean, withInvalidDiagram = false) {
         ]),
       );
     },
-    { directory: realpathSync(repository), split: inSplit, invalidDiagram: withInvalidDiagram },
+    {
+      directory: realpathSync(repository),
+      split: inSplit,
+      invalidDiagram: withInvalidDiagram,
+      theme: appearance,
+    },
   );
   await browser.refresh();
   if (inSplit && (await browser.execute(() => innerWidth)) <= 850) {
@@ -160,10 +166,7 @@ describe('pending structured plan review', () => {
     ]) {
       it(`keeps review actions reachable at ${width}px in ${theme}`, async () => {
         await browser.setWindowSize(width, height);
-        await restoreReview(true);
-        await browser.execute((value) => {
-          document.documentElement.dataset.suiTheme = value;
-        }, theme);
+        await restoreReview(true, false, theme);
         const panel = $('[aria-label="Plan review"]');
         await expect(panel).toBeDisplayed();
         const bounds = await browser.execute(() => {
